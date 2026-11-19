@@ -2,6 +2,8 @@ node_modules/
 data/*.db
 data/*.db-*
 data/*.log
+data/backups/
+data/logs/
 *.log
 .DS_Store
 
