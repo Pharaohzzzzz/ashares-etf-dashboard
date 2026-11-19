@@ -73,6 +73,15 @@ function createDatabase(filePath) {
       PRIMARY KEY (code, trade_date)
     );
 
+    CREATE TABLE IF NOT EXISTS share_history (
+      code TEXT NOT NULL,
+      trade_date TEXT NOT NULL,
+      shares REAL NOT NULL,
+      source TEXT NOT NULL,
+      fetched_at TEXT NOT NULL,
+      PRIMARY KEY (code, trade_date)
+    );
+
     CREATE TABLE IF NOT EXISTS update_log (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       scope TEXT NOT NULL,
@@ -88,6 +97,7 @@ function createDatabase(filePath) {
 
     CREATE INDEX IF NOT EXISTS idx_snapshots_latest ON snapshots(code, captured_at DESC);
     CREATE INDEX IF NOT EXISTS idx_bars_code_date ON daily_bars(code, date);
+    CREATE INDEX IF NOT EXISTS idx_share_history_code_date ON share_history(code, trade_date DESC);
   `);
 
   const insertEtf = db.prepare(`
@@ -178,6 +188,13 @@ function createDatabase(filePath) {
       `).all();
     },
     getPreviousShares(code, tradeDate) {
+      const shareRecord = db.prepare(`
+        SELECT shares FROM share_history
+        WHERE code = ? AND trade_date < ?
+        ORDER BY trade_date DESC
+        LIMIT 1
+      `).get(code, tradeDate);
+      if (shareRecord?.shares !== undefined) return shareRecord.shares;
       const row = db.prepare(`
         SELECT shares FROM snapshots
         WHERE code = ? AND trade_date < ? AND shares IS NOT NULL
@@ -185,6 +202,44 @@ function createDatabase(filePath) {
         LIMIT 1
       `).get(code, tradeDate);
       return row?.shares ?? null;
+    },
+    getPreviousShareRecord(code, tradeDate) {
+      const official = db.prepare(`
+        SELECT trade_date AS tradeDate, shares, source
+        FROM share_history
+        WHERE code = ? AND trade_date < ?
+        ORDER BY trade_date DESC
+        LIMIT 1
+      `).get(code, tradeDate);
+      if (official) return official;
+      const snapshot = db.prepare(`
+        SELECT trade_date AS tradeDate, shares, '快照' AS source
+        FROM snapshots
+        WHERE code = ? AND trade_date < ? AND shares IS NOT NULL
+        ORDER BY trade_date DESC, captured_at DESC
+        LIMIT 1
+      `).get(code, tradeDate);
+      return snapshot || null;
+    },
+    saveShareHistory(entries, fetchedAt = new Date().toISOString()) {
+      const statement = db.prepare(`
+        INSERT INTO share_history(code, trade_date, shares, source, fetched_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(code, trade_date) DO UPDATE SET
+          shares = excluded.shares,
+          source = excluded.source,
+          fetched_at = excluded.fetched_at
+      `);
+      db.exec('BEGIN');
+      try {
+        for (const entry of entries) {
+          statement.run(entry.code, entry.tradeDate, entry.shares, entry.source, fetchedAt);
+        }
+        db.exec('COMMIT');
+      } catch (error) {
+        db.exec('ROLLBACK');
+        throw error;
+      }
     },
     saveDailyMetrics(metric) {
       db.prepare(`

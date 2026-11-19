@@ -36,3 +36,16 @@ test('latest snapshots and previous shares use trade-date boundaries', () => {
   assert.equal(db.getPreviousShares('510300', '2026-11-19'), 1000);
   db.close();
 });
+
+test('official share history takes precedence over quote snapshots', () => {
+  const db = createDatabase(':memory:');
+  db.saveShareHistory([
+    { code: '510300', tradeDate: '2026-11-17', shares: 900, source: 'SSE' },
+    { code: '510300', tradeDate: '2026-11-18', shares: 980, source: 'SSE' }
+  ], '2026-11-20T00:00:00.000Z');
+  const record = db.getPreviousShareRecord('510300', '2026-11-19');
+  assert.equal(record.shares, 980);
+  assert.equal(record.tradeDate, '2026-11-18');
+  assert.equal(record.source, 'SSE');
+  db.close();
+});
