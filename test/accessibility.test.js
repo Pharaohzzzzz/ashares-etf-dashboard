@@ -22,5 +22,6 @@ test('detail drawer and sortable headers expose accessible dialog semantics', ()
   assert.match(app, /event\.key === 'Escape'/);
   assert.match(app, /rememberDrawerTrigger/);
   assert.match(app, /target\?\.focus\(\)/);
+  assert.match(app, /toggleAttribute\('inert'/);
   assert.match(app, /event\.key === 'Enter' \|\| event\.key === ' '/);
 });

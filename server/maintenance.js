@@ -5,7 +5,21 @@ const path = require('node:path');
 const { DatabaseSync, backup } = require('node:sqlite');
 
 function timestampToken(date = new Date()) {
-  return date.toISOString().replace(/[-:]/g, '').replace(/\..+$/, '').replace('T', '-');
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'Asia/Shanghai',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false
+    }).formatToParts(date)
+      .filter((part) => part.type !== 'literal')
+      .map((part) => [part.type, part.value])
+  );
+  return `${parts.year}${parts.month}${parts.day}-${parts.hour}${parts.minute}${parts.second}`;
 }
 
 function verifyDatabase(filePath) {

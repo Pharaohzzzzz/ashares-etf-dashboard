@@ -594,8 +594,8 @@ async function openDetail(code) {
   elements.drawer.classList.add('is-open');
   elements.drawer.setAttribute('aria-hidden', 'false');
   document.body.style.overflow = 'hidden';
-  if (pageMain) pageMain.inert = true;
-  if (pageHeader) pageHeader.inert = true;
+  pageMain?.toggleAttribute('inert', true);
+  pageHeader?.toggleAttribute('inert', true);
   elements.drawerClose.focus();
   try {
     const [detail, intraday] = await Promise.all([
@@ -1947,8 +1947,8 @@ async function openSignalEvent(id) {
   elements.drawer.classList.add('is-open');
   elements.drawer.setAttribute('aria-hidden', 'false');
   document.body.style.overflow = 'hidden';
-  if (pageMain) pageMain.inert = true;
-  if (pageHeader) pageHeader.inert = true;
+  pageMain?.toggleAttribute('inert', true);
+  pageHeader?.toggleAttribute('inert', true);
   elements.drawerClose.focus();
   try {
     const detail = await fetchJson(`/api/backtests/events/${id}`);
@@ -2291,8 +2291,8 @@ function closeDrawer() {
   elements.drawer.setAttribute('aria-hidden', 'true');
   elements.drawerBackdrop.hidden = true;
   document.body.style.overflow = '';
-  if (pageMain) pageMain.inert = false;
-  if (pageHeader) pageHeader.inert = false;
+  pageMain?.toggleAttribute('inert', false);
+  pageHeader?.toggleAttribute('inert', false);
   const trigger = state.drawerTrigger;
   state.drawerTrigger = null;
   const target = trigger?.element?.isConnected

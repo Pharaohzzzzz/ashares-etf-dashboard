@@ -99,7 +99,7 @@ const service = {
     }
     : null,
   getBacktestSummary: async () => ({
-    parameterVersion: 'signal-score-v1.0.1',
+    parameterVersion: 'signal-score-v2.0.0',
     run: { id: 7, generatedAt: '2026-11-20T08:00:00.000Z' },
     parameters: { weights: { volume: 35 }, horizons: [1, 3, 5, 10] },
     splits: {
@@ -109,7 +109,7 @@ const service = {
   }),
   getBacktestEvents: async (filters) => ({
     runId: 7,
-    parameterVersion: 'signal-score-v1.0.1',
+    parameterVersion: 'signal-score-v2.0.0',
     events: filters.code === '000000'
       ? []
       : filters.code === '588170'
