@@ -262,12 +262,10 @@ function updateMarketStatus() {
     setStatus('loading', '等待首次数据');
     return;
   }
-  const latestLog = state.summary.logs?.[0];
-  if (latestLog?.status === 'error') {
-    setStatus('error', '数据源异常');
-    return;
-  }
-  setStatus('live', state.summary.dataTime ? '行情已连接' : '等待盘后数据');
+  const status = state.summary.quoteStatus;
+  if (status === 'error') setStatus('error', '行情数据异常');
+  else if (status === 'partial') setStatus('warning', '部分数据异常');
+  else setStatus('live', state.summary.dataTime ? '行情已连接' : '等待盘后数据');
 }
 
 function renderSummary() {
@@ -390,6 +388,8 @@ function renderTable() {
     const tr = document.createElement('tr');
     tr.tabIndex = 0;
     tr.classList.toggle('is-candidate', row.scoreSignal);
+    tr.classList.toggle('is-stale', row.isStale);
+    if (row.isStale) tr.title = row.staleness || '行情数据已过期';
     tr.setAttribute('aria-label', `查看 ${row.name} 详情`);
     tr.append(createEtfCell(row));
     tr.append(createElement('td', '', formatter.price(row.price)));
@@ -455,6 +455,15 @@ function createEtfCell(row) {
     createElement('span', 'etf-name', row.name),
     createElement('span', 'etf-meta', `${row.code} · ${row.category}`)
   );
+  if (row.isStale) {
+    const warning = createElement(
+      'span',
+      `freshness-tag ${row.quoteStatus || 'stale'}`,
+      row.quoteStatus === 'missing' ? '无行情' : '数据过期'
+    );
+    warning.title = row.staleness || '行情数据已过期';
+    content.append(warning);
+  }
   wrapper.append(mark, content);
   td.append(wrapper);
   return td;

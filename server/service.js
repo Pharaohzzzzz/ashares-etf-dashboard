@@ -339,6 +339,7 @@ class MarketService {
     let successCount = 0;
     const failures = [];
     results.forEach((result, index) => {
+      const etf = ETFS[index];
       if (result.status === 'fulfilled' && result.value.timestamp) {
         const quote = result.value;
         const tradeDate = tradeDateFromTimestamp(quote.timestamp);
@@ -352,8 +353,20 @@ class MarketService {
           }], capturedAt);
         }
         successCount += 1;
+        this.db.recordFetchStatus(etf.code, 'quote', {
+          status: 'success',
+          attemptedAt: capturedAt,
+          successAt: capturedAt,
+          error: null
+        });
       } else {
+        const error = result.reason?.message || '无有效时间戳';
         failures.push(`${ETFS[index].code}: ${result.reason?.message || '无有效时间戳'}`);
+        this.db.recordFetchStatus(etf.code, 'quote', {
+          status: 'error',
+          attemptedAt: capturedAt,
+          error
+        });
       }
     });
     const status = failures.length ? (successCount ? 'partial' : 'error') : 'success';
@@ -789,7 +802,30 @@ class MarketService {
   }
 
   getSummary() {
-    const quoteRows = this.db.getLatestSnapshots().map(snapshotToQuote);
+    const snapshotByCode = new Map(
+      this.db.getLatestSnapshots().map((row) => [row.code, snapshotToQuote(row)])
+    );
+    const quoteRows = ETFS.map((etf) => snapshotByCode.get(etf.code) || {
+      code: etf.code,
+      name: etf.name,
+      category: etf.category,
+      tone: etf.tone,
+      price: null,
+      previousClose: null,
+      change: null,
+      changePercent: null,
+      open: null,
+      high: null,
+      low: null,
+      volume: null,
+      amount: null,
+      turnoverRate: null,
+      shares: null,
+      marketValue: null,
+      dataTime: null,
+      capturedAt: null,
+      tradeDate: null
+    });
     const marketData = quoteRows.map((quote) => {
       const bars = this.db.getBars(quote.code, 520);
       const officialHistory = this.db.getOfficialShareHistory(
@@ -921,9 +957,43 @@ class MarketService {
       .sort()
       .at(-1) || null;
     const amountRows = rows.filter((row) => Number.isFinite(row.amount));
+    const latestQuoteDate = quoteRows.map((row) => row.tradeDate).filter(Boolean).sort().at(-1) || null;
+    const fetchStatuses = this.db.getFetchStatuses('quote');
+    const freshnessRows = rows.map((row) => {
+      const freshness = this.getQuoteFreshness(row, {
+        latestQuoteDate,
+        fetchStatus: fetchStatuses[row.code] || null
+      });
+      return { ...row, ...freshness };
+    });
+    const staleRows = freshnessRows.filter((row) => row.isStale);
+    const freshRows = freshnessRows.filter((row) => !row.isStale);
+    const oldestDataTime = freshnessRows
+      .map((row) => row.dataTime)
+      .filter(Boolean)
+      .sort()
+      .at(0) || null;
+    const latestDataTime = freshnessRows
+      .map((row) => row.dataTime)
+      .filter(Boolean)
+      .sort()
+      .at(-1) || null;
+    const quoteStatus = !freshRows.length
+      ? 'error'
+      : staleRows.length ? 'partial' : 'ok';
     return {
       generatedAt: this.now().toISOString(),
-      dataTime,
+      dataTime: latestDataTime,
+      oldestDataTime,
+      latestDataTime,
+      quoteStatus,
+      quoteStatusLabel: quoteStatus === 'ok'
+        ? '行情已连接'
+        : quoteStatus === 'partial'
+          ? '部分数据异常'
+          : '行情数据异常',
+      staleCount: staleRows.length,
+      freshCount: freshRows.length,
       totalAmount: amountRows.length
         ? amountRows.reduce((sum, row) => sum + row.amount, 0)
         : null,
@@ -940,8 +1010,51 @@ class MarketService {
       iopvAbnormalCount: rows.filter((row) => row.premiumAbnormal).length,
       broadResonance,
       dataStatus: this.getDataStatus(),
-      etfs: rows,
+      etfs: freshnessRows,
       logs: this.db.recentLogs()
+    };
+  }
+
+  getQuoteFreshness(row, { latestQuoteDate, fetchStatus }) {
+    const now = this.now();
+    const dataTime = row.dataTime || row.capturedAt || null;
+    const observedMs = dataTime ? new Date(dataTime).getTime() : NaN;
+    const ageSeconds = Number.isFinite(observedMs)
+      ? Math.max(0, Math.floor((now.getTime() - observedMs) / 1000))
+      : null;
+    const failedAttempt = fetchStatus?.status === 'error';
+    const behindLatest = Boolean(
+      row.tradeDate &&
+      latestQuoteDate &&
+      row.tradeDate < latestQuoteDate
+    );
+    const intradayStale = this.isTradingSession(now) &&
+      Number.isFinite(ageSeconds) &&
+      ageSeconds > 3 * 60;
+    const generalStale = Number.isFinite(ageSeconds) &&
+      ageSeconds > 72 * 60 * 60;
+    const isStale = !row.dataTime || failedAttempt || behindLatest ||
+      intradayStale || generalStale;
+    const reasons = [
+      !row.dataTime ? '缺少行情数据时间' : null,
+      failedAttempt ? `最近抓取失败：${fetchStatus.lastError || '未知错误'}` : null,
+      behindLatest ? `行情日期早于全池最新交易日 ${latestQuoteDate}` : null,
+      intradayStale ? '盘中行情超过 3 分钟未更新' : null,
+      generalStale ? '行情超过 72 小时未更新' : null
+    ].filter(Boolean);
+    return {
+      capturedAt: row.capturedAt || fetchStatus?.lastAttemptAt || null,
+      dataTime: row.dataTime || null,
+      quoteStatus: !row.dataTime
+        ? 'missing'
+        : failedAttempt
+          ? 'error'
+          : isStale ? 'stale' : 'fresh',
+      staleness: reasons[0] || '正常',
+      stalenessSeconds: ageSeconds,
+      isStale,
+      quoteAttemptedAt: fetchStatus?.lastAttemptAt || null,
+      quoteLastSuccessAt: fetchStatus?.lastSuccessAt || null
     };
   }
 

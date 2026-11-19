@@ -119,7 +119,7 @@ test('summary calculates ratio, returns, shares and a broad resonance candidate'
   assert.equal(row.shareDelta, 200);
   assert.equal(row.signals.some((signal) => signal.key === 'volume'), true);
   assert.equal(summary.totalAmount, 300);
-  assert.deepEqual(summary.amountCoverage, { available: 1, total: 1 });
+  assert.deepEqual(summary.amountCoverage, { available: 1, total: 14 });
   db.close();
 });
 
@@ -144,7 +144,7 @@ test('summary excludes missing amounts from totals while preserving valid zero',
   });
   const summary = service.getSummary();
   assert.equal(summary.totalAmount, 0);
-  assert.deepEqual(summary.amountCoverage, { available: 1, total: 2 });
+  assert.deepEqual(summary.amountCoverage, { available: 1, total: 14 });
   db.close();
 });
 
@@ -179,11 +179,82 @@ test('refreshQuotes records provider failures without discarding successes', asy
     now: () => new Date('2026-10-26T08:00:00.000Z')
   });
   const summary = await service.refreshQuotes();
-  assert.equal(summary.etfs.length, 2);
+  assert.equal(summary.etfs.length, ETFS.length);
+  assert.equal(summary.quoteStatus, 'partial');
+  assert.equal(summary.staleCount, ETFS.length - 2);
   assert.equal(
     summary.logs.find((log) => log.scope === 'quotes')?.status,
     'partial'
   );
+  db.close();
+});
+
+test('thirteen quote failures and one success are reported as partial data anomaly', async () => {
+  const db = createDatabase(':memory:');
+  const service = new MarketService({
+    db,
+    quoteProvider: async (etf) => {
+      if (etf.code !== ETFS[0].code) throw new Error('mock quote failure');
+      return {
+        code: etf.code, price: 4, previousClose: 4, change: 0,
+        changePercent: 0, open: 4, high: 4, low: 4, volume: 0,
+        amount: 0, turnoverRate: 0, shares: 1000, marketValue: 4000,
+        timestamp: 1795114800
+      };
+    },
+    officialIopvProvider: mockOfficialIopv,
+    supplementaryIopvProvider: mockSupplementaryIopv,
+    now: () => new Date('2026-10-26T08:00:00.000Z')
+  });
+  const summary = await service.refreshQuotes();
+  assert.equal(summary.etfs.length, ETFS.length);
+  assert.equal(summary.quoteStatus, 'partial');
+  assert.equal(summary.quoteStatusLabel, '部分数据异常');
+  assert.equal(summary.freshCount, 1);
+  assert.equal(summary.staleCount, 13);
+  assert.equal(summary.etfs.filter((row) => row.quoteStatus === 'missing').length, 13);
+  assert.ok(summary.etfs.every((row) => (
+    'capturedAt' in row &&
+    'dataTime' in row &&
+    'quoteStatus' in row &&
+    'staleness' in row &&
+    'isStale' in row
+  )));
+  db.close();
+});
+
+test('a few rows older than the latest quote are marked stale individually', () => {
+  const db = createDatabase(':memory:');
+  const quote = {
+    price: 4, previousClose: 4, change: 0, changePercent: 0,
+    open: 4, high: 4, low: 4, volume: 100, amount: 100,
+    turnoverRate: 0, shares: 1000, marketValue: 4000
+  };
+  db.saveSnapshot({
+    ...quote,
+    code: '510300',
+    timestamp: Date.parse('2026-11-19T07:00:00.000Z') / 1000
+  }, '2026-11-19', '2026-11-19T07:00:01.000Z');
+  db.saveSnapshot({
+    ...quote,
+    code: '159919',
+    timestamp: Date.parse('2026-11-18T07:00:00.000Z') / 1000
+  }, '2026-11-18', '2026-11-18T07:00:01.000Z');
+  const service = new MarketService({
+    db,
+    now: () => new Date('2026-11-20T01:00:00.000Z')
+  });
+  const summary = service.getSummary();
+  const current = summary.etfs.find((row) => row.code === '510300');
+  const older = summary.etfs.find((row) => row.code === '159919');
+  assert.equal(current.isStale, false);
+  assert.equal(current.quoteStatus, 'fresh');
+  assert.equal(older.isStale, true);
+  assert.equal(older.quoteStatus, 'stale');
+  assert.match(older.staleness, /最新交易日/);
+  assert.equal(summary.quoteStatus, 'partial');
+  assert.equal(summary.oldestDataTime, '2026-11-18T07:00:00.000Z');
+  assert.equal(summary.latestDataTime, '2026-11-19T07:00:00.000Z');
   db.close();
 });
 

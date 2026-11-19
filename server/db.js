@@ -222,6 +222,16 @@ function createDatabase(filePath) {
       message TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS fetch_status (
+      code TEXT NOT NULL,
+      source TEXT NOT NULL,
+      status TEXT NOT NULL,
+      last_attempt_at TEXT NOT NULL,
+      last_success_at TEXT,
+      last_error TEXT,
+      PRIMARY KEY (code, source)
+    );
+
     CREATE TABLE IF NOT EXISTS backtest_runs (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       parameter_version TEXT NOT NULL,
@@ -1110,6 +1120,33 @@ function createDatabase(filePath) {
     getSyncTasks() {
       return db.prepare('SELECT task_key FROM sync_tasks ORDER BY task_key').all()
         .map((row) => this.getSyncTask(row.task_key));
+    },
+    recordFetchStatus(code, source, {
+      status,
+      attemptedAt = new Date().toISOString(),
+      successAt = null,
+      error = null
+    }) {
+      db.prepare(`
+        INSERT INTO fetch_status(
+          code, source, status, last_attempt_at, last_success_at, last_error
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(code, source) DO UPDATE SET
+          status = excluded.status,
+          last_attempt_at = excluded.last_attempt_at,
+          last_success_at = COALESCE(excluded.last_success_at, fetch_status.last_success_at),
+          last_error = excluded.last_error
+      `).run(code, source, status, attemptedAt, successAt, error);
+    },
+    getFetchStatuses(source) {
+      return Object.fromEntries(
+        db.prepare(`
+          SELECT code, status, last_attempt_at AS lastAttemptAt,
+                 last_success_at AS lastSuccessAt, last_error AS lastError
+          FROM fetch_status
+          WHERE source = ?
+        `).all(source).map((row) => [row.code, row])
+      );
     }
   };
 }
