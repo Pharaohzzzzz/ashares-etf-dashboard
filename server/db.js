@@ -143,6 +143,16 @@ function createDatabase(filePath) {
       value TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS trading_calendar (
+      trade_date TEXT PRIMARY KEY,
+      is_trading INTEGER NOT NULL,
+      exchange_status TEXT,
+      name TEXT,
+      source TEXT NOT NULL,
+      source_url TEXT,
+      fetched_at TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS backtest_runs (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       parameter_version TEXT NOT NULL,
@@ -192,6 +202,8 @@ function createDatabase(filePath) {
       ON signal_events(run_id, signal_date DESC);
     CREATE INDEX IF NOT EXISTS idx_signal_events_run_code
       ON signal_events(run_id, code, signal_date DESC);
+    CREATE INDEX IF NOT EXISTS idx_trading_calendar_trading
+      ON trading_calendar(is_trading, trade_date);
   `);
 
   ensureColumn(db, 'share_history', 'official_fetched_at', 'TEXT');
@@ -791,6 +803,51 @@ function createDatabase(filePath) {
         INSERT INTO app_meta(key, value) VALUES (?, ?)
         ON CONFLICT(key) DO UPDATE SET value = excluded.value
       `).run(key, value);
+    },
+    saveTradingCalendar(rows, {
+      source,
+      sourceUrl = null,
+      fetchedAt = new Date().toISOString()
+    }) {
+      const statement = db.prepare(`
+        INSERT INTO trading_calendar(
+          trade_date, is_trading, exchange_status, name, source, source_url, fetched_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(trade_date) DO UPDATE SET
+          is_trading = excluded.is_trading,
+          exchange_status = excluded.exchange_status,
+          name = excluded.name,
+          source = excluded.source,
+          source_url = excluded.source_url,
+          fetched_at = excluded.fetched_at
+      `);
+      db.exec('BEGIN');
+      try {
+        for (const row of rows) {
+          statement.run(
+            row.date,
+            row.isTrading ? 1 : 0,
+            row.exchangeStatus ?? null,
+            row.name ?? null,
+            source,
+            sourceUrl,
+            fetchedAt
+          );
+        }
+        db.exec('COMMIT');
+      } catch (error) {
+        db.exec('ROLLBACK');
+        throw error;
+      }
+    },
+    getTradingCalendar(date) {
+      return db.prepare(`
+        SELECT trade_date AS date, is_trading AS isTrading,
+               exchange_status AS exchangeStatus, name, source,
+               source_url AS sourceUrl, fetched_at AS fetchedAt
+        FROM trading_calendar
+        WHERE trade_date = ?
+      `).get(date) || null;
     }
   };
 }

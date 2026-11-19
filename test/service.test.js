@@ -143,6 +143,17 @@ test('refreshQuotes records provider failures without discarding successes', asy
     },
     officialIopvProvider: mockOfficialIopv,
     supplementaryIopvProvider: mockSupplementaryIopv,
+    calendarProvider: async (date) => ({
+      month: '2026-10',
+      source: '深交所',
+      sourceUrl: 'https://www.szse.cn/aboutus/calendar/',
+      rows: [{
+        date: '2026-10-26',
+        isTrading: true,
+        exchangeStatus: '1',
+        name: null
+      }]
+    }),
     now: () => new Date('2026-10-26T08:00:00.000Z')
   });
   const summary = await service.refreshQuotes();
@@ -179,6 +190,17 @@ test('initialization continues when one ETF history request fails', async () => 
     szseShareProvider: async () => new Map(),
     officialIopvProvider: mockOfficialIopv,
     supplementaryIopvProvider: mockSupplementaryIopv,
+    calendarProvider: async () => ({
+      month: '2026-10',
+      source: '深交所',
+      sourceUrl: 'https://www.szse.cn/aboutus/calendar/',
+      rows: [{
+        date: '2026-10-26',
+        isTrading: true,
+        exchangeStatus: '1',
+        name: null
+      }]
+    }),
     now: () => new Date('2026-10-26T08:00:00.000Z')
   });
   await service.initialize({ force: true });

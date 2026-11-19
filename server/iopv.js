@@ -275,7 +275,8 @@ function crossCheckIopv(primary, secondary, {
 function resolveIopvState(record, {
   now = new Date(),
   latestTradeDate = null,
-  refreshFailed = false
+  refreshFailed = false,
+  tradingSession = false
 } = {}) {
   if (!record) {
     return { status: 'missing', label: '暂无', message: '尚无有效 IOPV 记录', premiumRate: null };
@@ -339,7 +340,7 @@ function resolveIopvState(record, {
       };
     }
     const age = nowMs - observedMs;
-    if (isTradingSession(now) && age > INTRADAY_STALE_MS) {
+    if (tradingSession && age > INTRADAY_STALE_MS) {
       return {
         ...record,
         status: 'stale',

@@ -30,6 +30,11 @@ const {
   fetchSzseEtfShares,
   fetchSzseEtfShareRange
 } = require('./official-shares');
+const {
+  fetchCalendarMonth,
+  calendarStatusFor,
+  isTradingSession
+} = require('./trading-calendar');
 
 const OFFICIAL_HISTORY_DAYS = 250;
 const OFFICIAL_FETCH_DAYS = OFFICIAL_HISTORY_DAYS + 1;
@@ -96,6 +101,8 @@ class MarketService {
     szseRangeProvider = fetchSzseEtfShareRange,
     officialIopvProvider = fetchOfficialIopv,
     supplementaryIopvProvider = fetchSupplementaryIopv,
+    calendarProvider = fetchCalendarMonth,
+    calendarMaxAgeMs,
     now = () => new Date()
   }) {
     this.db = db;
@@ -107,11 +114,16 @@ class MarketService {
     this.szseRangeProvider = szseRangeProvider;
     this.officialIopvProvider = officialIopvProvider;
     this.supplementaryIopvProvider = supplementaryIopvProvider;
+    this.calendarProvider = calendarProvider;
+    this.calendarMaxAgeMs = calendarMaxAgeMs;
     this.now = now;
     this.refreshPromise = null;
     this.shareSyncPromise = null;
     this.backtestPromise = null;
     this.iopvRefreshPromise = null;
+    this.calendarRefreshPromise = null;
+    this.calendarLastAttemptAt = 0;
+    this.calendarLastError = null;
     this.initializing = false;
     this.initializedAt = db.getMeta('initializedAt');
   }
@@ -121,6 +133,7 @@ class MarketService {
     this.initializing = true;
     this.db.log('startup', 'running', '开始同步两年日线与实时行情', this.now().toISOString());
     try {
+      await this.ensureTradingCalendar({ force: true });
       const historyResults = await Promise.allSettled(ETFS.map(async (etf) => {
         const count = this.db.countBars(etf.code);
         if (!force && count >= 250) return;
@@ -170,6 +183,86 @@ class MarketService {
     } finally {
       this.refreshPromise = null;
     }
+  }
+
+  async ensureTradingCalendar({ force = false, date = this.now() } = {}) {
+    const nowMs = this.now().getTime();
+    const dateKey = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Shanghai',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit'
+    }).format(date);
+    const cached = this.db.getTradingCalendar(dateKey);
+    const cachedAt = cached?.fetchedAt ? new Date(cached.fetchedAt).getTime() : NaN;
+    if (
+      !force &&
+      cached &&
+      Number.isFinite(cachedAt) &&
+      nowMs - cachedAt < 60 * 60 * 1000
+    ) {
+      return this.getTradingCalendarStatus(date);
+    }
+    if (this.calendarRefreshPromise) return this.calendarRefreshPromise;
+    this.calendarRefreshPromise = (async () => {
+      try {
+        const calendar = await this.calendarProvider(date);
+        const fetchedAt = this.now().toISOString();
+        this.db.saveTradingCalendar(calendar.rows, {
+          source: calendar.source,
+          sourceUrl: calendar.sourceUrl,
+          fetchedAt
+        });
+        this.calendarLastAttemptAt = nowMs;
+        this.calendarLastError = null;
+        this.db.log(
+          'calendar',
+          'success',
+          `${calendar.source}交易日历更新至 ${calendar.month}`,
+          fetchedAt
+        );
+      } catch (error) {
+        this.calendarLastAttemptAt = nowMs;
+        this.calendarLastError = error.message;
+        this.db.log(
+          'calendar',
+          'warning',
+          `交易日历刷新失败，使用缓存并标记可能过期：${error.message}`,
+          this.now().toISOString()
+        );
+      }
+      return this.getTradingCalendarStatus(date);
+    })();
+    try {
+      return await this.calendarRefreshPromise;
+    } finally {
+      this.calendarRefreshPromise = null;
+    }
+  }
+
+  getTradingCalendarStatus(date = this.now()) {
+    const dateKey = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Shanghai',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit'
+    }).format(date);
+    const status = calendarStatusFor(this.db.getTradingCalendar(dateKey), {
+      now: date,
+      maxAgeMs: this.calendarMaxAgeMs
+    });
+    if (this.calendarLastError && !status.stale) {
+      return {
+        ...status,
+        stale: true,
+        message: `交易日历可能过期：刷新失败，正在使用缓存（${this.calendarLastError}）`
+      };
+    }
+    return status;
+  }
+
+  isTradingSession(date = this.now()) {
+    return isTradingSession(date, this.getTradingCalendarStatus(date));
   }
 
   async syncHistory() {
@@ -315,7 +408,8 @@ class MarketService {
 
       const resolved = resolveIopvState(state, {
         now: this.now(),
-        latestTradeDate
+        latestTradeDate,
+        tradingSession: this.isTradingSession(this.now())
       });
       const stored = {
         ...state,
