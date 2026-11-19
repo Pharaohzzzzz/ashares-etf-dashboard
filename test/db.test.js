@@ -167,3 +167,44 @@ test('sync task state persists failed dates and retry counts', () => {
   assert.deepEqual(task.failedDates, ['2026-11-18', '2026-11-19']);
   db.close();
 });
+
+test('official share day writes and completion status share one transaction', () => {
+  const db = createDatabase(':memory:');
+  const expectedCodes = ['510050', '510300'];
+  const entries = expectedCodes.map((code) => ({
+    code,
+    tradeDate: '2026-11-19',
+    shares: 1000,
+    source: '上交所'
+  }));
+  db.raw.exec(`
+    CREATE TRIGGER fail_second_share
+    BEFORE INSERT ON share_history
+    WHEN NEW.code = '510050'
+    BEGIN
+      SELECT RAISE(ABORT, 'simulated write failure');
+    END
+  `);
+  assert.throws(() => db.saveOfficialShareDay({
+    exchange: 'SSE',
+    tradeDate: '2026-11-19',
+    entries,
+    expectedCodes,
+    fetchedAt: '2026-11-20T00:00:00.000Z'
+  }), /simulated write failure/);
+  assert.equal(db.countOfficialShareHistory('510300'), 0);
+  assert.equal(db.getOfficialShareSyncRecord('SSE', '2026-11-19'), null);
+
+  db.raw.exec('DROP TRIGGER fail_second_share');
+  const recovery = db.saveOfficialShareDay({
+    exchange: 'SSE',
+    tradeDate: '2026-11-19',
+    entries,
+    expectedCodes,
+    fetchedAt: '2026-11-20T00:01:00.000Z'
+  });
+  assert.equal(recovery.status, 'success');
+  assert.deepEqual(recovery.writtenCodes, expectedCodes);
+  assert.equal(db.getOfficialShareSyncRecord('SSE', '2026-11-19').actualCount, 2);
+  db.close();
+});

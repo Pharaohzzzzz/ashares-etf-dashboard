@@ -11,6 +11,63 @@ function ensureColumn(db, table, column, definition) {
   if (!exists) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
 }
 
+function shareUpsertSql() {
+  return `
+    INSERT INTO share_history(
+      code, trade_date, shares, source, fetched_at,
+      official_fetched_at, snapshot_fetched_at
+    )
+    VALUES (
+      ?, ?, ?, ?, ?,
+      CASE WHEN ? IN ('上交所', '深交所', 'SSE', 'SZSE') THEN ? ELSE NULL END,
+      CASE WHEN ? NOT IN ('上交所', '深交所', 'SSE', 'SZSE') THEN ? ELSE NULL END
+    )
+    ON CONFLICT(code, trade_date) DO UPDATE SET
+      shares = CASE
+        WHEN share_history.source IN ('上交所', '深交所', 'SSE', 'SZSE')
+             AND excluded.source NOT IN ('上交所', '深交所', 'SSE', 'SZSE')
+          THEN share_history.shares
+        ELSE excluded.shares
+      END,
+      source = CASE
+        WHEN share_history.source IN ('上交所', '深交所', 'SSE', 'SZSE')
+             AND excluded.source NOT IN ('上交所', '深交所', 'SSE', 'SZSE')
+          THEN share_history.source
+        ELSE excluded.source
+      END,
+      fetched_at = CASE
+        WHEN share_history.source IN ('上交所', '深交所', 'SSE', 'SZSE')
+             AND excluded.source NOT IN ('上交所', '深交所', 'SSE', 'SZSE')
+          THEN share_history.fetched_at
+        ELSE excluded.fetched_at
+      END,
+      official_fetched_at = CASE
+        WHEN excluded.source IN ('上交所', '深交所', 'SSE', 'SZSE')
+          THEN excluded.official_fetched_at
+        ELSE share_history.official_fetched_at
+      END,
+      snapshot_fetched_at = CASE
+        WHEN excluded.source NOT IN ('上交所', '深交所', 'SSE', 'SZSE')
+          THEN excluded.snapshot_fetched_at
+        ELSE share_history.snapshot_fetched_at
+      END
+  `;
+}
+
+function runShareUpsert(statement, entry, fetchedAt) {
+  statement.run(
+    entry.code,
+    entry.tradeDate,
+    entry.shares,
+    entry.source,
+    fetchedAt,
+    entry.source,
+    fetchedAt,
+    entry.source,
+    fetchedAt
+  );
+}
+
 function createDatabase(filePath) {
   if (filePath !== ':memory:') fs.mkdirSync(path.dirname(filePath), { recursive: true });
   const db = new DatabaseSync(filePath);
@@ -220,6 +277,10 @@ function createDatabase(filePath) {
 
   ensureColumn(db, 'share_history', 'official_fetched_at', 'TEXT');
   ensureColumn(db, 'share_history', 'snapshot_fetched_at', 'TEXT');
+  ensureColumn(db, 'official_share_sync_dates', 'expected_count', 'INTEGER');
+  ensureColumn(db, 'official_share_sync_dates', 'actual_count', 'INTEGER');
+  ensureColumn(db, 'official_share_sync_dates', 'expected_codes_json', 'TEXT');
+  ensureColumn(db, 'official_share_sync_dates', 'written_codes_json', 'TEXT');
   db.exec(`
     UPDATE share_history
     SET official_fetched_at = fetched_at
@@ -555,9 +616,27 @@ function createDatabase(filePath) {
           AND source IN ('上交所', '深交所', 'SSE', 'SZSE')
       `).get(code).count;
     },
-    getCompletedOfficialShareSyncDates(exchange, tradeDates) {
+    getCompletedOfficialShareSyncDates(exchange, tradeDates, expectedCodes = null) {
       if (!tradeDates.length) return new Set();
       const placeholders = tradeDates.map(() => '?').join(',');
+      if (Array.isArray(expectedCodes) && expectedCodes.length) {
+        const codePlaceholders = expectedCodes.map(() => '?').join(',');
+        const rows = db.prepare(`
+          SELECT trade_date AS tradeDate, COUNT(DISTINCT code) AS actualCount
+          FROM share_history
+          WHERE trade_date IN (${placeholders})
+            AND code IN (${codePlaceholders})
+            AND source IN ('上交所', '深交所', 'SSE', 'SZSE')
+          GROUP BY trade_date
+          HAVING COUNT(DISTINCT code) = ?
+          ORDER BY trade_date ASC
+        `).all(
+          ...tradeDates,
+          ...expectedCodes,
+          expectedCodes.length
+        );
+        return new Set(rows.map((row) => row.tradeDate));
+      }
       const rows = db.prepare(`
         SELECT trade_date AS tradeDate
         FROM official_share_sync_dates
@@ -596,66 +675,140 @@ function createDatabase(filePath) {
       }
     },
     saveShareHistory(entries, fetchedAt = new Date().toISOString()) {
-      const statement = db.prepare(`
-        INSERT INTO share_history(
-          code, trade_date, shares, source, fetched_at,
-          official_fetched_at, snapshot_fetched_at
-        )
-        VALUES (
-          ?, ?, ?, ?, ?,
-          CASE WHEN ? IN ('上交所', '深交所', 'SSE', 'SZSE') THEN ? ELSE NULL END,
-          CASE WHEN ? NOT IN ('上交所', '深交所', 'SSE', 'SZSE') THEN ? ELSE NULL END
-        )
-        ON CONFLICT(code, trade_date) DO UPDATE SET
-          shares = CASE
-            WHEN share_history.source IN ('上交所', '深交所', 'SSE', 'SZSE')
-                 AND excluded.source NOT IN ('上交所', '深交所', 'SSE', 'SZSE')
-              THEN share_history.shares
-            ELSE excluded.shares
-          END,
-          source = CASE
-            WHEN share_history.source IN ('上交所', '深交所', 'SSE', 'SZSE')
-                 AND excluded.source NOT IN ('上交所', '深交所', 'SSE', 'SZSE')
-              THEN share_history.source
-            ELSE excluded.source
-          END,
-          fetched_at = CASE
-            WHEN share_history.source IN ('上交所', '深交所', 'SSE', 'SZSE')
-                 AND excluded.source NOT IN ('上交所', '深交所', 'SSE', 'SZSE')
-              THEN share_history.fetched_at
-            ELSE excluded.fetched_at
-          END,
-          official_fetched_at = CASE
-            WHEN excluded.source IN ('上交所', '深交所', 'SSE', 'SZSE')
-              THEN excluded.official_fetched_at
-            ELSE share_history.official_fetched_at
-          END,
-          snapshot_fetched_at = CASE
-            WHEN excluded.source NOT IN ('上交所', '深交所', 'SSE', 'SZSE')
-              THEN excluded.snapshot_fetched_at
-            ELSE share_history.snapshot_fetched_at
-          END
-      `);
+      const statement = db.prepare(shareUpsertSql());
       db.exec('BEGIN');
       try {
         for (const entry of entries) {
-          statement.run(
-            entry.code,
-            entry.tradeDate,
-            entry.shares,
-            entry.source,
-            fetchedAt,
-            entry.source,
-            fetchedAt,
-            entry.source,
-            fetchedAt
-          );
+          runShareUpsert(statement, entry, fetchedAt);
         }
         db.exec('COMMIT');
       } catch (error) {
         db.exec('ROLLBACK');
         throw error;
       }
+    },
+    saveOfficialShareDay({
+      exchange,
+      tradeDate,
+      entries,
+      expectedCodes,
+      message = null,
+      fetchedAt = new Date().toISOString()
+    }) {
+      const expected = [...new Set(expectedCodes)];
+      const byCode = new Map(entries
+        .filter((entry) => (
+          entry.tradeDate === tradeDate &&
+          expected.includes(entry.code) &&
+          Number.isFinite(entry.shares)
+        ))
+        .map((entry) => [entry.code, entry]));
+      const statement = db.prepare(shareUpsertSql());
+      const insertStatus = db.prepare(`
+        INSERT INTO official_share_sync_dates(
+          exchange, trade_date, status, message, fetched_at,
+          expected_count, actual_count, expected_codes_json, written_codes_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(exchange, trade_date) DO UPDATE SET
+          status = excluded.status,
+          message = excluded.message,
+          fetched_at = excluded.fetched_at,
+          expected_count = excluded.expected_count,
+          actual_count = excluded.actual_count,
+          expected_codes_json = excluded.expected_codes_json,
+          written_codes_json = excluded.written_codes_json
+      `);
+      db.exec('BEGIN');
+      try {
+        for (const entry of byCode.values()) {
+          runShareUpsert(statement, entry, fetchedAt);
+        }
+        const actualCodes = this.getActualOfficialShareCodes(tradeDate, expected);
+        const status = !actualCodes.length
+          ? 'pending'
+          : actualCodes.length === expected.length
+            ? 'success'
+            : 'partial';
+        insertStatus.run(
+          exchange,
+          tradeDate,
+          status,
+          message,
+          fetchedAt,
+          expected.length,
+          actualCodes.length,
+          JSON.stringify(expected),
+          JSON.stringify(actualCodes)
+        );
+        db.exec('COMMIT');
+        return { status, tradeDate, expectedCodes: expected, writtenCodes: actualCodes };
+      } catch (error) {
+        db.exec('ROLLBACK');
+        throw error;
+      }
+    },
+    recordOfficialShareDayFailure({
+      exchange,
+      tradeDate,
+      expectedCodes,
+      message,
+      fetchedAt = new Date().toISOString()
+    }) {
+      const expected = [...new Set(expectedCodes)];
+      const actualCodes = this.getActualOfficialShareCodes(tradeDate, expected);
+      const status = !actualCodes.length
+        ? 'pending'
+        : actualCodes.length === expected.length
+          ? 'success'
+          : 'partial';
+      db.prepare(`
+        INSERT INTO official_share_sync_dates(
+          exchange, trade_date, status, message, fetched_at,
+          expected_count, actual_count, expected_codes_json, written_codes_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(exchange, trade_date) DO UPDATE SET
+          status = excluded.status,
+          message = excluded.message,
+          fetched_at = excluded.fetched_at,
+          expected_count = excluded.expected_count,
+          actual_count = excluded.actual_count,
+          expected_codes_json = excluded.expected_codes_json,
+          written_codes_json = excluded.written_codes_json
+      `).run(
+        exchange,
+        tradeDate,
+        status,
+        message,
+        fetchedAt,
+        expected.length,
+        actualCodes.length,
+        JSON.stringify(expected),
+        JSON.stringify(actualCodes)
+      );
+      return { status, tradeDate, writtenCodes: actualCodes };
+    },
+    getActualOfficialShareCodes(tradeDate, expectedCodes) {
+      if (!expectedCodes.length) return [];
+      const placeholders = expectedCodes.map(() => '?').join(',');
+      return db.prepare(`
+        SELECT code
+        FROM share_history
+        WHERE trade_date = ?
+          AND code IN (${placeholders})
+          AND source IN ('上交所', '深交所', 'SSE', 'SZSE')
+        ORDER BY code ASC
+      `).all(tradeDate, ...expectedCodes).map((row) => row.code);
+    },
+    getOfficialShareSyncRecord(exchange, tradeDate) {
+      return db.prepare(`
+        SELECT exchange, trade_date AS tradeDate, status, message,
+               fetched_at AS fetchedAt, expected_count AS expectedCount,
+               actual_count AS actualCount,
+               expected_codes_json AS expectedCodesJson,
+               written_codes_json AS writtenCodesJson
+        FROM official_share_sync_dates
+        WHERE exchange = ? AND trade_date = ?
+      `).get(exchange, tradeDate) || null;
     },
     saveDailyMetrics(metric) {
       db.prepare(`

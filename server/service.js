@@ -575,7 +575,6 @@ class MarketService {
       ...sseResult.completedDates,
       ...szseResult.completedDates
     ])];
-    if (entries.length) this.db.saveShareHistory(entries, this.now().toISOString());
     const missingDates = requestedDates.filter((date) => !completedDates.includes(date));
     const status = failures.length || missingDates.length
       ? (entries.length || completedDates.length ? 'partial' : 'error')
@@ -613,7 +612,12 @@ class MarketService {
   }
 
   async syncSseShareDates(etfs, requestedDates) {
-    const completed = this.db.getCompletedOfficialShareSyncDates('SSE', requestedDates);
+    const expectedCodes = etfs.map((etf) => etf.code);
+    const completed = this.db.getCompletedOfficialShareSyncDates(
+      'SSE',
+      requestedDates,
+      expectedCodes
+    );
     const datesToFetch = requestedDates.filter((date) => !completed.has(date));
     const results = await mapLimit(datesToFetch, SSE_FETCH_CONCURRENCY, async (date) => {
       try {
@@ -624,23 +628,42 @@ class MarketService {
             ? [{ code: etf.code, tradeDate: date, shares, source: '上交所' }]
             : [];
         });
-        return { date, entries, failure: null };
+        const saved = this.db.saveOfficialShareDay({
+          exchange: 'SSE',
+          tradeDate: date,
+          entries,
+          expectedCodes,
+          message: entries.length === expectedCodes.length
+            ? null
+            : `上交所仅返回 ${entries.length}/${expectedCodes.length} 只目标 ETF`,
+          fetchedAt: this.now().toISOString()
+        });
+        return {
+          date,
+          entries,
+          status: saved.status,
+          failure: saved.status === 'success'
+            ? null
+            : `上交所 ${date}：${saved.status}（${saved.writtenCodes.length}/${expectedCodes.length}）`
+        };
       } catch (error) {
-        return { date, entries: [], failure: `上交所 ${date}：${error.message}` };
+        try {
+          this.db.recordOfficialShareDayFailure({
+            exchange: 'SSE',
+            tradeDate: date,
+            expectedCodes,
+            message: error.message,
+            fetchedAt: this.now().toISOString()
+          });
+        } catch {
+          // The original write error is the useful failure for retry state.
+        }
+        return { date, entries: [], status: 'pending', failure: `上交所 ${date}：${error.message}` };
       }
     });
     const successfulDates = results
-      .filter((result) => !result.failure)
+      .filter((result) => result.status === 'success')
       .map((result) => result.date);
-    if (successfulDates.length) {
-      this.db.markOfficialShareSyncDates(
-        'SSE',
-        successfulDates,
-        'success',
-        null,
-        this.now().toISOString()
-      );
-    }
     return {
       entries: results.flatMap((result) => result.entries),
       failures: results.map((result) => result.failure).filter(Boolean),
@@ -649,7 +672,12 @@ class MarketService {
   }
 
   async syncSzseShareDates(etfs, requestedDates) {
-    const completed = this.db.getCompletedOfficialShareSyncDates('SZSE', requestedDates);
+    const expectedCodes = etfs.map((etf) => etf.code);
+    const completed = this.db.getCompletedOfficialShareSyncDates(
+      'SZSE',
+      requestedDates,
+      expectedCodes
+    );
     const datesToFetch = requestedDates.filter((date) => !completed.has(date));
     if (!datesToFetch.length) {
       return { entries: [], failures: [], completedDates: [...completed] };
@@ -663,19 +691,44 @@ class MarketService {
           datesToFetch.at(-1)
         );
         const dateSet = new Set(datesToFetch);
-        this.db.markOfficialShareSyncDates(
-          'SZSE',
-          datesToFetch,
-          'success',
-          null,
-          this.now().toISOString()
-        );
+        const results = datesToFetch.map((date) => {
+          const dateEntries = entries.filter((entry) => entry.tradeDate === date);
+          const saved = this.db.saveOfficialShareDay({
+            exchange: 'SZSE',
+            tradeDate: date,
+            entries: dateEntries,
+            expectedCodes,
+            message: dateEntries.length === expectedCodes.length
+              ? null
+              : `深交所 ${date} 仅返回 ${dateEntries.length}/${expectedCodes.length} 只目标 ETF`,
+            fetchedAt: this.now().toISOString()
+          });
+          return { date, status: saved.status, entries: dateEntries };
+        });
         return {
           entries: entries.filter((entry) => dateSet.has(entry.tradeDate)),
-          failures: [],
-          completedDates: [...completed, ...datesToFetch]
+          failures: results
+            .filter((result) => result.status !== 'success')
+            .map((result) => `深交所 ${result.date}：${result.status}`),
+          completedDates: [
+            ...completed,
+            ...results.filter((result) => result.status === 'success').map((result) => result.date)
+          ]
         };
       } catch (error) {
+        for (const date of datesToFetch) {
+          try {
+            this.db.recordOfficialShareDayFailure({
+              exchange: 'SZSE',
+              tradeDate: date,
+              expectedCodes,
+              message: error.message,
+              fetchedAt: this.now().toISOString()
+            });
+          } catch {
+            // Preserve the provider failure as the primary retry reason.
+          }
+        }
         return {
           entries: [],
           failures: [`深交所 ${datesToFetch[0]} 至 ${datesToFetch.at(-1)}：${error.message}`],
@@ -693,26 +746,41 @@ class MarketService {
     results.forEach((result, index) => {
       const date = datesToFetch[index];
       if (result.status === 'rejected') {
+        try {
+          this.db.recordOfficialShareDayFailure({
+            exchange: 'SZSE',
+            tradeDate: date,
+            expectedCodes,
+            message: result.reason.message,
+            fetchedAt: this.now().toISOString()
+          });
+        } catch {
+          // Preserve the provider failure as the primary retry reason.
+        }
         failures.push(`深交所 ${date}：${result.reason.message}`);
         return;
       }
-      successfulDates.push(date);
+      const dateEntries = [];
       for (const etf of etfs) {
         const shares = result.value.values.get(etf.code);
         if (Number.isFinite(shares)) {
-          entries.push({ code: etf.code, tradeDate: date, shares, source: '深交所' });
+          dateEntries.push({ code: etf.code, tradeDate: date, shares, source: '深交所' });
         }
       }
+      entries.push(...dateEntries);
+      const saved = this.db.saveOfficialShareDay({
+        exchange: 'SZSE',
+        tradeDate: date,
+        entries: dateEntries,
+        expectedCodes,
+        message: dateEntries.length === expectedCodes.length
+          ? null
+          : `深交所 ${date} 仅返回 ${dateEntries.length}/${expectedCodes.length} 只目标 ETF`,
+        fetchedAt: this.now().toISOString()
+      });
+      if (saved.status === 'success') successfulDates.push(date);
+      else failures.push(`深交所 ${date}：${saved.status}`);
     });
-    if (successfulDates.length) {
-      this.db.markOfficialShareSyncDates(
-        'SZSE',
-        successfulDates,
-        'success',
-        null,
-        this.now().toISOString()
-      );
-    }
     return {
       entries,
       failures,

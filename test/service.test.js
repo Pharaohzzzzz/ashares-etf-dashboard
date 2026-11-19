@@ -379,15 +379,22 @@ test('official history backfill covers the 250-day analytics window and stays id
   }, lastDate, `${lastDate}T07:00:00.000Z`);
   const sseAttempts = [];
   let rangeCalls = 0;
+  const sseEtfs = ETFS.filter((etf) => etf.code.startsWith('5'));
+  const szseEtfs = ETFS.filter((etf) => etf.code.startsWith('1'));
   const service = new MarketService({
     db,
     sseShareProvider: async (date) => {
       sseAttempts.push(date);
-      return new Map([['510300', 1000 + sseAttempts.length]]);
+      return new Map(sseEtfs.map((etf) => [etf.code, 1000 + sseAttempts.length]));
     },
     szseRangeProvider: async () => {
       rangeCalls += 1;
-      return [];
+      return bars.flatMap((bar) => szseEtfs.map((etf) => ({
+        code: etf.code,
+        tradeDate: bar.date,
+        shares: 900 + sseAttempts.length,
+        source: '深交所'
+      })));
     },
     now: () => new Date('2026-11-20T00:00:00.000Z')
   });
@@ -434,13 +441,62 @@ test('one failed exchange does not discard the other exchange share history', as
 
   const result = await service.syncOfficialShareHistory(lastDate, { historyDays: 5 });
   assert.equal(result.entries.length, 1);
-  assert.equal(result.failures.length, 5);
+  assert.equal(result.failures.length, 10);
   assert.equal(db.countOfficialShareHistory('159919'), 1);
   assert.equal(
     db.getCompletedOfficialShareSyncDates('SZSE', result.requestedDates).size,
-    5
+    0
+  );
+  assert.equal(
+    db.getOfficialShareSyncRecord('SZSE', result.requestedDates.at(-1)).status,
+    'partial'
   );
   assert.equal(db.recentLogs(1)[0].status, 'partial');
+  db.close();
+});
+
+test('empty and partial official responses remain pending and retry to success', async () => {
+  const db = createDatabase(':memory:');
+  const bars = createConsecutiveBars(1);
+  const date = bars[0].date;
+  db.upsertBars('510300', bars);
+  db.saveSnapshot({
+    code: '510300', price: 4.4, previousClose: 4.3, change: 0.1,
+    changePercent: 2, open: 4.3, high: 4.4, low: 4.2, volume: 100,
+    amount: 100, turnoverRate: 1, shares: 2000, marketValue: 4000,
+    timestamp: 1795114800
+  }, date, `${date}T07:00:00.000Z`);
+  const sseEtfs = ETFS.filter((etf) => etf.code.startsWith('5'));
+  let mode = 'empty';
+  const service = new MarketService({
+    db,
+    sseShareProvider: async () => {
+      if (mode === 'empty') return new Map();
+      if (mode === 'partial') return new Map([[sseEtfs[0].code, 1000]]);
+      return new Map(sseEtfs.map((etf) => [etf.code, 1000]));
+    },
+    szseRangeProvider: async () => [],
+    now: () => new Date('2026-11-20T00:00:00.000Z')
+  });
+
+  await service.syncOfficialShareHistory(date, { historyDays: 1 });
+  let record = db.getOfficialShareSyncRecord('SSE', date);
+  assert.equal(record.status, 'pending');
+  assert.equal(record.actualCount, 0);
+
+  mode = 'partial';
+  await service.syncOfficialShareHistory(date, { historyDays: 1 });
+  record = db.getOfficialShareSyncRecord('SSE', date);
+  assert.equal(record.status, 'partial');
+  assert.equal(record.actualCount, 1);
+  assert.equal(record.expectedCount, sseEtfs.length);
+
+  mode = 'complete';
+  const recovered = await service.syncOfficialShareHistory(date, { historyDays: 1 });
+  record = db.getOfficialShareSyncRecord('SSE', date);
+  assert.equal(record.status, 'success');
+  assert.equal(record.actualCount, sseEtfs.length);
+  assert.ok(recovered.entries.length >= sseEtfs.length);
   db.close();
 });
 
