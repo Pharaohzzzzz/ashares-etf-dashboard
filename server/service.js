@@ -81,12 +81,25 @@ class MarketService {
     this.initializing = true;
     this.db.log('startup', 'running', '开始同步两年日线与实时行情', this.now().toISOString());
     try {
-      await mapLimit(ETFS, 4, async (etf) => {
+      const historyResults = await Promise.allSettled(ETFS.map(async (etf) => {
         const count = this.db.countBars(etf.code);
         if (!force && count >= 250) return;
         const bars = await this.klineProvider(etf, 520);
         this.db.upsertBars(etf.code, bars);
-      });
+      }));
+      const failures = historyResults
+        .map((result, index) => result.status === 'rejected'
+          ? `${ETFS[index].code}: ${result.reason.message}`
+          : null)
+        .filter(Boolean);
+      if (failures.length) {
+        this.db.log(
+          'history',
+          failures.length === ETFS.length ? 'error' : 'partial',
+          `${failures.length} 只日线同步失败；${failures.join('；')}`,
+          this.now().toISOString()
+        );
+      }
       await this.refreshQuotes();
       this.initializedAt = this.now().toISOString();
       this.db.setMeta('initializedAt', this.initializedAt);

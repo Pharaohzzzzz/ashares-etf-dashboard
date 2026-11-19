@@ -80,3 +80,25 @@ test('invalid code returns no detail', () => {
   assert.equal(service.getDetail('000000'), null);
   db.close();
 });
+
+test('initialization continues when one ETF history request fails', async () => {
+  const db = createDatabase(':memory:');
+  const service = new MarketService({
+    db,
+    klineProvider: async (etf) => {
+      if (etf.code === '510050') throw new Error('mock history failure');
+      return createBars(1);
+    },
+    quoteProvider: async (etf) => ({
+      code: etf.code, price: 1, previousClose: 1, change: 0,
+      changePercent: 0, open: 1, high: 1, low: 1, volume: 1,
+      amount: 1, turnoverRate: 0, shares: 1, marketValue: 1,
+      timestamp: 1795114800
+    }),
+    now: () => new Date('2026-10-26T08:00:00.000Z')
+  });
+  await service.initialize({ force: true });
+  assert.equal(db.getLatestSnapshots().length, 14);
+  assert.equal(service.getSummary().etfs.length, 14);
+  db.close();
+});

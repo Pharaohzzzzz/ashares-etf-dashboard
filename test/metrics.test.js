@@ -70,3 +70,16 @@ test('a single share increase is not a composite signal', () => {
   assert.equal(result.composite, false);
   assert.equal(result.signals.length, 1);
 });
+
+test('broad resonance does not tag a low-volume broad ETF as a candidate', () => {
+  const result = calculateSignals({
+    isBroad: true,
+    volumeRatio: 0.8,
+    previousVolumeRatio: 0.9,
+    shareDelta: null,
+    broadResonance: true,
+    tailVolumeShare: null
+  });
+  assert.equal(result.composite, false);
+  assert.equal(result.signals.length, 0);
+});

@@ -50,12 +50,13 @@ function calculateSignals({
   if (shareDelta !== null && shareDelta > 0) {
     signals.push({ key: 'share-up', label: '份额增加', level: 'medium' });
   }
-  if (isBroad && broadResonance) {
+  const participatesInResonance = isBroad && broadResonance && ratio !== null && ratio >= 1.5;
+  if (participatesInResonance) {
     signals.push({ key: 'broad-resonance', label: '宽基共振', level: 'high' });
   }
   const composite = (
     (ratio !== null && ratio >= 2 && shareDelta !== null && shareDelta > 0) ||
-    (isBroad && broadResonance)
+    participatesInResonance
   );
   if (composite) signals.push({ key: 'candidate', label: '护盘候选', level: 'high' });
   return { signals, composite };
