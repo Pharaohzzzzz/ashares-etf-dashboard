@@ -1,0 +1,38 @@
+'use strict';
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const { createDatabase } = require('../server/db');
+
+test('database seeds all configured ETFs and stores bars idempotently', () => {
+  const db = createDatabase(':memory:');
+  assert.equal(db.raw.prepare('SELECT COUNT(*) AS count FROM etfs').get().count, 14);
+  const bar = {
+    date: '2026-11-19', open: 4, close: 4.06, high: 4.07, low: 3.99,
+    volume: 100, amount: 400, amplitude: 2, changePercent: 0.5,
+    change: 0.02, turnoverRate: 1.2
+  };
+  db.upsertBars('510300', [bar]);
+  db.upsertBars('510300', [{ ...bar, close: 4.08 }]);
+  const bars = db.getBars('510300');
+  assert.equal(bars.length, 1);
+  assert.equal(bars[0].close, 4.08);
+  db.close();
+});
+
+test('latest snapshots and previous shares use trade-date boundaries', () => {
+  const db = createDatabase(':memory:');
+  const quote = {
+    code: '510300', price: 4.06, previousClose: 4.05, change: 0.01,
+    changePercent: 0.25, open: 4.05, high: 4.07, low: 4.04,
+    volume: 100, amount: 400, turnoverRate: 1.2, shares: 1000,
+    marketValue: 4000, timestamp: 1795075898
+  };
+  db.saveSnapshot(quote, '2026-11-18', '2026-11-18T07:00:00.000Z');
+  db.saveSnapshot({ ...quote, shares: 1200 }, '2026-11-19', '2026-11-19T07:00:00.000Z');
+  const latest = db.getLatestSnapshots();
+  assert.equal(latest.length, 1);
+  assert.equal(latest[0].shares, 1200);
+  assert.equal(db.getPreviousShares('510300', '2026-11-19'), 1000);
+  db.close();
+});
