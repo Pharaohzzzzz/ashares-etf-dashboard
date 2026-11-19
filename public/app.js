@@ -444,6 +444,7 @@ function renderDetail(detail, intraday) {
     ['近20日', formatter.percent(row.return20d), directionClass(row.return20d)],
     ['当前份额', formatter.shares(row.shares), ''],
     ['上一期份额', formatter.shares(row.previousShares), ''],
+    ['份额基准', row.previousShareDate ? `${row.previousShareDate} · ${row.previousShareSource}` : '--', 'neutral'],
     ['份额变化', row.shareDelta === null ? '待积累' : formatter.signedShares(row.shareDelta), directionClass(row.shareDelta)],
     ['估算净申赎', row.estimatedSubscription === null ? '--' : formatter.signedAmount(row.estimatedSubscription), directionClass(row.estimatedSubscription)],
     ['成交额分位', formatter.plainPercent(row.amountPercentile === null ? null : row.amountPercentile * 100, 1), ''],
@@ -458,7 +459,7 @@ function renderDetail(detail, intraday) {
   elements.drawerBody.append(metrics);
 
   const disclaimer = createElement('div', 'detail-note');
-  disclaimer.textContent = '份额变化仅在网站积累了两个交易日快照后可用。二级市场买入不增加总份额，候选信号不代表已确认的国家队成交。当前公开行情接口未提供可靠的 IOPV，因此折溢价显示“暂无”。';
+  disclaimer.textContent = '份额变化优先使用交易所上一交易日官方份额。若交易所回填暂时失败，才退回到网站自身快照。二级市场买入不增加总份额，候选信号不代表已确认的国家队成交。当前公开行情接口未提供可靠的 IOPV，因此折溢价显示“暂无”。';
   elements.drawerBody.append(disclaimer);
 
   const signalNote = createElement('section', 'signal-note');

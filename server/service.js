@@ -1,6 +1,6 @@
 'use strict';
 
-const { ETFS, getEtf } = require('../config/etfs');
+const { ETFS, getEtf, getMarket } = require('../config/etfs');
 const {
   volumeRatio,
   percentile,
@@ -8,6 +8,7 @@ const {
   calculateSignals
 } = require('./metrics');
 const { fetchQuote, fetchKlines, fetchTrends } = require('./provider');
+const { fetchSseEtfShares, fetchSzseEtfShares } = require('./official-shares');
 
 const shanghaiDateFormatter = new Intl.DateTimeFormat('en-CA', {
   timeZone: 'Asia/Shanghai',
@@ -64,12 +65,16 @@ class MarketService {
     quoteProvider = fetchQuote,
     klineProvider = fetchKlines,
     trendProvider = fetchTrends,
+    sseShareProvider = fetchSseEtfShares,
+    szseShareProvider = fetchSzseEtfShares,
     now = () => new Date()
   }) {
     this.db = db;
     this.quoteProvider = quoteProvider;
     this.klineProvider = klineProvider;
     this.trendProvider = trendProvider;
+    this.sseShareProvider = sseShareProvider;
+    this.szseShareProvider = szseShareProvider;
     this.now = now;
     this.refreshPromise = null;
     this.initializing = false;
@@ -101,6 +106,11 @@ class MarketService {
         );
       }
       await this.refreshQuotes();
+      try {
+        await this.syncOfficialShareHistory();
+      } catch (error) {
+        this.db.log('shares', 'error', `官方份额同步失败：${error.message}`, this.now().toISOString());
+      }
       this.initializedAt = this.now().toISOString();
       this.db.setMeta('initializedAt', this.initializedAt);
       this.db.log('startup', 'success', '历史数据与实时行情同步完成', this.initializedAt);
@@ -142,6 +152,11 @@ class MarketService {
       this.now().toISOString()
     );
     await this.refreshQuotes();
+    try {
+      await this.syncOfficialShareHistory();
+    } catch (error) {
+      this.db.log('shares', 'error', `官方份额同步失败：${error.message}`, this.now().toISOString());
+    }
     return this.getSummary();
   }
 
@@ -157,6 +172,14 @@ class MarketService {
         const quote = result.value;
         const tradeDate = tradeDateFromTimestamp(quote.timestamp);
         this.db.saveSnapshot(quote, tradeDate, capturedAt);
+        if (quote.shares !== null) {
+          this.db.saveShareHistory([{
+            code: quote.code,
+            tradeDate,
+            shares: quote.shares,
+            source: '行情快照'
+          }], capturedAt);
+        }
         successCount += 1;
       } else {
         failures.push(`${ETFS[index].code}: ${result.reason?.message || '无有效时间戳'}`);
@@ -170,6 +193,11 @@ class MarketService {
       capturedAt
     );
     const summary = this.getSummary();
+    this.persistSummaryMetrics(summary, capturedAt);
+    return summary;
+  }
+
+  persistSummaryMetrics(summary, updatedAt) {
     for (const row of summary.etfs) {
       if (row.tradeDate) {
         this.db.saveDailyMetrics({
@@ -184,11 +212,69 @@ class MarketService {
           shareDelta: row.shareDelta,
           estimatedSubscription: row.estimatedSubscription,
           signals: row.signals,
-          updatedAt: capturedAt
+          updatedAt
         });
       }
     }
-    return summary;
+  }
+
+  async syncOfficialShareHistory(tradeDate) {
+    const currentTradeDate = tradeDate ||
+      this.db.getLatestSnapshots().map((row) => row.trade_date).sort().at(-1);
+    if (!currentTradeDate) return null;
+    const previousTradeDate = this.db.getLatestBarDateBefore(currentTradeDate);
+    if (!previousTradeDate) return null;
+
+    const sseEtfs = ETFS.filter((etf) => getMarket(etf.code) === 1);
+    const szseEtfs = ETFS.filter((etf) => getMarket(etf.code) === 0);
+    const tradeDates = previousTradeDate === currentTradeDate
+      ? [currentTradeDate]
+      : [previousTradeDate, currentTradeDate];
+    const dateResults = await Promise.all(tradeDates.map(async (date) => {
+      const [sseResult, szseResult] = await Promise.allSettled([
+        this.sseShareProvider(date),
+        this.szseShareProvider(szseEtfs.map((etf) => etf.code), date)
+      ]);
+      const entries = [];
+      const failures = [];
+      if (sseResult.status === 'fulfilled') {
+        for (const etf of sseEtfs) {
+          const shares = sseResult.value.get(etf.code);
+          if (Number.isFinite(shares)) {
+            entries.push({ code: etf.code, tradeDate: date, shares, source: '上交所' });
+          }
+        }
+      } else {
+        failures.push(`${date} 上交所：${sseResult.reason.message}`);
+      }
+      if (szseResult.status === 'fulfilled') {
+        for (const etf of szseEtfs) {
+          const shares = szseResult.value.get(etf.code);
+          if (Number.isFinite(shares)) {
+            entries.push({ code: etf.code, tradeDate: date, shares, source: '深交所' });
+          }
+        }
+      } else {
+        failures.push(`${date} 深交所：${szseResult.reason.message}`);
+      }
+      return { entries, failures };
+    }));
+    const entries = dateResults.flatMap((result) => result.entries);
+    const failures = dateResults.flatMap((result) => result.failures);
+    if (entries.length) this.db.saveShareHistory(entries, this.now().toISOString());
+    const expected = ETFS.length * tradeDates.length;
+    const status = entries.length ? (failures.length || entries.length < expected ? 'partial' : 'success') : 'error';
+    this.db.log(
+      'shares',
+      status,
+      failures.length
+        ? `已同步 ${entries.length}/${expected} 条；${failures.join('；')}`
+        : `已同步 ${entries.length}/${expected} 条官方份额`,
+      this.now().toISOString()
+    );
+    const summary = this.getSummary();
+    this.persistSummaryMetrics(summary, this.now().toISOString());
+    return { tradeDate: previousTradeDate, entries, summary };
   }
 
   getSummary() {
@@ -204,12 +290,18 @@ class MarketService {
       const previousRatio = priorDayBar
         ? volumeRatio(priorDayBar.amount, priorBars.slice(-21, -1).map((bar) => bar.amount))
         : null;
-      const previousShares = this.db.getPreviousShares(quote.code, quote.tradeDate);
-      const shareDelta = quote.shares !== null && previousShares !== null
-        ? quote.shares - previousShares
+      const currentShareRecord = this.db.getShareRecord(quote.code, quote.tradeDate);
+      const shares = currentShareRecord?.shares ?? quote.shares;
+      const sharesSource = currentShareRecord?.source || '行情快照';
+      const previousShareRecord = this.db.getPreviousShareRecord(quote.code, quote.tradeDate);
+      const previousShares = previousShareRecord?.shares ?? null;
+      const shareDelta = shares !== null && previousShares !== null
+        ? shares - previousShares
         : null;
       return {
         ...quote,
+        shares,
+        sharesSource,
         volumeRatio: ratio,
         previousVolumeRatio: previousRatio,
         return5d: periodReturn(quote.price, priorBars.map((bar) => bar.close), 5),
@@ -219,6 +311,8 @@ class MarketService {
           priorBars.slice(-250).map((bar) => bar.amount)
         ),
         previousShares,
+        previousShareDate: previousShareRecord?.tradeDate || null,
+        previousShareSource: previousShareRecord?.source || null,
         shareDelta,
         estimatedSubscription: shareDelta !== null && quote.price !== null
           ? shareDelta * quote.price

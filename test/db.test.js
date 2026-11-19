@@ -17,6 +17,7 @@ test('database seeds all configured ETFs and stores bars idempotently', () => {
   const bars = db.getBars('510300');
   assert.equal(bars.length, 1);
   assert.equal(bars[0].close, 4.08);
+  assert.equal(db.getLatestBarDateBefore('2026-11-19'), null);
   db.close();
 });
 
@@ -47,5 +48,11 @@ test('official share history takes precedence over quote snapshots', () => {
   assert.equal(record.shares, 980);
   assert.equal(record.tradeDate, '2026-11-18');
   assert.equal(record.source, 'SSE');
+  db.saveShareHistory([
+    { code: '510300', tradeDate: '2026-11-18', shares: 777, source: '行情快照' }
+  ]);
+  const protectedRecord = db.getShareRecord('510300', '2026-11-18');
+  assert.equal(protectedRecord.shares, 980);
+  assert.equal(protectedRecord.source, 'SSE');
   db.close();
 });

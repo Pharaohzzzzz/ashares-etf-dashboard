@@ -95,10 +95,50 @@ test('initialization continues when one ETF history request fails', async () => 
       amount: 1, turnoverRate: 0, shares: 1, marketValue: 1,
       timestamp: 1795114800
     }),
+    sseShareProvider: async () => new Map(),
+    szseShareProvider: async () => new Map(),
     now: () => new Date('2026-10-26T08:00:00.000Z')
   });
   await service.initialize({ force: true });
   assert.equal(db.getLatestSnapshots().length, 14);
   assert.equal(service.getSummary().etfs.length, 14);
+  db.close();
+});
+
+test('official previous-day shares populate ETF share delta immediately', async () => {
+  const db = createDatabase(':memory:');
+  db.upsertBars('510300', [
+    {
+      date: '2026-11-17', open: 4, close: 4.05, high: 4.1, low: 3.9,
+      volume: 100, amount: 100, amplitude: 1, changePercent: 1,
+      change: 0.01, turnoverRate: 1
+    },
+    {
+      date: '2026-11-18', open: 4, close: 4.1, high: 4.2, low: 3.9,
+      volume: 100, amount: 100, amplitude: 1, changePercent: 1,
+      change: 0.01, turnoverRate: 1
+    }
+  ]);
+  db.saveSnapshot({
+    code: '510300', price: 4.2, previousClose: 4.1, change: 0.1,
+    changePercent: 2, open: 4.1, high: 4.2, low: 4.0, volume: 100,
+    amount: 100, turnoverRate: 1, shares: 1200, marketValue: 4000,
+    timestamp: 1795114800
+  }, '2026-11-19', '2026-11-19T07:00:00.000Z');
+  const service = new MarketService({
+    db,
+    sseShareProvider: async (date) => new Map([['510300', date === '2026-11-19' ? 1200 : 1000]]),
+    szseShareProvider: async () => new Map(),
+    now: () => new Date('2026-11-20T00:00:00.000Z')
+  });
+  const result = await service.syncOfficialShareHistory('2026-11-19');
+  const row = result.summary.etfs.find((etf) => etf.code === '510300');
+  assert.equal(result.tradeDate, '2026-11-18');
+  assert.equal(row.shares, 1200);
+  assert.equal(row.sharesSource, '上交所');
+  assert.equal(row.previousShares, 1000);
+  assert.equal(row.previousShareSource, '上交所');
+  assert.equal(row.shareDelta, 200);
+  assert.equal(row.estimatedSubscription, 840);
   db.close();
 });

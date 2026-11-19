@@ -152,6 +152,11 @@ function createDatabase(filePath) {
     countBars(code) {
       return db.prepare('SELECT COUNT(*) AS count FROM daily_bars WHERE code = ?').get(code).count;
     },
+    getLatestBarDateBefore(tradeDate) {
+      return db.prepare(
+        'SELECT MAX(date) AS date FROM daily_bars WHERE date < ?'
+      ).get(tradeDate)?.date || null;
+    },
     saveSnapshot(quote, tradeDate, capturedAt) {
       const dataTime = quote.timestamp
         ? new Date(quote.timestamp * 1000).toISOString()
@@ -221,13 +226,30 @@ function createDatabase(filePath) {
       `).get(code, tradeDate);
       return snapshot || null;
     },
+    getShareRecord(code, tradeDate) {
+      const official = db.prepare(`
+        SELECT trade_date AS tradeDate, shares, source
+        FROM share_history
+        WHERE code = ? AND trade_date = ?
+        LIMIT 1
+      `).get(code, tradeDate);
+      return official || null;
+    },
     saveShareHistory(entries, fetchedAt = new Date().toISOString()) {
       const statement = db.prepare(`
         INSERT INTO share_history(code, trade_date, shares, source, fetched_at)
         VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(code, trade_date) DO UPDATE SET
-          shares = excluded.shares,
-          source = excluded.source,
+          shares = CASE
+            WHEN share_history.source IN ('上交所', '深交所', 'SSE', 'SZSE') AND excluded.source = '行情快照'
+              THEN share_history.shares
+            ELSE excluded.shares
+          END,
+          source = CASE
+            WHEN share_history.source IN ('上交所', '深交所', 'SSE', 'SZSE') AND excluded.source = '行情快照'
+              THEN share_history.source
+            ELSE excluded.source
+          END,
           fetched_at = excluded.fetched_at
       `);
       db.exec('BEGIN');
