@@ -25,8 +25,8 @@ function percentile(value, history) {
   return valid.filter((item) => item <= value).length / valid.length;
 }
 
-function periodReturn(close, closesAscending) {
-  const prior = closesAscending.at(-1);
+function periodReturn(close, closesAscending, periods = 1) {
+  const prior = closesAscending.at(-periods);
   if (!Number.isFinite(close) || !Number.isFinite(prior) || prior <= 0) return null;
   return close / prior - 1;
 }

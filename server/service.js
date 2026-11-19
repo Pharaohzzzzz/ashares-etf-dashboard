@@ -199,8 +199,8 @@ class MarketService {
         ...quote,
         volumeRatio: ratio,
         previousVolumeRatio: previousRatio,
-        return5d: periodReturn(quote.price, priorBars.slice(-5).map((bar) => bar.close)),
-        return20d: periodReturn(quote.price, priorBars.slice(-20).map((bar) => bar.close)),
+        return5d: periodReturn(quote.price, priorBars.map((bar) => bar.close), 5),
+        return20d: periodReturn(quote.price, priorBars.map((bar) => bar.close), 20),
         amountPercentile: percentile(
           quote.amount,
           priorBars.slice(-250).map((bar) => bar.amount)

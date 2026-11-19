@@ -37,6 +37,11 @@ test('period return uses the last prior close', () => {
   assert.equal(periodReturn(110, []), null);
 });
 
+test('period return can use a multi-day lookback', () => {
+  assert.ok(Math.abs(periodReturn(120, [80, 90, 100], 3) - 0.5) < 1e-12);
+  assert.equal(periodReturn(120, [80, 90], 3), null);
+});
+
 test('signals flag broad resonance and composite candidate', () => {
   const result = calculateSignals({
     isBroad: true,
