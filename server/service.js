@@ -9,6 +9,12 @@ const {
   calculateShareWindow,
   calculateSignals
 } = require('./metrics');
+const {
+  SIGNAL_PARAMETERS,
+  buildSignalObservations,
+  buildBacktest,
+  datasetFingerprint
+} = require('./signal-backtest');
 const { fetchQuote, fetchKlines, fetchTrends } = require('./provider');
 const {
   fetchSseEtfShares,
@@ -91,6 +97,7 @@ class MarketService {
     this.now = now;
     this.refreshPromise = null;
     this.shareSyncPromise = null;
+    this.backtestPromise = null;
     this.initializing = false;
     this.initializedAt = db.getMeta('initializedAt');
   }
@@ -124,6 +131,11 @@ class MarketService {
         await this.syncOfficialShareHistory();
       } catch (error) {
         this.db.log('shares', 'error', `官方份额同步失败：${error.message}`, this.now().toISOString());
+      }
+      try {
+        await this.runSignalBacktest();
+      } catch (error) {
+        this.db.log('backtest', 'error', `信号回测失败：${error.message}`, this.now().toISOString());
       }
       this.initializedAt = this.now().toISOString();
       this.db.setMeta('initializedAt', this.initializedAt);
@@ -170,6 +182,11 @@ class MarketService {
       await this.syncOfficialShareHistory();
     } catch (error) {
       this.db.log('shares', 'error', `官方份额同步失败：${error.message}`, this.now().toISOString());
+    }
+    try {
+      await this.runSignalBacktest();
+    } catch (error) {
+      this.db.log('backtest', 'error', `信号回测失败：${error.message}`, this.now().toISOString());
     }
     return this.getSummary();
   }
@@ -399,8 +416,28 @@ class MarketService {
 
   getSummary() {
     const quoteRows = this.db.getLatestSnapshots().map(snapshotToQuote);
-    const baseRows = quoteRows.map((quote) => {
+    const marketData = quoteRows.map((quote) => {
       const bars = this.db.getBars(quote.code, 520);
+      const officialHistory = this.db.getOfficialShareHistory(
+        quote.code,
+        OFFICIAL_HISTORY_DAYS + 1
+      );
+      return {
+        quote,
+        etf: getEtf(quote.code),
+        bars,
+        shares: officialHistory,
+        officialHistory
+      };
+    });
+    const scoreAnalysis = buildSignalObservations(
+      marketData.map(({ etf, bars, shares }) => ({ etf, bars, shares }))
+    );
+    const latestScoreByCode = new Map();
+    for (const observation of scoreAnalysis.observations) {
+      latestScoreByCode.set(observation.code, observation);
+    }
+    const baseRows = marketData.map(({ quote, bars, officialHistory }) => {
       const priorBars = bars.filter((bar) => bar.date < quote.tradeDate);
       const ratio = volumeRatio(
         quote.amount,
@@ -418,7 +455,6 @@ class MarketService {
       const shareDelta = shares !== null && previousShares !== null
         ? shares - previousShares
         : null;
-      const officialHistory = this.db.getOfficialShareHistory(quote.code, OFFICIAL_HISTORY_DAYS + 1);
       const latestOfficial = officialHistory.at(-1) || null;
       const officialTradeDates = latestOfficial
         ? this.db.getRecentTradeDates(officialHistory.length, latestOfficial.tradeDate)
@@ -467,13 +503,23 @@ class MarketService {
         broadResonance,
         tailVolumeShare: null
       });
+      const latestScore = latestScoreByCode.get(row.code) || null;
       return {
         ...row,
         broadResonance,
         signals: result.signals,
-        composite: result.composite
+        composite: result.composite,
+        score: latestScore?.score ?? null,
+        scoreDate: latestScore?.date ?? null,
+        scoreLevel: latestScore?.level ?? null,
+        scoreComponents: latestScore?.components ?? null,
+        scoreReasons: latestScore?.reasons ?? [],
+        scoreStatus: latestScore ? 'ready' : 'insufficient',
+        scoreSignal: latestScore?.isSignal || false
       };
     }).sort((left, right) => {
+      if (left.scoreSignal !== right.scoreSignal) return left.scoreSignal ? -1 : 1;
+      if ((left.score || 0) !== (right.score || 0)) return (right.score || 0) - (left.score || 0);
       if (left.composite !== right.composite) return left.composite ? -1 : 1;
       return (right.volumeRatio || 0) - (left.volumeRatio || 0);
     });
@@ -489,6 +535,8 @@ class MarketService {
       volumeUpCount: rows.filter((row) => row.volumeRatio !== null && row.volumeRatio >= 2).length,
       shareUpCount: rows.filter((row) => row.shareDelta !== null && row.shareDelta > 0).length,
       compositeCount: rows.filter((row) => row.composite).length,
+      scoreSignalCount: rows.filter((row) => row.scoreSignal).length,
+      highScoreCount: rows.filter((row) => row.score >= SIGNAL_PARAMETERS.levels.high).length,
       broadResonance,
       etfs: rows,
       logs: this.db.recentLogs()
@@ -564,6 +612,78 @@ class MarketService {
       range: ranges[selectedDays] || ranges[OFFICIAL_HISTORY_DAYS],
       ranges
     };
+  }
+
+  loadBacktestDataset() {
+    return ETFS.map((etf) => ({
+      etf,
+      bars: this.db.getBars(etf.code, 520),
+      shares: this.db.getOfficialShareHistory(etf.code, 520)
+    }));
+  }
+
+  async runSignalBacktest() {
+    if (this.backtestPromise) return this.backtestPromise;
+    this.backtestPromise = this.performSignalBacktest();
+    try {
+      return await this.backtestPromise;
+    } finally {
+      this.backtestPromise = null;
+    }
+  }
+
+  async performSignalBacktest() {
+    const dataset = this.loadBacktestDataset();
+    const fingerprint = datasetFingerprint(dataset);
+    const existing = this.db.getBacktestRun(SIGNAL_PARAMETERS.version, fingerprint);
+    if (existing) return existing;
+
+    const run = buildBacktest(dataset);
+    this.db.saveBacktestRun(run, run.events);
+    const saved = this.db.getBacktestRun(SIGNAL_PARAMETERS.version, fingerprint);
+    this.db.log(
+      'backtest',
+      'success',
+      `信号回测完成：${saved.result.splits.train.signalCount} 个训练期信号，${saved.result.splits.validation.signalCount} 个验证期信号`,
+      this.now().toISOString()
+    );
+    return saved;
+  }
+
+  async getBacktestSummary() {
+    const run = await this.runSignalBacktest();
+    return {
+      ...run.result,
+      parameterVersion: run.parameterVersion,
+      datasetFingerprint: run.datasetFingerprint,
+      generatedAt: run.generatedAt,
+      run: {
+        id: run.id,
+        parameterVersion: run.parameterVersion,
+        datasetFingerprint: run.datasetFingerprint,
+        generatedAt: run.generatedAt,
+        status: run.status,
+        trainStart: run.trainStart,
+        trainEnd: run.trainEnd,
+        validationStart: run.validationStart,
+        validationEnd: run.validationEnd
+      },
+      parameters: run.parameters
+    };
+  }
+
+  async getBacktestEvents(filters = {}) {
+    const run = await this.runSignalBacktest();
+    return {
+      runId: run.id,
+      parameterVersion: run.parameterVersion,
+      events: this.db.getSignalEvents(run.id, filters)
+    };
+  }
+
+  async getBacktestEvent(id) {
+    await this.runSignalBacktest();
+    return this.db.getSignalEvent(id);
   }
 
   async getIntraday(code) {

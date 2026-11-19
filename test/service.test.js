@@ -4,6 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { createDatabase } = require('../server/db');
 const { MarketService } = require('../server/service');
+const { ETFS } = require('../config/etfs');
 
 function createBars(count = 25) {
   return Array.from({ length: count }, (_, index) => {
@@ -262,5 +263,51 @@ test('share history API model exposes 20/60/250 windows and real coverage', () =
   assert.equal(history.streak.days, 29);
   assert.ok(Number.isFinite(history.range.periodEstimatedSubscription));
   assert.ok(Number.isFinite(history.range.sharePercentile));
+  db.close();
+});
+
+test('signal backtest is deterministic and does not duplicate a matching dataset run', async () => {
+  const db = createDatabase(':memory:');
+  const bars = createConsecutiveBars(90);
+  for (const etf of ETFS) {
+    db.upsertBars(etf.code, bars);
+    db.saveShareHistory(bars.map((bar, index) => ({
+      code: etf.code,
+      tradeDate: bar.date,
+      shares: 100000 + index * 100,
+      source: etf.code.startsWith('1') ? '深交所' : '上交所'
+    })));
+  }
+  const service = new MarketService({
+    db,
+    now: () => new Date('2026-11-20T08:00:00.000Z')
+  });
+
+  const first = await service.runSignalBacktest();
+  const firstEventCount = db.countSignalEvents(first.id);
+  const second = await service.runSignalBacktest();
+  assert.equal(second.id, first.id);
+  assert.equal(db.countSignalEvents(second.id), firstEventCount);
+  assert.ok(firstEventCount > 0);
+  assert.equal(db.raw.prepare('SELECT COUNT(*) AS count FROM backtest_runs').get().count, 1);
+  assert.equal(
+    db.raw.prepare('SELECT COUNT(*) AS count FROM signal_events').get().count,
+    firstEventCount
+  );
+  db.close();
+});
+
+test('signal backtest reports insufficient official share history per ETF', async () => {
+  const db = createDatabase(':memory:');
+  const service = new MarketService({
+    db,
+    now: () => new Date('2026-11-20T08:00:00.000Z')
+  });
+  const run = await service.runSignalBacktest();
+  const summary = await service.getBacktestSummary();
+  assert.equal(run.id, summary.run.id);
+  assert.equal(summary.etfStatus.length, ETFS.length);
+  assert.ok(summary.etfStatus.every((etf) => etf.status === 'insufficient'));
+  assert.ok(summary.etfStatus.every((etf) => etf.reason));
   db.close();
 });

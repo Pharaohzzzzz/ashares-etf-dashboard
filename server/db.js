@@ -104,11 +104,51 @@ function createDatabase(filePath) {
       value TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS backtest_runs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      parameter_version TEXT NOT NULL,
+      dataset_fingerprint TEXT NOT NULL,
+      parameters_json TEXT NOT NULL,
+      train_start TEXT,
+      train_end TEXT,
+      validation_start TEXT,
+      validation_end TEXT,
+      status TEXT NOT NULL,
+      result_json TEXT NOT NULL,
+      generated_at TEXT NOT NULL,
+      UNIQUE(parameter_version, dataset_fingerprint)
+    );
+
+    CREATE TABLE IF NOT EXISTS signal_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_id INTEGER NOT NULL,
+      code TEXT NOT NULL,
+      signal_date TEXT NOT NULL,
+      split_name TEXT NOT NULL,
+      score REAL NOT NULL,
+      level_key TEXT NOT NULL,
+      level_label TEXT NOT NULL,
+      components_json TEXT NOT NULL,
+      reasons_json TEXT NOT NULL,
+      outcomes_json TEXT NOT NULL,
+      future_path_json TEXT NOT NULL,
+      legacy_composite INTEGER NOT NULL DEFAULT 0,
+      legacy_signals_json TEXT NOT NULL,
+      FOREIGN KEY(run_id) REFERENCES backtest_runs(id) ON DELETE CASCADE,
+      UNIQUE(run_id, code, signal_date)
+    );
+
     CREATE INDEX IF NOT EXISTS idx_snapshots_latest ON snapshots(code, captured_at DESC);
     CREATE INDEX IF NOT EXISTS idx_bars_code_date ON daily_bars(code, date);
     CREATE INDEX IF NOT EXISTS idx_share_history_code_date ON share_history(code, trade_date DESC);
     CREATE INDEX IF NOT EXISTS idx_share_sync_exchange_date
       ON official_share_sync_dates(exchange, trade_date DESC);
+    CREATE INDEX IF NOT EXISTS idx_backtest_runs_generated
+      ON backtest_runs(generated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_signal_events_run_date
+      ON signal_events(run_id, signal_date DESC);
+    CREATE INDEX IF NOT EXISTS idx_signal_events_run_code
+      ON signal_events(run_id, code, signal_date DESC);
   `);
 
   const insertEtf = db.prepare(`
@@ -380,6 +420,126 @@ function createDatabase(filePath) {
         'SELECT scope, status, message, created_at AS createdAt FROM update_log ORDER BY id DESC LIMIT ?'
       ).all(limit);
     },
+    getBacktestRun(parameterVersion, datasetFingerprint) {
+      const row = db.prepare(`
+        SELECT *
+        FROM backtest_runs
+        WHERE parameter_version = ? AND dataset_fingerprint = ?
+      `).get(parameterVersion, datasetFingerprint);
+      return row ? parseBacktestRun(row) : null;
+    },
+    saveBacktestRun(run, events) {
+      const insertRun = db.prepare(`
+        INSERT INTO backtest_runs(
+          parameter_version, dataset_fingerprint, parameters_json,
+          train_start, train_end, validation_start, validation_end,
+          status, result_json, generated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      const insertEvent = db.prepare(`
+        INSERT INTO signal_events(
+          run_id, code, signal_date, split_name, score, level_key, level_label,
+          components_json, reasons_json, outcomes_json, future_path_json,
+          legacy_composite, legacy_signals_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      const {
+        events: ignoredEvents,
+        parameterVersion,
+        datasetFingerprint,
+        parameters,
+        window,
+        generatedAt,
+        ...result
+      } = run;
+      db.exec('BEGIN');
+      try {
+        const runResult = insertRun.run(
+          parameterVersion,
+          datasetFingerprint,
+          JSON.stringify(parameters),
+          window.trainStart,
+          window.trainEnd,
+          window.validationStart,
+          window.validationEnd,
+          'complete',
+          JSON.stringify(result),
+          generatedAt
+        );
+        const runId = Number(runResult.lastInsertRowid);
+        for (const event of events) {
+          insertEvent.run(
+            runId,
+            event.code,
+            event.date,
+            event.split,
+            event.score,
+            event.level.key,
+            event.level.label,
+            JSON.stringify(event.components),
+            JSON.stringify(event.reasons),
+            JSON.stringify(event.outcomes),
+            JSON.stringify(event.futurePath),
+            event.legacyComposite ? 1 : 0,
+            JSON.stringify(event.legacySignals)
+          );
+        }
+        db.exec('COMMIT');
+        return runId;
+      } catch (error) {
+        db.exec('ROLLBACK');
+        throw error;
+      }
+    },
+    getSignalEvents(runId, filters = {}) {
+      const conditions = ['e.run_id = ?'];
+      const values = [runId];
+      if (filters.code) {
+        conditions.push('e.code = ?');
+        values.push(filters.code);
+      }
+      if (filters.category) {
+        conditions.push('f.category = ?');
+        values.push(filters.category);
+      }
+      if (filters.level) {
+        conditions.push('e.level_key = ?');
+        values.push(filters.level);
+      }
+      if (filters.split) {
+        conditions.push('e.split_name = ?');
+        values.push(filters.split);
+      }
+      if (filters.from) {
+        conditions.push('e.signal_date >= ?');
+        values.push(filters.from);
+      }
+      if (filters.to) {
+        conditions.push('e.signal_date <= ?');
+        values.push(filters.to);
+      }
+      return db.prepare(`
+        SELECT e.*, f.name, f.category
+        FROM signal_events e
+        JOIN etfs f ON f.code = e.code
+        WHERE ${conditions.join(' AND ')}
+        ORDER BY e.signal_date DESC, e.score DESC, e.code ASC
+      `).all(...values).map(parseSignalEvent);
+    },
+    getSignalEvent(id) {
+      const row = db.prepare(`
+        SELECT e.*, f.name, f.category
+        FROM signal_events e
+        JOIN etfs f ON f.code = e.code
+        WHERE e.id = ?
+      `).get(id);
+      return row ? parseSignalEvent(row) : null;
+    },
+    countSignalEvents(runId) {
+      return db.prepare(
+        'SELECT COUNT(*) AS count FROM signal_events WHERE run_id = ?'
+      ).get(runId).count;
+    },
     getMeta(key) {
       return db.prepare('SELECT value FROM app_meta WHERE key = ?').get(key)?.value ?? null;
     },
@@ -393,4 +553,40 @@ function createDatabase(filePath) {
 }
 
 module.exports = { createDatabase };
+
+function parseBacktestRun(row) {
+  return {
+    id: row.id,
+    parameterVersion: row.parameter_version,
+    datasetFingerprint: row.dataset_fingerprint,
+    parameters: JSON.parse(row.parameters_json),
+    trainStart: row.train_start,
+    trainEnd: row.train_end,
+    validationStart: row.validation_start,
+    validationEnd: row.validation_end,
+    status: row.status,
+    generatedAt: row.generated_at,
+    result: JSON.parse(row.result_json)
+  };
+}
+
+function parseSignalEvent(row) {
+  return {
+    id: row.id,
+    runId: row.run_id,
+    code: row.code,
+    name: row.name,
+    category: row.category,
+    date: row.signal_date,
+    split: row.split_name,
+    score: row.score,
+    level: { key: row.level_key, label: row.level_label },
+    components: JSON.parse(row.components_json),
+    reasons: JSON.parse(row.reasons_json),
+    outcomes: JSON.parse(row.outcomes_json),
+    futurePath: JSON.parse(row.future_path_json),
+    legacyComposite: Boolean(row.legacy_composite),
+    legacySignals: JSON.parse(row.legacy_signals_json)
+  };
+}
 

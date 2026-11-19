@@ -47,6 +47,66 @@ const service = {
       },
       ranges: {}
     }
+    : null,
+  getBacktestSummary: async () => ({
+    parameterVersion: 'signal-score-v1.0.1',
+    run: { id: 7, generatedAt: '2026-11-20T08:00:00.000Z' },
+    parameters: { weights: { volume: 35 }, horizons: [1, 3, 5, 10] },
+    splits: {
+      train: {},
+      validation: {}
+    }
+  }),
+  getBacktestEvents: async (filters) => ({
+    runId: 7,
+    parameterVersion: 'signal-score-v1.0.1',
+    events: filters.code === '000000'
+      ? []
+      : filters.code === '588170'
+        ? [{
+          id: 12,
+          code: '588170',
+          name: '科创半导体ETF华夏',
+          category: '半导体',
+          date: '2026-11-19',
+          split: 'validation',
+          score: 63.8,
+          level: { key: 'active', label: '活跃异动' },
+          legacyComposite: false,
+          outcomes: { 5: {} }
+        }]
+        : [{
+          id: 11,
+          code: '510300',
+          name: '沪深300ETF华泰柏瑞',
+          category: '宽基核心',
+          date: '2026-10-15',
+          split: 'validation',
+          score: 72.5,
+          level: { key: 'active', label: '活跃异动' },
+          legacyComposite: true,
+          outcomes: {
+            5: {
+              futureReturn: 0.03,
+              drawdown: -0.02,
+              maxFavorable: 0.04,
+              benchmarkReturn: 0.01,
+              outperformedBenchmark: true,
+              baselineHitRate: 0.48,
+              returnVsUnconditional: 0.012
+            }
+          }
+        }]
+  }),
+  getBacktestEvent: async (id) => Number(id) === 11
+    ? {
+      id: 11,
+      code: '510300',
+      date: '2026-10-15',
+      components: [{ key: 'volume', contribution: 20 }],
+      outcomes: { 5: { futureReturn: 0.03 } },
+      futurePath: { 5: [{ date: '2026-10-16', close: 4.2, relative: 0.01 }] }
+    }
     : null
 };
 
@@ -77,6 +137,28 @@ test('summary, health, detail and CSV APIs respond', async (context) => {
     .then((response) => response.text());
   assert.match(shareCsv, /官方总份额/);
   assert.match(shareCsv, /2026-11-19/);
+
+  const backtestSummary = await fetch(`${base}/api/backtests/summary`)
+    .then((response) => response.json());
+  assert.equal(backtestSummary.run.id, 7);
+  const backtestEvents = await fetch(`${base}/api/backtests/events?horizon=5&code=510300`)
+    .then((response) => response.json());
+  assert.equal(backtestEvents.events[0].score, 72.5);
+  const invalidHorizon = await fetch(`${base}/api/backtests/events?horizon=2`);
+  assert.equal(invalidHorizon.status, 400);
+  const signalEvent = await fetch(`${base}/api/backtests/events/11`)
+    .then((response) => response.json());
+  assert.equal(signalEvent.components[0].contribution, 20);
+  const missingSignalEvent = await fetch(`${base}/api/backtests/events/12`);
+  assert.equal(missingSignalEvent.status, 404);
+  const backtestCsv = await fetch(`${base}/api/export.csv?type=backtest&horizon=5&code=510300`)
+    .then((response) => response.text());
+  assert.match(backtestCsv, /信号日期/);
+  assert.match(backtestCsv, /72.5/);
+  const missingOutcomeCsv = await fetch(`${base}/api/export.csv?type=backtest&horizon=5&code=588170`)
+    .then((response) => response.text());
+  assert.match(missingOutcomeCsv, /数据不足/);
+  assert.doesNotMatch(missingOutcomeCsv, /2026-11-19,验证期,63.8,活跃异动,5日,,,,,否/);
 });
 
 test('local application assets are served without stale caching', async (context) => {

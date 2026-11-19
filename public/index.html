@@ -5,9 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#080b11">
   <title>ETF资金雷达</title>
-  <link rel="stylesheet" href="/styles.css?v=20261120-7">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='15' fill='%230b1421'/%3E%3Cpath d='M15 45V31h7v14zm13 0V20h7v25zm13 0V26h7v19z' fill='%234d8dff'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/styles.css?v=20261120-9">
   <script src="/vendor/echarts.min.js?v=6.1.0" defer></script>
-  <script src="/app.js?v=20261120-7" defer></script>
+  <script src="/app.js?v=20261120-9" defer></script>
 </head>
 <body>
   <div class="ambient ambient-a"></div>
@@ -39,8 +40,8 @@
     <section class="hero-row">
       <div>
         <p class="eyebrow">14 只重点 ETF · 公开行情监测</p>
-        <h2>观察资金痕迹，不猜测账户身份</h2>
-        <p class="hero-copy">把成交放量、份额变化与宽基共振放在同一张图里。信号用于发现异常，不代表已确认的“国家队”成交。</p>
+        <h2 id="heroTitle">观察资金痕迹，不猜测账户身份</h2>
+        <p id="heroCopy" class="hero-copy">把成交放量、份额变化与宽基共振放在同一张图里。信号用于发现异常，不代表已确认的“国家队”成交。</p>
       </div>
       <div class="time-card">
         <span>最近行情</span>
@@ -51,6 +52,12 @@
 
     <div id="errorBanner" class="error-banner" role="alert" hidden></div>
 
+    <nav class="view-tabs" role="tablist" aria-label="页面视图">
+      <button class="view-tab active" type="button" role="tab" aria-selected="true" data-view="overview">行情概览</button>
+      <button class="view-tab" type="button" role="tab" aria-selected="false" data-view="evaluation">信号评估</button>
+    </nav>
+
+    <div id="overviewView" class="view-panel">
     <section class="summary-grid" aria-label="市场摘要">
       <article class="summary-card accent-blue">
         <div class="summary-label">监测池成交额</div>
@@ -68,9 +75,9 @@
         <span class="summary-foot">相对上一已记录交易日</span>
       </article>
       <article class="summary-card accent-cyan">
-        <div class="summary-label">护盘候选</div>
+        <div class="summary-label">评分 ≥ 40</div>
         <strong id="compositeCount">--</strong>
-        <span class="summary-foot" id="resonanceHint">等待宽基信号</span>
+        <span class="summary-foot" id="resonanceHint">等待异常资金评分</span>
       </article>
     </section>
 
@@ -80,7 +87,7 @@
           <p class="eyebrow">SIGNAL BOARD</p>
           <h3>今日异动线索</h3>
         </div>
-        <span class="muted-note">按信号强度排序</span>
+          <span class="muted-note">评分解读 · 非身份判断</span>
       </div>
       <div id="signalBoard" class="signal-board">
         <div class="skeleton-card"></div>
@@ -122,7 +129,7 @@
               <th data-sort="return20d">近20日</th>
               <th data-sort="shareDelta">份额变化</th>
               <th data-sort="estimatedSubscription">估算净申赎</th>
-              <th>候选信号</th>
+              <th>异常资金评分</th>
             </tr>
           </thead>
           <tbody id="etfRows">
@@ -138,7 +145,7 @@
         <h3>数据口径</h3>
         <p>20日量比使用当前成交额与前 20 个完整交易日成交额均值计算。份额变化优先采用上交所、深交所上一交易日官方份额；详情页可按 20/60/250 日查看官方份额、累计估算净申赎、连续净申赎天数和份额历史分位。缺失日期保留为空，不伪造数据。</p>
         <p>ETF 二级市场买入不改变基金总份额，因此份额变化只能作为一级市场净申赎代理，不能识别交易账户。累计净申赎使用相邻官方份额变化 × 当日收盘价估算。</p>
-        <p>“护盘候选”提示交投异常与宽基共振，不构成国家队身份确认或投资建议。</p>
+        <p>新版评分把成交额量比、官方份额变化分位、连续净申赎与宽基/同分类共振拆成可追溯贡献分。40–59 为观察，60–79 为活跃异动，80 以上为高强度异动；评分不构成国家队身份确认或投资建议。</p>
       </article>
       <article class="info-panel">
         <p class="eyebrow">UPDATE LOG</p>
@@ -148,6 +155,187 @@
         </div>
       </article>
     </section>
+    </div>
+
+    <div id="evaluationView" class="view-panel" hidden>
+      <section class="evaluation-intro">
+        <div>
+          <p class="eyebrow">SIGNAL EVALUATION</p>
+          <h3>历史回测与评分解释</h3>
+          <p>用信号日及以前的数据评分，只用后续价格检验表现。基准为监测池同期等权收益；命中率必须与同 ETF 无条件命中率及样本数一起阅读。</p>
+        </div>
+        <div id="backtestRunMeta" class="run-meta">正在读取回测运行...</div>
+      </section>
+
+      <section class="summary-grid evaluation-summary" aria-label="信号评估摘要">
+        <article class="summary-card accent-blue">
+          <div class="summary-label">有效信号数</div>
+          <strong id="evalSignalCount">--</strong>
+          <span class="summary-foot" id="evalSignalFoot">仅统计所选切分与筛选</span>
+        </article>
+        <article class="summary-card accent-cyan">
+          <div class="summary-label">基准命中率</div>
+          <strong id="evalBaselineHit">--</strong>
+          <span class="summary-foot">同 ETF 同期间无条件表现</span>
+        </article>
+        <article class="summary-card accent-amber">
+          <div class="summary-label">信号命中率</div>
+          <strong id="evalSignalHit">--</strong>
+          <span class="summary-foot" id="evalHitSamples">样本数 --</span>
+        </article>
+        <article class="summary-card accent-red">
+          <div class="summary-label">相对提升</div>
+          <strong id="evalLift">--</strong>
+          <span class="summary-foot">信号命中率 − 无条件命中率</span>
+        </article>
+        <article class="summary-card accent-blue">
+          <div class="summary-label">中位未来收益</div>
+          <strong id="evalMedianReturn">--</strong>
+          <span class="summary-foot" id="evalHorizonFoot">未来 5 日</span>
+        </article>
+        <article class="summary-card accent-red">
+          <div class="summary-label">最差未来回撤</div>
+          <strong id="evalWorstDrawdown">--</strong>
+          <span class="summary-foot">筛选样本内的最差值</span>
+        </article>
+      </section>
+
+      <section class="table-panel evaluation-controls">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">FILTERS</p>
+            <h3>回测筛选</h3>
+          </div>
+          <a id="backtestExport" class="button button-quiet" href="/api/export.csv?type=backtest&horizon=5">导出回测明细 CSV</a>
+        </div>
+        <form id="backtestFilters" class="filter-grid">
+          <label>
+            <span>数据切分</span>
+            <select id="backtestSplit" name="split">
+              <option value="validation">留出验证期</option>
+              <option value="train">训练期</option>
+            </select>
+          </label>
+          <label>
+            <span>预测周期</span>
+            <select id="backtestHorizon" name="horizon">
+              <option value="1">未来 1 日</option>
+              <option value="3">未来 3 日</option>
+              <option value="5" selected>未来 5 日</option>
+              <option value="10">未来 10 日</option>
+            </select>
+          </label>
+          <label>
+            <span>ETF</span>
+            <select id="backtestCode" name="code"><option value="">全部 ETF</option></select>
+          </label>
+          <label>
+            <span>分类</span>
+            <select id="backtestCategory" name="category"><option value="">全部分类</option></select>
+          </label>
+          <label>
+            <span>评分等级</span>
+            <select id="backtestLevel" name="level">
+              <option value="">全部等级</option>
+              <option value="observe">观察</option>
+              <option value="active">活跃异动</option>
+              <option value="high">高强度异动</option>
+            </select>
+          </label>
+          <label>
+            <span>开始日期</span>
+            <input id="backtestFrom" name="from" type="date">
+          </label>
+          <label>
+            <span>结束日期</span>
+            <input id="backtestTo" name="to" type="date">
+          </label>
+          <button id="backtestReset" class="button button-quiet" type="button">重置筛选</button>
+        </form>
+        <p id="backtestDataNote" class="data-note">正在加载回测...</p>
+      </section>
+
+      <section class="table-panel">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">TRAIN / VALIDATION</p>
+            <h3>训练期与留出验证期</h3>
+          </div>
+          <span class="muted-note">全池时间顺序切分，验证期不参与调参</span>
+        </div>
+        <div class="table-scroll compact-table">
+          <table id="splitComparisonTable">
+            <thead>
+              <tr>
+                <th>周期</th>
+                <th>训练样本</th><th>训练命中率</th><th>训练相对提升</th>
+                <th>验证样本</th><th>验证命中率</th><th>验证相对提升</th>
+                <th>旧规则训练样本</th><th>旧规则训练命中率</th>
+                <th>旧规则验证样本</th><th>旧规则验证命中率</th>
+              </tr>
+            </thead>
+            <tbody><tr><td colspan="11"><div class="table-loading">正在计算...</div></td></tr></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="table-panel">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">HIT-RATE LIFT</p>
+            <h3>分类区分度热力图</h3>
+          </div>
+          <span id="heatmapNote" class="muted-note">颜色为相对无条件命中率提升，单位为百分点</span>
+        </div>
+        <div id="backtestHeatmap" class="chart heatmap-chart"></div>
+      </section>
+
+      <section class="table-panel">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">BY ETF</p>
+            <h3>分 ETF 表现</h3>
+          </div>
+          <span class="muted-note">所有百分比均附带样本数</span>
+        </div>
+        <div class="table-scroll">
+          <table class="backtest-table">
+            <thead>
+              <tr>
+                <th>ETF</th><th>样本数</th><th>命中率</th><th>无条件命中率</th><th>相对提升</th>
+                <th>平均收益</th><th>中位收益</th><th>最差回撤</th><th>平均有利波动</th><th>样本状态</th>
+              </tr>
+            </thead>
+            <tbody id="backtestEtfRows"><tr><td colspan="10"><div class="table-loading">正在加载...</div></td></tr></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="table-panel">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">EVENT TIMELINE</p>
+            <h3>信号时间线</h3>
+          </div>
+          <span id="eventCount" class="muted-note">正在统计事件</span>
+        </div>
+        <div id="signalTimeline" class="signal-timeline">
+          <div class="table-loading">正在加载信号事件...</div>
+        </div>
+      </section>
+
+      <section class="table-panel methodology-panel">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">FIXED PARAMETERS</p>
+            <h3>固定参数与数据状态</h3>
+          </div>
+          <span id="parameterVersion" class="muted-note">--</span>
+        </div>
+        <div id="backtestMethodology" class="methodology-copy"></div>
+        <div id="backtestEtfStatus" class="etf-status-grid"></div>
+      </section>
+    </div>
   </main>
 
   <div id="drawerBackdrop" class="drawer-backdrop" hidden></div>

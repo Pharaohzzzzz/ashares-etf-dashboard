@@ -37,6 +37,22 @@ function toCsv(headers, rows) {
   ].join('\r\n');
 }
 
+function csvNumberOrMissing(value) {
+  return Number.isFinite(value) ? value : '数据不足';
+}
+
+function parseBacktestFilters(url) {
+  return {
+    from: url.searchParams.get('from') || null,
+    to: url.searchParams.get('to') || null,
+    code: url.searchParams.get('code') || null,
+    category: url.searchParams.get('category') || null,
+    level: url.searchParams.get('level') || null,
+    split: url.searchParams.get('split') || null,
+    horizon: Number(url.searchParams.get('horizon') || 5)
+  };
+}
+
 function createApp({ service, publicDir = path.join(__dirname, '..', 'public') }) {
   const server = http.createServer(async (request, response) => {
     const url = new URL(request.url, 'http://127.0.0.1');
@@ -81,6 +97,26 @@ function createApp({ service, publicDir = path.join(__dirname, '..', 'public') }
           : sendJson(response, 404, { error: 'ETF 不存在' });
       }
 
+      if (url.pathname === '/api/backtests/summary' && request.method === 'GET') {
+        return sendJson(response, 200, await service.getBacktestSummary());
+      }
+
+      if (url.pathname === '/api/backtests/events' && request.method === 'GET') {
+        const filters = parseBacktestFilters(url);
+        if (![1, 3, 5, 10].includes(filters.horizon)) {
+          return sendJson(response, 400, { error: '回测周期仅支持 1、3、5 或 10 日' });
+        }
+        return sendJson(response, 200, await service.getBacktestEvents(filters));
+      }
+
+      const signalEventMatch = url.pathname.match(/^\/api\/backtests\/events\/(\d+)$/);
+      if (signalEventMatch && request.method === 'GET') {
+        const event = await service.getBacktestEvent(signalEventMatch[1]);
+        return event
+          ? sendJson(response, 200, event)
+          : sendJson(response, 404, { error: '信号事件不存在' });
+      }
+
       const detailMatch = url.pathname.match(/^\/api\/etfs\/(\d{6})$/);
       if (detailMatch && request.method === 'GET') {
         const detail = service.getDetail(detailMatch[1]);
@@ -93,7 +129,54 @@ function createApp({ service, publicDir = path.join(__dirname, '..', 'public') }
         const code = url.searchParams.get('code');
         let csv;
         let filename;
-        if (code && /^\d{6}$/.test(code)) {
+        if (url.searchParams.get('type') === 'backtest') {
+          const filters = parseBacktestFilters(url);
+          if (![1, 3, 5, 10].includes(filters.horizon)) {
+            return sendJson(response, 400, { error: '回测周期仅支持 1、3、5 或 10 日' });
+          }
+          const { events } = await service.getBacktestEvents(filters);
+          csv = toCsv([
+            { key: 'code', label: '代码' },
+            { key: 'name', label: '名称' },
+            { key: 'category', label: '分类' },
+            { key: 'signalDate', label: '信号日期' },
+            { key: 'split', label: '数据切分' },
+            { key: 'score', label: '评分' },
+            { key: 'level', label: '等级' },
+            { key: 'horizon', label: '预测周期' },
+            { key: 'futureReturn', label: '未来收益' },
+            { key: 'drawdown', label: '未来最大回撤' },
+            { key: 'maxFavorable', label: '最大有利波动' },
+            { key: 'benchmarkReturn', label: '同期基准收益' },
+            { key: 'hit', label: '跑赢同期基准' },
+            { key: 'baselineHitRate', label: '同ETF无条件命中率' },
+            { key: 'returnVsUnconditional', label: '相对无条件收益' },
+            { key: 'legacyComposite', label: '旧规则对照' }
+          ], events.map((event) => {
+            const outcome = event.outcomes?.[filters.horizon] || {};
+            return {
+              code: event.code,
+              name: event.name,
+              category: event.category,
+              signalDate: event.date,
+              split: event.split === 'train' ? '训练期' : '验证期',
+              score: event.score,
+              level: event.level.label,
+              horizon: `${filters.horizon}日`,
+              futureReturn: csvNumberOrMissing(outcome.futureReturn),
+              drawdown: csvNumberOrMissing(outcome.drawdown),
+              maxFavorable: csvNumberOrMissing(outcome.maxFavorable),
+              benchmarkReturn: csvNumberOrMissing(outcome.benchmarkReturn),
+              hit: typeof outcome.outperformedBenchmark === 'boolean'
+                ? (outcome.outperformedBenchmark ? '是' : '否')
+                : '数据不足',
+              baselineHitRate: csvNumberOrMissing(outcome.baselineHitRate),
+              returnVsUnconditional: csvNumberOrMissing(outcome.returnVsUnconditional),
+              legacyComposite: event.legacyComposite ? '命中旧候选' : '未命中'
+            };
+          }));
+          filename = 'etf-signal-backtest.csv';
+        } else if (code && /^\d{6}$/.test(code)) {
           const detail = service.getDetail(code);
           if (!detail) return sendJson(response, 404, { error: 'ETF 不存在' });
           if (url.searchParams.get('type') === 'shares') {
