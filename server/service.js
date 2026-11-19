@@ -109,6 +109,29 @@ class MarketService {
     }
   }
 
+  async syncHistory() {
+    const startedAt = this.now().toISOString();
+    this.db.log('history', 'running', '同步最近日线', startedAt);
+    const results = await Promise.allSettled(
+      ETFS.map(async (etf) => {
+        const bars = await this.klineProvider(etf, 520);
+        this.db.upsertBars(etf.code, bars);
+      })
+    );
+    const failed = results
+      .map((result, index) => result.status === 'rejected' ? `${ETFS[index].code}: ${result.reason.message}` : null)
+      .filter(Boolean);
+    const status = failed.length ? (failed.length === results.length ? 'error' : 'partial') : 'success';
+    this.db.log(
+      'history',
+      status,
+      failed.length ? `${failed.length} 只失败；${failed.join('；')}` : '14 只日线同步完成',
+      this.now().toISOString()
+    );
+    await this.refreshQuotes();
+    return this.getSummary();
+  }
+
   async performQuoteRefresh() {
     const capturedAt = this.now().toISOString();
     const results = await Promise.allSettled(
