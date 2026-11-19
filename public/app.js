@@ -56,6 +56,7 @@ const elements = {
   searchInput: document.querySelector('#searchInput'),
   etfRows: document.querySelector('#etfRows'),
   updateLogs: document.querySelector('#updateLogs'),
+  dataStatusPanel: document.querySelector('#dataStatusPanel'),
   drawer: document.querySelector('#detailDrawer'),
   drawerBackdrop: document.querySelector('#drawerBackdrop'),
   drawerBody: document.querySelector('#drawerBody'),
@@ -291,6 +292,7 @@ function renderSummary() {
   renderSignalBoard();
   renderCategoryTabs();
   renderLogs();
+  renderDataStatus();
 }
 
 function renderSignalBoard() {
@@ -342,6 +344,38 @@ function renderSignalBoard() {
       }
     });
     elements.signalBoard.append(card);
+  }
+}
+
+function renderDataStatus() {
+  const status = state.summary?.dataStatus;
+  elements.dataStatusPanel.replaceChildren();
+  if (!status) {
+    elements.dataStatusPanel.append(createElement('div', 'log-line', '尚未取得更新状态'));
+    return;
+  }
+  const rows = [
+    ['行情', status.dates?.quoteDate],
+    ['日线', status.dates?.barDate],
+    ['官方份额', status.dates?.officialShareDate],
+    ['IOPV', status.dates?.iopvDate],
+    ['回测', status.dates?.backtestDate]
+  ];
+  for (const [label, date] of rows) {
+    const item = createElement('div', 'data-status-item');
+    item.append(
+      createElement('span', '', label),
+      createElement('strong', '', date || '尚未更新')
+    );
+    elements.dataStatusPanel.append(item);
+  }
+  const calendar = status.calendar;
+  if (calendar) {
+    elements.dataStatusPanel.append(createElement(
+      'div',
+      `data-calendar-note ${calendar.stale ? 'warning' : ''}`,
+      calendar.message
+    ));
   }
 }
 
