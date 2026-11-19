@@ -17,6 +17,15 @@ const {
 } = require('./signal-backtest');
 const { fetchQuote, fetchKlines, fetchTrends } = require('./provider');
 const {
+  IOPV_ALERT_THRESHOLD,
+  calculatePremiumRate,
+  fetchOfficialIopv,
+  fetchSupplementaryIopv,
+  crossCheckIopv,
+  resolveIopvState,
+  dedupeIopvSeries
+} = require('./iopv');
+const {
   fetchSseEtfShares,
   fetchSzseEtfShares,
   fetchSzseEtfShareRange
@@ -85,6 +94,8 @@ class MarketService {
     sseShareProvider = fetchSseEtfShares,
     szseShareProvider = fetchSzseEtfShares,
     szseRangeProvider = fetchSzseEtfShareRange,
+    officialIopvProvider = fetchOfficialIopv,
+    supplementaryIopvProvider = fetchSupplementaryIopv,
     now = () => new Date()
   }) {
     this.db = db;
@@ -94,10 +105,13 @@ class MarketService {
     this.sseShareProvider = sseShareProvider;
     this.szseShareProvider = szseShareProvider;
     this.szseRangeProvider = szseRangeProvider;
+    this.officialIopvProvider = officialIopvProvider;
+    this.supplementaryIopvProvider = supplementaryIopvProvider;
     this.now = now;
     this.refreshPromise = null;
     this.shareSyncPromise = null;
     this.backtestPromise = null;
+    this.iopvRefreshPromise = null;
     this.initializing = false;
     this.initializedAt = db.getMeta('initializedAt');
   }
@@ -223,9 +237,141 @@ class MarketService {
       failures.length ? `${successCount}/${ETFS.length} 成功；${failures.join('；')}` : `更新 ${successCount}/${ETFS.length}`,
       capturedAt
     );
+    try {
+      await this.refreshIopv();
+    } catch (error) {
+      this.db.log('iopv', 'error', `IOPV 同步失败：${error.message}`, this.now().toISOString());
+    }
     const summary = this.getSummary();
     this.persistSummaryMetrics(summary, capturedAt);
     return summary;
+  }
+
+  async refreshIopv() {
+    if (this.iopvRefreshPromise) return this.iopvRefreshPromise;
+    this.iopvRefreshPromise = this.performIopvRefresh();
+    try {
+      return await this.iopvRefreshPromise;
+    } finally {
+      this.iopvRefreshPromise = null;
+    }
+  }
+
+  async performIopvRefresh() {
+    const attemptedAt = this.now().toISOString();
+    let supplementary = new Map();
+    let supplementaryFailure = null;
+    try {
+      supplementary = await this.supplementaryIopvProvider(ETFS);
+    } catch (error) {
+      supplementaryFailure = error;
+    }
+    const officialResults = await Promise.allSettled(
+      ETFS.map((etf) => this.officialIopvProvider(etf))
+    );
+    const failures = [];
+    let validCount = 0;
+    let fallbackCount = 0;
+    let anomalyCount = 0;
+    const samples = [];
+
+    officialResults.forEach((result, index) => {
+      const etf = ETFS[index];
+      const latestTradeDate = this.db.getBars(etf.code, 1).at(-1)?.date || null;
+      let state;
+      if (result.status === 'fulfilled') {
+        const official = result.value;
+        const secondary = supplementary.get(etf.code) || null;
+        const crossCheck = crossCheckIopv(official, secondary);
+        state = {
+          ...official,
+          crossCheck,
+          status: crossCheck.status === 'conflict' ? 'conflict' : 'valid',
+          fetchedAt: attemptedAt,
+          attemptedAt
+        };
+      } else {
+        const fallback = supplementary.get(etf.code);
+        if (fallback) {
+          fallbackCount += 1;
+          state = {
+            ...fallback,
+            crossCheck: {
+              status: 'unavailable',
+              message: '官方实时接口不可用，使用东方财富公开报价字段'
+            },
+            status: 'valid',
+            fetchedAt: attemptedAt,
+            attemptedAt
+          };
+        } else {
+          const reason = result.reason?.message || '未知错误';
+          failures.push(`${etf.code}: ${reason}`);
+          this.db.markIopvFailure(etf.code, `官方与补充源均不可用：${reason}`, attemptedAt);
+          anomalyCount += 1;
+          return;
+        }
+      }
+
+      const resolved = resolveIopvState(state, {
+        now: this.now(),
+        latestTradeDate
+      });
+      const stored = {
+        ...state,
+        status: resolved.status,
+        message: resolved.message,
+        premiumRate: resolved.premiumRate ?? calculatePremiumRate(state.marketPrice, state.iopv)
+      };
+      this.db.saveIopvLatest(stored);
+      if (resolved.status !== 'valid') {
+        anomalyCount += 1;
+        failures.push(`${etf.code}: ${resolved.message}`);
+        return;
+      }
+      validCount += 1;
+      const currentSample = {
+        code: etf.code,
+        tradeDate: state.tradeDate,
+        dataTime: state.dataTime,
+        observedAt: state.observedAt,
+        marketPrice: state.marketPrice,
+        iopv: state.iopv,
+        premiumRate: resolved.premiumRate,
+        source: state.source,
+        sourceKind: state.sourceKind,
+        sourceUrl: state.sourceUrl
+      };
+      samples.push(currentSample);
+      for (const point of state.series || []) {
+        if (
+          point.dataTime &&
+          point.dataTime < state.dataTime &&
+          iopvPointIsValid(point)
+        ) {
+          samples.push({
+            ...point,
+            source: state.source,
+            sourceKind: state.sourceKind,
+            sourceUrl: state.sourceUrl
+          });
+        }
+      }
+    });
+
+    if (samples.length) this.db.saveIopvSamples(samples, attemptedAt);
+    const status = anomalyCount || supplementaryFailure
+      ? (validCount ? 'partial' : 'error')
+      : 'success';
+    const detail = [
+      `${validCount}/${ETFS.length} 有效`,
+      fallbackCount ? `${fallbackCount} 只使用东方财富补充源` : null,
+      anomalyCount ? `${anomalyCount} 只数据异常或过期` : null,
+      supplementaryFailure ? `补充校验源失败：${supplementaryFailure.message}` : null,
+      failures.length ? failures.join('；') : null
+    ].filter(Boolean).join('；');
+    this.db.log('iopv', status, detail, attemptedAt);
+    return { validCount, fallbackCount, anomalyCount, failures };
   }
 
   persistSummaryMetrics(summary, updatedAt) {
@@ -459,6 +605,7 @@ class MarketService {
       const officialTradeDates = latestOfficial
         ? this.db.getRecentTradeDates(officialHistory.length, latestOfficial.tradeDate)
         : [];
+      const iopv = this.getCurrentIopv(quote.code, bars.at(-1)?.date || null);
       return {
         ...quote,
         shares,
@@ -488,6 +635,21 @@ class MarketService {
             officialHistory.slice(-OFFICIAL_HISTORY_DAYS).map((row) => row.shares)
           )
           : null,
+        iopvMarketPrice: iopv.marketPrice,
+        iopv: iopv.iopv,
+        premiumRate: iopv.premiumRate,
+        premiumStatus: iopv.status,
+        premiumStatusLabel: iopv.label,
+        premiumMessage: iopv.message,
+        premiumAbnormal: iopv.isAbnormal === true,
+        premiumAlertThreshold: IOPV_ALERT_THRESHOLD,
+        iopvSource: iopv.source,
+        iopvSourceKind: iopv.sourceKind,
+        iopvSourceUrl: iopv.sourceUrl || null,
+        iopvDataTime: iopv.dataTime || null,
+        iopvObservedAt: iopv.observedAt || null,
+        iopvFetchedAt: iopv.fetchedAt || null,
+        iopvCrossCheck: iopv.crossCheck || null,
         sourceUrl: `https://quote.eastmoney.com/${quote.code}.html`
       };
     });
@@ -537,10 +699,20 @@ class MarketService {
       compositeCount: rows.filter((row) => row.composite).length,
       scoreSignalCount: rows.filter((row) => row.scoreSignal).length,
       highScoreCount: rows.filter((row) => row.score >= SIGNAL_PARAMETERS.levels.high).length,
+      iopvAvailableCount: rows.filter((row) => row.premiumStatus === 'valid').length,
+      iopvAbnormalCount: rows.filter((row) => row.premiumAbnormal).length,
       broadResonance,
       etfs: rows,
       logs: this.db.recentLogs()
     };
+  }
+
+  getCurrentIopv(code, latestTradeDate) {
+    const record = this.db.getIopvLatest(code);
+    return resolveIopvState(record, {
+      now: this.now(),
+      latestTradeDate
+    });
   }
 
   getDetail(code) {
@@ -551,6 +723,7 @@ class MarketService {
       quote,
       bars: this.db.getBars(code, 520),
       shareHistory: this.getShareHistory(code, OFFICIAL_HISTORY_DAYS),
+      iopvHistory: this.getIopvHistory(code, OFFICIAL_HISTORY_DAYS),
       updatedAt: summary.generatedAt
     };
   }
@@ -611,6 +784,104 @@ class MarketService {
       streak: calculateShareStreak(history, officialTradeDates),
       range: ranges[selectedDays] || ranges[OFFICIAL_HISTORY_DAYS],
       ranges
+    };
+  }
+
+  getIopvHistory(code, selectedDays = OFFICIAL_HISTORY_DAYS) {
+    const etf = getEtf(code);
+    if (!etf) return null;
+    const days = Number.isInteger(selectedDays) && selectedDays > 0
+      ? Math.min(selectedDays, OFFICIAL_HISTORY_DAYS)
+      : OFFICIAL_HISTORY_DAYS;
+    const bars = this.db.getBars(code, 2);
+    const latestTradeDate = bars.at(-1)?.date || null;
+    const current = this.getCurrentIopv(code, latestTradeDate);
+    const quote = this.db.getLatestSnapshots().find((row) => row.code === code);
+    const tradeDate = current.tradeDate || quote?.trade_date || latestTradeDate;
+    const rawIntraday = tradeDate
+      ? this.db.getIopvSamplesForDate(code, tradeDate)
+      : [];
+    const intraday = dedupeIopvSeries(rawIntraday);
+    const rates = intraday
+      .map((point) => point.premiumRate)
+      .filter(Number.isFinite);
+    const stats = rates.length
+      ? {
+        open: rates[0],
+        high: Math.max(...rates),
+        low: Math.min(...rates),
+        mean: rates.reduce((sum, value) => sum + value, 0) / rates.length,
+        latest: rates.at(-1),
+        sampleCount: rates.length
+      }
+      : {
+        open: null,
+        high: null,
+        low: null,
+        mean: null,
+        latest: null,
+        sampleCount: 0
+      };
+    const targetDates = latestTradeDate
+      ? this.db.getRecentTradeDates(days, latestTradeDate)
+      : [];
+    const closeHistory = this.db.getIopvCloseHistory(
+      code,
+      days,
+      targetDates[0] || null,
+      targetDates.at(-1) || null
+    );
+    const closeRates = closeHistory
+      .map((point) => point.premiumRate)
+      .filter(Number.isFinite);
+    const latestCloseRate = closeRates.at(-1) ?? null;
+    const closePercentile = latestCloseRate === null || closeRates.length < 5
+      ? null
+      : percentile(latestCloseRate, closeRates);
+    const availableDates = new Set(closeHistory.map((point) => point.tradeDate));
+    const missingDates = targetDates.filter((date) => !availableDates.has(date));
+    const recent = closeHistory.slice(-20);
+    const direction = recent.length >= 2
+      ? Math.sign(recent.at(-1).premiumRate - recent[0].premiumRate)
+      : 0;
+    return {
+      code,
+      selectedDays: days,
+      generatedAt: this.now().toISOString(),
+      tradeDate,
+      current,
+      source: current.source || null,
+      sourceKind: current.sourceKind || null,
+      sourceUrl: current.sourceUrl || null,
+      sourceName: current.source || (tradeDate ? null : '暂无'),
+      formula: '市场价 ÷ IOPV − 1',
+      alertThreshold: IOPV_ALERT_THRESHOLD,
+      updateFrequency: '交易所实时行情；本地交易时段每 30 秒刷新',
+      intraday,
+      stats,
+      closeHistory,
+      closePercentile,
+      closeSampleCount: closeRates.length,
+      latestCloseRate,
+      recent,
+      trend: direction > 0 ? 'up' : direction < 0 ? 'down' : 'flat',
+      coverage: {
+        requestedDays: days,
+        availableDays: closeRates.length,
+        missingDays: missingDates.length,
+        targetStartDate: targetDates[0] || null,
+        targetEndDate: targetDates.at(-1) || null,
+        missingRecentDates: missingDates.slice(-5),
+        status: !closeRates.length
+          ? 'unavailable'
+          : missingDates.length ? 'partial' : 'complete'
+      },
+      note: intraday.length <= 1
+        ? '当日 IOPV 历史样本尚不足；统计仅基于已实际记录的交易所时点，不推算或补零。'
+        : '当日统计仅使用同一交易日已记录的市场价与 IOPV 配对样本。',
+      historyNote: closeRates.length < 5
+        ? `收盘折溢价历史仅积累 ${closeRates.length} 个交易日，暂不计算分位。`
+        : '收盘折溢价按每个交易日最后一个有效 IOPV 样本计算。'
     };
   }
 
@@ -708,4 +979,12 @@ module.exports = {
   snapshotToQuote,
   mapLimit
 };
+
+function iopvPointIsValid(point) {
+  return Number.isFinite(point.marketPrice) &&
+    point.marketPrice > 0 &&
+    Number.isFinite(point.iopv) &&
+    point.iopv > 0 &&
+    Number.isFinite(point.premiumRate);
+}
 

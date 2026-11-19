@@ -189,6 +189,14 @@ function createElement(tag, className, text) {
   return node;
 }
 
+function afterRender(callback) {
+  if (document.visibilityState === 'hidden') {
+    setTimeout(callback, 0);
+  } else {
+    requestAnimationFrame(callback);
+  }
+}
+
 async function fetchJson(url, options) {
   const response = await fetch(url, options);
   const body = await response.json();
@@ -373,7 +381,7 @@ function renderTable() {
   if (!rows.length) {
     const tr = document.createElement('tr');
     const td = createElement('td', 'table-loading', state.rows.length ? '没有匹配的 ETF' : '正在读取行情数据...');
-    td.colSpan = 10;
+    td.colSpan = 11;
     tr.append(td);
     elements.etfRows.append(tr);
     return;
@@ -385,6 +393,7 @@ function renderTable() {
     tr.setAttribute('aria-label', `查看 ${row.name} 详情`);
     tr.append(createEtfCell(row));
     tr.append(createElement('td', '', formatter.price(row.price)));
+    tr.append(createPremiumCell(row));
     tr.append(createElement('td', directionClass(row.changePercent), formatter.percentDirect(row.changePercent)));
     tr.append(createElement('td', '', formatter.amount(row.amount)));
     const ratioCell = document.createElement('td');
@@ -413,6 +422,26 @@ function renderTable() {
     });
     elements.etfRows.append(tr);
   }
+}
+
+function createPremiumCell(row) {
+  const td = document.createElement('td');
+  const pill = createElement('span', 'premium-pill');
+  if (Number.isFinite(row.premiumRate) && row.premiumStatus === 'valid') {
+    pill.classList.add(directionClass(row.premiumRate));
+    if (row.premiumAbnormal) pill.classList.add('abnormal');
+    pill.append(
+      createElement('strong', '', formatter.percent(row.premiumRate)),
+      createElement('small', '', row.premiumAbnormal ? '异常偏离' : 'IOPV')
+    );
+    pill.title = `${row.iopvSource || 'IOPV'} · ${row.iopvDataTime || '时间未知'} · ${formatter.percent(row.premiumRate)}`;
+  } else {
+    pill.classList.add(`status-${row.premiumStatus || 'missing'}`);
+    pill.append(createElement('small', '', row.premiumStatusLabel || '暂无'));
+    pill.title = row.premiumMessage || 'IOPV 数据暂不可用';
+  }
+  td.append(pill);
+  return td;
 }
 
 function createEtfCell(row) {
@@ -514,8 +543,16 @@ function renderDetail(detail, intraday) {
   state.detailData = detail;
   elements.drawerBody.replaceChildren();
   const metrics = createElement('div', 'detail-metrics');
+  const iopv = detail.iopvHistory;
+  const currentIopv = iopv?.current || {};
+  const premiumUnavailableLabel = currentIopv.label || (row.premiumStatus === 'valid' ? '暂无' : '数据异常');
   const items = [
     ['最新价', formatter.price(row.price), ''],
+    ['当前 IOPV', Number.isFinite(currentIopv.iopv) ? formatter.price(currentIopv.iopv) : '暂无', currentIopv.status === 'valid' ? '' : 'status-warning'],
+    ['IOPV 对应市场价', Number.isFinite(currentIopv.marketPrice) ? formatter.price(currentIopv.marketPrice) : '暂无', ''],
+    ['当前折溢价', Number.isFinite(row.premiumRate) ? formatter.percent(row.premiumRate) : premiumUnavailableLabel, row.premiumAbnormal ? 'premium-warning' : directionClass(row.premiumRate)],
+    ['IOPV 来源', currentIopv.source || '暂无', currentIopv.sourceKind === 'official' ? '' : 'status-warning'],
+    ['IOPV 数据时间', currentIopv.dataTime || '暂无', currentIopv.status === 'valid' ? 'neutral' : 'status-warning'],
     ['涨跌幅', formatter.percentDirect(row.changePercent), directionClass(row.changePercent)],
     ['开盘', formatter.price(row.open), ''],
     ['最高', formatter.price(row.high), ''],
@@ -536,7 +573,6 @@ function renderDetail(detail, intraday) {
     ['连续净申赎', row.shareStreak?.days ? `${row.shareStreak.label} ${row.shareStreak.days}日` : '无连续序列', directionClass(row.shareStreak?.direction === 'subscription' ? 1 : row.shareStreak?.direction === 'redemption' ? -1 : 0)],
     ['250日份额分位', formatter.plainPercent(row.sharePercentile === null ? null : row.sharePercentile * 100, 1), ''],
     ['官方份额截至', row.officialShareDate ? `${row.officialShareDate} · ${row.officialShareSource}` : '暂无官方记录', 'neutral'],
-    ['折溢价', '暂无', 'neutral'],
     ['尾盘成交占比', formatter.plainPercent(intraday.tailVolumeShare === null ? null : intraday.tailVolumeShare * 100), '']
   ];
   for (const [label, value, className] of items) {
@@ -584,7 +620,7 @@ function renderDetail(detail, intraday) {
   elements.drawerBody.append(scoreNote);
 
   const disclaimer = createElement('div', 'detail-note');
-  disclaimer.textContent = '历史曲线只使用上交所、深交所官方份额，不使用模拟值补齐缺失日期。当前份额仍优先使用官方记录，交易所尚未返回当日数据时才显示行情快照。二级市场买入不增加总份额，候选信号不代表已确认的国家队成交；公开行情接口未提供可靠 IOPV，因此折溢价显示“暂无”。';
+  disclaimer.textContent = '折溢价率统一为“市场价 ÷ IOPV − 1”。IOPV 优先使用交易所官方数据，来源时间无法对齐时不做跨源合并；缺失、为零、过期或来源冲突时只显示异常状态，不用 0 或推算值代替。历史曲线只使用上交所、深交所官方份额，缺失日期不补齐。候选信号不代表已确认的国家队成交。';
   elements.drawerBody.append(disclaimer);
 
   const signalNote = createElement('section', 'signal-note');
@@ -618,6 +654,17 @@ function renderDetail(detail, intraday) {
   sourceLink.target = '_blank';
   sourceLink.rel = 'noopener noreferrer';
   sourceLinks.append(sourceLink);
+  if (iopv?.sourceUrl) {
+    const iopvLink = createElement(
+      'a',
+      'source-link',
+      `${iopv.source || 'IOPV'} 原始数据 ↗`
+    );
+    iopvLink.href = iopv.sourceUrl;
+    iopvLink.target = '_blank';
+    iopvLink.rel = 'noopener noreferrer';
+    sourceLinks.append(iopvLink);
+  }
   if (detail.shareHistory?.sourceUrl) {
     const officialLink = createElement(
       'a',
@@ -630,6 +677,36 @@ function renderDetail(detail, intraday) {
     sourceLinks.append(officialLink);
   }
   elements.drawerBody.append(sourceLinks);
+
+  const iopvCard = createElement('section', 'chart-card iopv-chart-card');
+  const iopvHeading = createElement('div', 'chart-card-heading');
+  iopvHeading.append(
+    createElement('h3', '', '当日市场价与 IOPV'),
+    createElement('span', 'muted-note', iopv?.updateFrequency || '交易所实时数据')
+  );
+  const iopvStats = createElement('div', 'share-range-summary iopv-intraday-stats');
+  iopvStats.id = 'iopvIntradayStats';
+  const iopvChart = createElement('div', 'chart chart-tall');
+  iopvChart.id = 'iopvIntradayChart';
+  const iopvNote = createElement('div', 'share-coverage-note');
+  iopvNote.id = 'iopvCoverageNote';
+  const iopvExport = createElement('a', 'button button-quiet share-export', '导出折溢价历史 CSV');
+  iopvExport.href = `/api/export.csv?code=${row.code}&type=iopv`;
+  iopvCard.append(iopvHeading, iopvStats, iopvChart, iopvNote, iopvExport);
+  elements.drawerBody.append(iopvCard);
+
+  const iopvHistoryCard = createElement('section', 'chart-card');
+  iopvHistoryCard.append(
+    createElement('h3', '', '收盘折溢价历史分位与近期趋势')
+  );
+  const iopvHistoryStats = createElement('div', 'share-range-summary iopv-history-stats');
+  iopvHistoryStats.id = 'iopvHistoryStats';
+  const iopvHistoryChart = createElement('div', 'chart');
+  iopvHistoryChart.id = 'iopvHistoryChart';
+  const iopvHistoryNote = createElement('div', 'share-coverage-note');
+  iopvHistoryNote.id = 'iopvHistoryNote';
+  iopvHistoryCard.append(iopvHistoryStats, iopvHistoryChart, iopvHistoryNote);
+  elements.drawerBody.append(iopvHistoryCard);
 
   const shareCard = createElement('section', 'chart-card share-chart-card');
   const shareHeading = createElement('div', 'chart-card-heading');
@@ -676,17 +753,26 @@ function renderDetail(detail, intraday) {
   dailyCard.append(dailyChart);
   elements.drawerBody.append(dailyCard);
 
-  requestAnimationFrame(() => {
+  afterRender(() => {
     if (!window.echarts) return;
     state.charts.forEach((instance) => instance.dispose());
     const shareInstance = echarts.init(shareChart);
     const intradayInstance = echarts.init(intradayChart);
     const dailyInstance = echarts.init(dailyChart);
+    const iopvIntradayInstance = echarts.init(iopvChart);
+    const iopvHistoryInstance = echarts.init(iopvHistoryChart);
     state.shareChart = shareInstance;
     renderShareRange();
+    renderIopvCharts(iopv, iopvIntradayInstance, iopvHistoryInstance);
     intradayInstance.setOption(buildIntradayOption(intraday));
     dailyInstance.setOption(buildDailyOption(detail.bars || []));
-    state.charts = [shareInstance, intradayInstance, dailyInstance];
+    state.charts = [
+      shareInstance,
+      intradayInstance,
+      dailyInstance,
+      iopvIntradayInstance,
+      iopvHistoryInstance
+    ];
   });
 }
 
@@ -877,6 +963,268 @@ function buildShareOption(range, history) {
         }
       }
     ]
+  };
+}
+
+function renderIopvCharts(history, intradayInstance, closeInstance) {
+  const statsNode = document.querySelector('#iopvIntradayStats');
+  const coverageNode = document.querySelector('#iopvCoverageNote');
+  const historyStatsNode = document.querySelector('#iopvHistoryStats');
+  const historyNoteNode = document.querySelector('#iopvHistoryNote');
+  if (!statsNode || !coverageNode || !historyStatsNode || !historyNoteNode) return;
+
+  const stats = history?.stats || {};
+  const statItems = [
+    ['折溢价开盘', formatter.percent(stats.open, 3)],
+    ['最高', formatter.percent(stats.high, 3)],
+    ['最低', formatter.percent(stats.low, 3)],
+    ['均值', formatter.percent(stats.mean, 3)],
+    ['最新', formatter.percent(stats.latest, 3)]
+  ];
+  statsNode.replaceChildren();
+  for (const [label, value] of statItems) {
+    const card = createElement('div', 'share-range-stat');
+    card.append(createElement('span', '', label), createElement('strong', '', value));
+    statsNode.append(card);
+  }
+  const current = history?.current || {};
+  coverageNode.textContent = [
+    current.label || '暂无',
+    `${stats.sampleCount || 0} 个已记录时点`,
+    current.source ? `来源：${current.source}` : null,
+    current.dataTime ? `数据时间：${current.dataTime}` : null,
+    history?.note || 'IOPV 缺失时不补零或推算。'
+  ].filter(Boolean).join(' · ');
+
+  const closePoints = history?.closeHistory || [];
+  historyStatsNode.replaceChildren();
+  const historyItems = [
+    ['收盘折溢价分位', formatter.plainPercent(
+      Number.isFinite(history?.closePercentile) ? history.closePercentile * 100 : null,
+      1
+    )],
+    ['最近收盘折溢价', formatter.percent(history?.latestCloseRate, 3)],
+    ['历史有效样本', `${history?.closeSampleCount || 0} 日`],
+    ['近期趋势', history?.trend === 'up' ? '抬升' : history?.trend === 'down' ? '回落' : history?.trend === 'flat' ? '平稳' : '样本不足']
+  ];
+  for (const [label, value] of historyItems) {
+    const card = createElement('div', 'share-range-stat');
+    card.append(createElement('span', '', label), createElement('strong', '', value));
+    historyStatsNode.append(card);
+  }
+  const coverage = history?.coverage;
+  historyNoteNode.textContent = [
+    history?.historyNote,
+    coverage
+      ? `历史覆盖 ${coverage.availableDays}/${coverage.requestedDays} 个可取得交易日`
+      : null,
+    closePoints.length ? '历史只取各交易日当时最后有效记录，缺口不插值。' : '尚无收盘折溢价历史，需从有效交易日开始积累。'
+  ].filter(Boolean).join(' · ');
+
+  if ((history?.intraday || []).length) {
+    intradayInstance.setOption(buildIopvIntradayOption(history.intraday), true);
+  } else {
+    intradayInstance.clear();
+    intradayInstance.setOption(emptyChartOption('当日暂无有效市场价与 IOPV 配对样本'), true);
+  }
+  if (closePoints.length) {
+    closeInstance.setOption(buildIopvCloseOption(closePoints), true);
+  } else {
+    closeInstance.clear();
+    closeInstance.setOption(emptyChartOption('收盘折溢价历史尚未形成'), true);
+  }
+}
+
+function buildIopvIntradayOption(points) {
+  const labels = points.map((point) => point.dataTime?.slice(11, 16) || '--');
+  const prices = points.map((point) => point.marketPrice);
+  const iopvs = points.map((point) => point.iopv);
+  const premiums = points.map((point) => (
+    Number.isFinite(point.premiumRate) ? point.premiumRate * 100 : null
+  ));
+  return {
+    animation: false,
+    backgroundColor: 'transparent',
+    aria: { enabled: true },
+    tooltip: {
+      trigger: 'axis',
+      backgroundColor: '#111824',
+      borderColor: '#29364c',
+      textStyle: { color: '#dce8f8' },
+      formatter: (items) => {
+        const index = items[0]?.dataIndex ?? 0;
+        const point = points[index];
+        return [
+          point.dataTime,
+          `市场价：${formatter.price(point.marketPrice)}`,
+          `IOPV：${formatter.price(point.iopv)}`,
+          `折溢价：${formatter.percent(point.premiumRate, 3)}`,
+          `来源：${point.source}`
+        ].join('<br>');
+      }
+    },
+    legend: {
+      top: 0,
+      left: 'center',
+      data: ['市场价', 'IOPV', '折溢价'],
+      textStyle: { color: '#8493a7', fontSize: 11 }
+    },
+    axisPointer: { link: [{ xAxisIndex: 'all' }] },
+    grid: [
+      { left: 54, right: 24, top: 42, height: 205 },
+      { left: 54, right: 24, top: 276, height: 72 }
+    ],
+    xAxis: [
+      {
+        type: 'category',
+        data: labels,
+        boundaryGap: false,
+        axisLine: { lineStyle: { color: '#263246' } },
+        axisLabel: { color: '#66768a', hideOverlap: true },
+        axisTick: { show: false }
+      },
+      {
+        type: 'category',
+        gridIndex: 1,
+        data: labels,
+        boundaryGap: false,
+        axisLine: { lineStyle: { color: '#263246' } },
+        axisLabel: { color: '#66768a', hideOverlap: true },
+        axisTick: { show: false }
+      }
+    ],
+    yAxis: [
+      {
+        type: 'value',
+        scale: true,
+        splitLine: { lineStyle: { color: 'rgba(150,170,195,0.08)' } },
+        axisLabel: { color: '#66768a' }
+      },
+      {
+        type: 'value',
+        gridIndex: 1,
+        scale: true,
+        splitNumber: 2,
+        splitLine: { lineStyle: { color: 'rgba(150,170,195,0.08)' } },
+        axisLabel: { color: '#66768a', formatter: (value) => `${value.toFixed(1)}%` }
+      }
+    ],
+    series: [
+      {
+        name: '市场价',
+        type: 'line',
+        data: prices,
+        symbol: 'none',
+        lineStyle: { color: '#5b98ff', width: 2 },
+        itemStyle: { color: '#5b98ff' }
+      },
+      {
+        name: 'IOPV',
+        type: 'line',
+        data: iopvs,
+        symbol: points.length <= 2 ? 'circle' : 'none',
+        symbolSize: 5,
+        lineStyle: { color: '#f0b857', width: 2 },
+        itemStyle: { color: '#f0b857' }
+      },
+      {
+        name: '折溢价',
+        type: 'line',
+        xAxisIndex: 1,
+        yAxisIndex: 1,
+        data: premiums,
+        symbol: points.length <= 2 ? 'circle' : 'none',
+        symbolSize: 5,
+        lineStyle: { color: '#42d6ca', width: 1.8 },
+        itemStyle: { color: '#42d6ca' },
+        markLine: {
+          silent: true,
+          symbol: 'none',
+          label: { show: false },
+          lineStyle: { color: 'rgba(150,170,195,0.28)', type: 'dashed' },
+          data: [{ yAxis: 0 }]
+        }
+      }
+    ]
+  };
+}
+
+function buildIopvCloseOption(points) {
+  const dates = points.map((point) => point.tradeDate);
+  const rates = points.map((point) => (
+    Number.isFinite(point.premiumRate) ? point.premiumRate * 100 : null
+  ));
+  return {
+    animation: false,
+    backgroundColor: 'transparent',
+    aria: { enabled: true },
+    tooltip: {
+      trigger: 'axis',
+      backgroundColor: '#111824',
+      borderColor: '#29364c',
+      textStyle: { color: '#dce8f8' },
+      formatter: (items) => {
+        const point = points[items[0]?.dataIndex ?? 0];
+        return point
+          ? [
+            point.tradeDate,
+            `收盘市场价：${formatter.price(point.marketPrice)}`,
+            `收盘 IOPV：${formatter.price(point.iopv)}`,
+            `折溢价：${formatter.percent(point.premiumRate, 3)}`,
+            `来源：${point.source}`
+          ].join('<br>')
+          : '';
+      }
+    },
+    grid: { left: 54, right: 24, top: 26, bottom: 38 },
+    xAxis: {
+      type: 'category',
+      data: dates,
+      boundaryGap: false,
+      axisLine: { lineStyle: { color: '#263246' } },
+      axisLabel: { color: '#66768a', hideOverlap: true },
+      axisTick: { show: false }
+    },
+    yAxis: {
+      type: 'value',
+      scale: true,
+      splitLine: { lineStyle: { color: 'rgba(150,170,195,0.08)' } },
+      axisLabel: { color: '#66768a', formatter: (value) => `${value.toFixed(1)}%` }
+    },
+    dataZoom: [{ type: 'inside', start: 0, end: 100 }],
+    series: [{
+      name: '收盘折溢价',
+      type: 'line',
+      data: rates,
+      showSymbol: points.length <= 60,
+      symbolSize: 4,
+      connectNulls: false,
+      lineStyle: { color: '#f0b857', width: 2 },
+      itemStyle: { color: '#f0b857' },
+      areaStyle: { color: 'rgba(240,184,87,0.08)' },
+      markLine: {
+        silent: true,
+        symbol: 'none',
+        label: { show: false },
+        lineStyle: { color: 'rgba(150,170,195,0.28)', type: 'dashed' },
+        data: [{ yAxis: 0 }]
+      }
+    }]
+  };
+}
+
+function emptyChartOption(message) {
+  return {
+    animation: false,
+    graphic: {
+      type: 'text',
+      left: 'center',
+      top: 'middle',
+      style: { text: message, fill: '#75869b', fontSize: 12 }
+    },
+    xAxis: { show: false },
+    yAxis: { show: false },
+    series: []
   };
 }
 
@@ -1545,7 +1893,7 @@ function renderSignalEventDetail(detail) {
   );
   elements.drawerBody.append(legacy);
 
-  requestAnimationFrame(() => {
+  afterRender(() => {
     if (!window.echarts) return;
     state.signalDetailChart = echarts.init(pathChart);
     state.charts = [state.signalDetailChart];

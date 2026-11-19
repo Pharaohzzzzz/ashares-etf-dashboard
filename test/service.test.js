@@ -42,6 +42,36 @@ function createConsecutiveBars(count) {
   }));
 }
 
+async function mockOfficialIopv(etf) {
+  return {
+    code: etf.code,
+    name: etf.name,
+    marketPrice: 4,
+    iopv: 4,
+    tradeDate: '2026-10-26',
+    dataTime: '2026-10-26 15:00:00',
+    observedAt: '2026-10-26T07:00:00.000Z',
+    source: '上交所',
+    sourceKind: 'official',
+    sourceUrl: 'https://www.sse.com.cn/',
+    series: []
+  };
+}
+
+async function mockSupplementaryIopv(etfs) {
+  return new Map(etfs.map((etf) => [etf.code, {
+    code: etf.code,
+    marketPrice: 4,
+    iopv: 4,
+    tradeDate: '2026-10-26',
+    dataTime: '2026-10-26 15:00:00',
+    observedAt: '2026-10-26T07:00:00.000Z',
+    source: '东方财富（补充）',
+    sourceKind: 'supplementary',
+    sourceUrl: 'https://quote.eastmoney.com/'
+  }]));
+}
+
 test('summary calculates ratio, returns, shares and a broad resonance candidate', () => {
   const db = createDatabase(':memory:');
   db.upsertBars('510300', createBars());
@@ -84,11 +114,16 @@ test('refreshQuotes records provider failures without discarding successes', asy
         timestamp: 1795114800
       };
     },
+    officialIopvProvider: mockOfficialIopv,
+    supplementaryIopvProvider: mockSupplementaryIopv,
     now: () => new Date('2026-10-26T08:00:00.000Z')
   });
   const summary = await service.refreshQuotes();
   assert.equal(summary.etfs.length, 2);
-  assert.equal(summary.logs[0].status, 'partial');
+  assert.equal(
+    summary.logs.find((log) => log.scope === 'quotes')?.status,
+    'partial'
+  );
   db.close();
 });
 
@@ -115,6 +150,8 @@ test('initialization continues when one ETF history request fails', async () => 
     }),
     sseShareProvider: async () => new Map(),
     szseShareProvider: async () => new Map(),
+    officialIopvProvider: mockOfficialIopv,
+    supplementaryIopvProvider: mockSupplementaryIopv,
     now: () => new Date('2026-10-26T08:00:00.000Z')
   });
   await service.initialize({ force: true });

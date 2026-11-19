@@ -24,6 +24,7 @@
 
 html {
   min-width: 320px;
+  overflow-x: hidden;
   background: var(--bg);
 }
 
@@ -501,6 +502,7 @@ h1 {
 
 .category-tabs {
   display: flex;
+  min-width: 0;
   gap: 6px;
   overflow-x: auto;
   scrollbar-width: none;
@@ -541,7 +543,7 @@ h1 {
 
 table {
   width: 100%;
-  min-width: 1120px;
+  min-width: 1230px;
   border-collapse: collapse;
 }
 
@@ -631,6 +633,57 @@ td {
 .positive { color: var(--red) !important; }
 .negative { color: var(--green) !important; }
 .neutral { color: var(--muted) !important; }
+.status-warning,
+.premium-warning {
+  color: var(--amber) !important;
+}
+
+.premium-pill {
+  display: inline-flex;
+  min-width: 76px;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+  padding: 4px 8px;
+  color: #9fb1c7;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255,255,255,0.025);
+}
+
+.premium-pill strong {
+  color: inherit;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.premium-pill small {
+  color: var(--faint);
+  font-size: 9px;
+}
+
+.premium-pill.abnormal {
+  border-color: rgba(240, 184, 87, 0.48);
+  background: rgba(240, 184, 87, 0.12);
+  box-shadow: 0 0 16px rgba(240, 184, 87, 0.12);
+}
+
+.premium-pill.status-stale {
+  color: var(--amber);
+  border-color: rgba(240, 184, 87, 0.32);
+}
+
+.premium-pill.status-conflict,
+.premium-pill.status-invalid,
+.premium-pill.status-zero {
+  color: #ffadb5;
+  border-color: rgba(255, 91, 107, 0.34);
+  background: rgba(255, 91, 107, 0.08);
+}
+
+.premium-pill.status-missing {
+  color: #8393a7;
+}
 
 .ratio-pill {
   display: inline-block;
@@ -926,6 +979,18 @@ td {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 8px;
+  margin-bottom: 12px;
+}
+
+.iopv-history-stats {
+  margin-top: 4px;
+}
+
+.iopv-intraday-stats {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
+.iopv-chart-card {
   margin-bottom: 12px;
 }
 
@@ -1493,13 +1558,20 @@ td {
   }
 
   .site-header {
-    align-items: flex-start;
+    align-items: stretch;
+    flex-direction: column;
+    gap: 14px;
     padding-top: 20px;
   }
 
   .header-actions {
-    flex-direction: column-reverse;
-    align-items: end;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    width: 100%;
+  }
+
+  .hero-row h2 {
+    overflow-wrap: anywhere;
   }
 
   .status-pill {
@@ -1569,8 +1641,15 @@ td {
   }
 
   .toolbar {
+    width: 100%;
+    min-width: 0;
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .category-tabs {
+    width: 100%;
+    min-width: 0;
   }
 
   .detail-drawer {

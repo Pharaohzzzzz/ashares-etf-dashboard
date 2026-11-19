@@ -97,6 +97,18 @@ function createApp({ service, publicDir = path.join(__dirname, '..', 'public') }
           : sendJson(response, 404, { error: 'ETF 不存在' });
       }
 
+      const iopvHistoryMatch = url.pathname.match(/^\/api\/etfs\/(\d{6})\/iopv-history$/);
+      if (iopvHistoryMatch && request.method === 'GET') {
+        const days = Number(url.searchParams.get('days') || 250);
+        if (!Number.isInteger(days) || days < 1 || days > 250) {
+          return sendJson(response, 400, { error: 'IOPV 历史视角需为 1 至 250 日' });
+        }
+        const history = service.getIopvHistory(iopvHistoryMatch[1], days);
+        return history
+          ? sendJson(response, 200, history)
+          : sendJson(response, 404, { error: 'ETF 不存在' });
+      }
+
       if (url.pathname === '/api/backtests/summary' && request.method === 'GET') {
         return sendJson(response, 200, await service.getBacktestSummary());
       }
@@ -192,6 +204,24 @@ function createApp({ service, publicDir = path.join(__dirname, '..', 'public') }
               { key: 'source', label: '来源' }
             ], shareHistory?.range?.points || []);
             filename = `${code}-official-shares.csv`;
+          } else if (url.searchParams.get('type') === 'iopv') {
+            const iopvHistory = service.getIopvHistory(code, 250);
+            csv = toCsv([
+              { key: 'tradeDate', label: '交易日' },
+              { key: 'dataTime', label: 'IOPV数据时间' },
+              { key: 'marketPrice', label: '市场价' },
+              { key: 'iopv', label: 'IOPV' },
+              { key: 'premiumRate', label: '折溢价率' },
+              { key: 'source', label: '数据来源' },
+              { key: 'sourceKind', label: '来源级别' }
+            ], (iopvHistory?.closeHistory || []).map((point) => ({
+              ...point,
+              premiumRate: Number.isFinite(point.premiumRate)
+                ? `${(point.premiumRate * 100).toFixed(4)}%`
+                : '',
+              sourceKind: point.sourceKind === 'official' ? '交易所官方' : '公开补充源'
+            })));
+            filename = `${code}-iopv-premium.csv`;
           } else {
             csv = toCsv([
               { key: 'date', label: '日期' },
@@ -213,6 +243,12 @@ function createApp({ service, publicDir = path.join(__dirname, '..', 'public') }
             { key: 'name', label: '名称' },
             { key: 'category', label: '分类' },
             { key: 'price', label: '最新价' },
+            { key: 'iopvMarketPrice', label: 'IOPV对应市场价' },
+            { key: 'iopv', label: 'IOPV' },
+            { key: 'premiumRate', label: '折溢价率（市场价/IOPV-1）' },
+            { key: 'premiumStatusLabel', label: '折溢价状态' },
+            { key: 'iopvSource', label: 'IOPV来源' },
+            { key: 'iopvDataTime', label: 'IOPV数据时间' },
             { key: 'changePercent', label: '涨跌幅' },
             { key: 'amount', label: '成交额' },
             { key: 'turnoverRate', label: '换手率' },
@@ -227,6 +263,9 @@ function createApp({ service, publicDir = path.join(__dirname, '..', 'public') }
           ];
           csv = toCsv(headers, summary.etfs.map((row) => ({
             ...row,
+            premiumRate: Number.isFinite(row.premiumRate)
+              ? `${(row.premiumRate * 100).toFixed(4)}%`
+              : (row.premiumStatusLabel || '暂无'),
             shareStreak: row.shareStreak?.days
               ? `${row.shareStreak.label} ${row.shareStreak.days}日`
               : '无连续序列',

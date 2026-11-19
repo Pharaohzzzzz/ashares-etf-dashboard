@@ -91,6 +91,39 @@ function createDatabase(filePath) {
       PRIMARY KEY (exchange, trade_date)
     );
 
+    CREATE TABLE IF NOT EXISTS iopv_latest (
+      code TEXT PRIMARY KEY,
+      trade_date TEXT,
+      data_time TEXT,
+      observed_at TEXT,
+      market_price REAL,
+      iopv REAL,
+      premium_rate REAL,
+      source TEXT,
+      source_kind TEXT,
+      source_url TEXT,
+      cross_check_json TEXT,
+      status TEXT NOT NULL,
+      message TEXT,
+      fetched_at TEXT NOT NULL,
+      attempted_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS iopv_samples (
+      code TEXT NOT NULL,
+      trade_date TEXT NOT NULL,
+      data_time TEXT NOT NULL,
+      observed_at TEXT,
+      market_price REAL NOT NULL,
+      iopv REAL NOT NULL,
+      premium_rate REAL NOT NULL,
+      source TEXT NOT NULL,
+      source_kind TEXT NOT NULL,
+      source_url TEXT,
+      fetched_at TEXT NOT NULL,
+      PRIMARY KEY (code, data_time, source)
+    );
+
     CREATE TABLE IF NOT EXISTS update_log (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       scope TEXT NOT NULL,
@@ -143,6 +176,10 @@ function createDatabase(filePath) {
     CREATE INDEX IF NOT EXISTS idx_share_history_code_date ON share_history(code, trade_date DESC);
     CREATE INDEX IF NOT EXISTS idx_share_sync_exchange_date
       ON official_share_sync_dates(exchange, trade_date DESC);
+    CREATE INDEX IF NOT EXISTS idx_iopv_samples_code_time
+      ON iopv_samples(code, data_time DESC);
+    CREATE INDEX IF NOT EXISTS idx_iopv_samples_code_trade_date
+      ON iopv_samples(code, trade_date DESC, data_time DESC);
     CREATE INDEX IF NOT EXISTS idx_backtest_runs_generated
       ON backtest_runs(generated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_signal_events_run_date
@@ -255,6 +292,149 @@ function createDatabase(filePath) {
         ) latest ON latest.code = s.code AND latest.captured_at = s.captured_at
         ORDER BY s.code
       `).all();
+    },
+    saveIopvLatest(state) {
+      db.prepare(`
+        INSERT INTO iopv_latest(
+          code, trade_date, data_time, observed_at, market_price, iopv, premium_rate,
+          source, source_kind, source_url, cross_check_json, status, message,
+          fetched_at, attempted_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(code) DO UPDATE SET
+          trade_date = excluded.trade_date,
+          data_time = excluded.data_time,
+          observed_at = excluded.observed_at,
+          market_price = excluded.market_price,
+          iopv = excluded.iopv,
+          premium_rate = excluded.premium_rate,
+          source = excluded.source,
+          source_kind = excluded.source_kind,
+          source_url = excluded.source_url,
+          cross_check_json = excluded.cross_check_json,
+          status = excluded.status,
+          message = excluded.message,
+          fetched_at = excluded.fetched_at,
+          attempted_at = excluded.attempted_at
+      `).run(
+        state.code,
+        state.tradeDate ?? null,
+        state.dataTime ?? null,
+        state.observedAt ?? null,
+        state.marketPrice ?? null,
+        state.iopv ?? null,
+        state.premiumRate ?? null,
+        state.source ?? null,
+        state.sourceKind ?? null,
+        state.sourceUrl ?? null,
+        state.crossCheck ? JSON.stringify(state.crossCheck) : null,
+        state.status,
+        state.message ?? null,
+        state.fetchedAt,
+        state.attemptedAt || state.fetchedAt
+      );
+    },
+    markIopvFailure(code, message, attemptedAt = new Date().toISOString()) {
+      db.prepare(`
+        INSERT INTO iopv_latest(code, status, message, fetched_at, attempted_at)
+        VALUES (?, 'stale', ?, ?, ?)
+        ON CONFLICT(code) DO UPDATE SET
+          status = 'stale',
+          message = excluded.message,
+          attempted_at = excluded.attempted_at
+      `).run(code, message, attemptedAt, attemptedAt);
+    },
+    getIopvLatest(code) {
+      const row = db.prepare('SELECT * FROM iopv_latest WHERE code = ?').get(code);
+      return row ? parseIopvLatest(row) : null;
+    },
+    saveIopvSamples(entries, fetchedAt = new Date().toISOString()) {
+      const statement = db.prepare(`
+        INSERT INTO iopv_samples(
+          code, trade_date, data_time, observed_at, market_price, iopv, premium_rate,
+          source, source_kind, source_url, fetched_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(code, data_time, source) DO UPDATE SET
+          trade_date = excluded.trade_date,
+          observed_at = excluded.observed_at,
+          market_price = excluded.market_price,
+          iopv = excluded.iopv,
+          premium_rate = excluded.premium_rate,
+          source_kind = excluded.source_kind,
+          source_url = excluded.source_url,
+          fetched_at = excluded.fetched_at
+      `);
+      db.exec('BEGIN');
+      try {
+        for (const entry of entries) {
+          if (
+            !Number.isFinite(entry.marketPrice) ||
+            !Number.isFinite(entry.iopv) ||
+            entry.marketPrice <= 0 ||
+            entry.iopv <= 0 ||
+            !Number.isFinite(entry.premiumRate)
+          ) {
+            continue;
+          }
+          statement.run(
+            entry.code,
+            entry.tradeDate,
+            entry.dataTime,
+            entry.observedAt ?? null,
+            entry.marketPrice,
+            entry.iopv,
+            entry.premiumRate,
+            entry.source,
+            entry.sourceKind,
+            entry.sourceUrl ?? null,
+            fetchedAt
+          );
+        }
+        db.exec('COMMIT');
+      } catch (error) {
+        db.exec('ROLLBACK');
+        throw error;
+      }
+    },
+    getIopvSamplesForDate(code, tradeDate, limit = 500) {
+      return db.prepare(`
+        SELECT code, trade_date AS tradeDate, data_time AS dataTime,
+               observed_at AS observedAt, market_price AS marketPrice,
+               iopv, premium_rate AS premiumRate, source,
+               source_kind AS sourceKind, source_url AS sourceUrl,
+               fetched_at AS fetchedAt
+        FROM iopv_samples
+        WHERE code = ? AND trade_date = ?
+        ORDER BY data_time ASC
+        LIMIT ?
+      `).all(code, tradeDate, limit);
+    },
+    getIopvCloseHistory(code, limit = 250, startDate = null, endDate = null) {
+      if (!Number.isInteger(limit) || limit < 1) return [];
+      return db.prepare(`
+        SELECT code, trade_date AS tradeDate, data_time AS dataTime, observed_at AS observedAt,
+               market_price AS marketPrice, iopv, premium_rate AS premiumRate, source,
+               source_kind AS sourceKind, source_url AS sourceUrl, fetched_at AS fetchedAt
+        FROM (
+          SELECT s.*,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY trade_date
+                   ORDER BY data_time DESC,
+                            CASE source_kind WHEN 'official' THEN 0 ELSE 1 END
+                 ) AS position
+          FROM iopv_samples s
+          WHERE code = ?
+            AND (? IS NULL OR trade_date >= ?)
+            AND (? IS NULL OR trade_date <= ?)
+        )
+        WHERE position = 1
+        ORDER BY trade_date DESC
+        LIMIT ?
+      `).all(code, startDate, startDate, endDate, endDate, limit).reverse();
+    },
+    countIopvSamples(code) {
+      return db.prepare(
+        'SELECT COUNT(*) AS count FROM iopv_samples WHERE code = ?'
+      ).get(code).count;
     },
     getPreviousShares(code, tradeDate) {
       const shareRecord = db.prepare(`
@@ -587,6 +767,26 @@ function parseSignalEvent(row) {
     futurePath: JSON.parse(row.future_path_json),
     legacyComposite: Boolean(row.legacy_composite),
     legacySignals: JSON.parse(row.legacy_signals_json)
+  };
+}
+
+function parseIopvLatest(row) {
+  return {
+    code: row.code,
+    tradeDate: row.trade_date,
+    dataTime: row.data_time,
+    observedAt: row.observed_at,
+    marketPrice: row.market_price,
+    iopv: row.iopv,
+    premiumRate: row.premium_rate,
+    source: row.source,
+    sourceKind: row.source_kind,
+    sourceUrl: row.source_url,
+    crossCheck: row.cross_check_json ? JSON.parse(row.cross_check_json) : null,
+    status: row.status,
+    message: row.message,
+    fetchedAt: row.fetched_at,
+    attemptedAt: row.attempted_at
   };
 }
 

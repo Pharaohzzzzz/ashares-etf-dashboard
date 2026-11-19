@@ -48,6 +48,42 @@ const service = {
       ranges: {}
     }
     : null,
+  getIopvHistory: (code, days) => code === '510300'
+    ? {
+      code,
+      selectedDays: days,
+      current: {
+        iopv: 4,
+        marketPrice: 4.04,
+        premiumRate: 0.01,
+        source: '上交所',
+        sourceKind: 'official',
+        dataTime: '2026-11-19 15:00:00',
+        status: 'valid',
+        label: '正常'
+      },
+      stats: {
+        open: 0,
+        high: 0.01,
+        low: 0,
+        mean: 0.005,
+        latest: 0.01,
+        sampleCount: 2
+      },
+      closeHistory: [{
+        tradeDate: '2026-11-19',
+        dataTime: '2026-11-19 15:00:00',
+        marketPrice: 4.04,
+        iopv: 4,
+        premiumRate: 0.01,
+        source: '上交所',
+        sourceKind: 'official'
+      }],
+      closePercentile: null,
+      closeSampleCount: 1,
+      coverage: { requestedDays: days, availableDays: 1, status: 'partial' }
+    }
+    : null,
   getBacktestSummary: async () => ({
     parameterVersion: 'signal-score-v1.0.1',
     run: { id: 7, generatedAt: '2026-11-20T08:00:00.000Z' },
@@ -127,6 +163,11 @@ test('summary, health, detail and CSV APIs respond', async (context) => {
   assert.equal(shareHistory.selectedDays, 20);
   const invalidShareHistory = await fetch(`${base}/api/etfs/510300/share-history?days=30`);
   assert.equal(invalidShareHistory.status, 400);
+  const iopvHistory = await fetch(`${base}/api/etfs/510300/iopv-history?days=20`)
+    .then((response) => response.json());
+  assert.equal(iopvHistory.current.iopv, 4);
+  const invalidIopvHistory = await fetch(`${base}/api/etfs/510300/iopv-history?days=0`);
+  assert.equal(invalidIopvHistory.status, 400);
   const missing = await fetch(`${base}/api/etfs/000000`);
   assert.equal(missing.status, 404);
   const csv = await fetch(`${base}/api/export.csv`).then((response) => response.text());
@@ -137,6 +178,10 @@ test('summary, health, detail and CSV APIs respond', async (context) => {
     .then((response) => response.text());
   assert.match(shareCsv, /官方总份额/);
   assert.match(shareCsv, /2026-11-19/);
+  const iopvCsv = await fetch(`${base}/api/export.csv?code=510300&type=iopv`)
+    .then((response) => response.text());
+  assert.match(iopvCsv, /折溢价率/);
+  assert.match(iopvCsv, /交易所官方/);
 
   const backtestSummary = await fetch(`${base}/api/backtests/summary`)
     .then((response) => response.json());
