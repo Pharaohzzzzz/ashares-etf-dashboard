@@ -153,6 +153,18 @@ function createDatabase(filePath) {
       fetched_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS sync_tasks (
+      task_key TEXT PRIMARY KEY,
+      status TEXT NOT NULL,
+      target_dates_json TEXT NOT NULL DEFAULT '[]',
+      last_success_date TEXT,
+      failed_dates_json TEXT NOT NULL DEFAULT '[]',
+      retry_count INTEGER NOT NULL DEFAULT 0,
+      last_attempt_at TEXT NOT NULL,
+      last_success_at TEXT,
+      message TEXT
+    );
+
     CREATE TABLE IF NOT EXISTS backtest_runs (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       parameter_version TEXT NOT NULL,
@@ -848,6 +860,103 @@ function createDatabase(filePath) {
         FROM trading_calendar
         WHERE trade_date = ?
       `).get(date) || null;
+    },
+    getDataDates() {
+      return {
+        quoteDate: db.prepare('SELECT MAX(trade_date) AS date FROM snapshots').get().date || null,
+        barDate: db.prepare('SELECT MAX(date) AS date FROM daily_bars').get().date || null,
+        officialShareDate: db.prepare(`
+          SELECT MAX(trade_date) AS date
+          FROM share_history
+          WHERE source IN ('上交所', '深交所', 'SSE', 'SZSE')
+        `).get().date || null,
+        iopvDate: db.prepare('SELECT MAX(trade_date) AS date FROM iopv_latest').get().date || null,
+        backtestDate: db.prepare('SELECT MAX(signal_date) AS date FROM signal_events').get().date || null
+      };
+    },
+    getEtfDataDates(code) {
+      return {
+        quoteDate: db.prepare(
+          'SELECT MAX(trade_date) AS date FROM snapshots WHERE code = ?'
+        ).get(code).date || null,
+        barDate: db.prepare(
+          'SELECT MAX(date) AS date FROM daily_bars WHERE code = ?'
+        ).get(code).date || null,
+        officialShareDate: db.prepare(`
+          SELECT MAX(trade_date) AS date
+          FROM share_history
+          WHERE code = ? AND source IN ('上交所', '深交所', 'SSE', 'SZSE')
+        `).get(code).date || null,
+        iopvDate: db.prepare(
+          'SELECT MAX(trade_date) AS date FROM iopv_latest WHERE code = ?'
+        ).get(code).date || null
+      };
+    },
+    startSyncTask(taskKey, {
+      targetDates = [],
+      attemptedAt = new Date().toISOString()
+    } = {}) {
+      db.prepare(`
+        INSERT INTO sync_tasks(
+          task_key, status, target_dates_json, retry_count, last_attempt_at
+        ) VALUES (?, 'running', ?, 0, ?)
+        ON CONFLICT(task_key) DO UPDATE SET
+          status = 'running',
+          target_dates_json = excluded.target_dates_json,
+          retry_count = sync_tasks.retry_count + 1,
+          last_attempt_at = excluded.last_attempt_at
+      `).run(taskKey, JSON.stringify(targetDates), attemptedAt);
+    },
+    finishSyncTask(taskKey, {
+      status,
+      lastSuccessDate = null,
+      failedDates = [],
+      message = null,
+      attemptedAt = new Date().toISOString()
+    }) {
+      db.prepare(`
+        INSERT INTO sync_tasks(
+          task_key, status, target_dates_json, last_success_date,
+          failed_dates_json, retry_count, last_attempt_at, last_success_at, message
+        ) VALUES (?, ?, '[]', ?, ?, 0, ?, ?, ?)
+        ON CONFLICT(task_key) DO UPDATE SET
+          status = excluded.status,
+          last_success_date = COALESCE(excluded.last_success_date, sync_tasks.last_success_date),
+          failed_dates_json = excluded.failed_dates_json,
+          last_attempt_at = excluded.last_attempt_at,
+          last_success_at = CASE
+            WHEN excluded.status IN ('success', 'partial')
+              THEN excluded.last_attempt_at
+            ELSE sync_tasks.last_success_at
+          END,
+          message = excluded.message
+      `).run(
+        taskKey,
+        status,
+        lastSuccessDate,
+        JSON.stringify([...new Set(failedDates)].sort()),
+        attemptedAt,
+        attemptedAt,
+        message
+      );
+    },
+    getSyncTask(taskKey) {
+      const row = db.prepare('SELECT * FROM sync_tasks WHERE task_key = ?').get(taskKey);
+      return row ? {
+        key: row.task_key,
+        status: row.status,
+        targetDates: JSON.parse(row.target_dates_json),
+        lastSuccessDate: row.last_success_date,
+        failedDates: JSON.parse(row.failed_dates_json),
+        retryCount: row.retry_count,
+        lastAttemptAt: row.last_attempt_at,
+        lastSuccessAt: row.last_success_at,
+        message: row.message
+      } : null;
+    },
+    getSyncTasks() {
+      return db.prepare('SELECT task_key FROM sync_tasks ORDER BY task_key').all()
+        .map((row) => this.getSyncTask(row.task_key));
     }
   };
 }

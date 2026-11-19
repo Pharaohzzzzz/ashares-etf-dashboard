@@ -42,6 +42,28 @@ function createConsecutiveBars(count) {
   }));
 }
 
+function createBarsEnding(endDate, count) {
+  const end = Date.parse(`${endDate}T00:00:00Z`);
+  return Array.from({ length: count }, (_, index) => {
+    const date = new Date(end - (count - index - 1) * 86400000)
+      .toISOString()
+      .slice(0, 10);
+    return {
+      date,
+      open: 4,
+      close: 4 + index * 0.001,
+      high: 4.1,
+      low: 3.9,
+      volume: 100,
+      amount: 100,
+      amplitude: 1,
+      changePercent: 1,
+      change: 0.01,
+      turnoverRate: 1
+    };
+  });
+}
+
 async function mockOfficialIopv(etf) {
   return {
     code: etf.code,
@@ -206,6 +228,103 @@ test('initialization continues when one ETF history request fails', async () => 
   await service.initialize({ force: true });
   assert.equal(db.getLatestSnapshots().length, 14);
   assert.equal(service.getSummary().etfs.length, 14);
+  db.close();
+});
+
+test('startup reconciles a new quote date over 520 bars and an official share gap', async () => {
+  const db = createDatabase(':memory:');
+  const fullBars = createBarsEnding('2026-11-19', 520);
+  const oldBars = fullBars.slice(0, -5);
+  const missingShareDate = '2026-11-18';
+  for (const etf of ETFS) db.upsertBars(etf.code, oldBars);
+  for (const etf of ETFS) {
+    db.saveShareHistory(fullBars
+      .slice(-251)
+      .filter((bar) => bar.date !== missingShareDate)
+      .map((bar, index) => ({
+        code: etf.code,
+        tradeDate: bar.date,
+        shares: 100000 + index * 100,
+        source: etf.code.startsWith('1') ? '深交所' : '上交所'
+      })));
+  }
+  const requestedDates = fullBars.slice(-251).map((bar) => bar.date);
+  for (const exchange of ['SSE', 'SZSE']) {
+    db.markOfficialShareSyncDates(
+      exchange,
+      requestedDates.filter((date) => date !== missingShareDate)
+    );
+  }
+
+  const quoteTimestamp = Date.parse('2026-11-19T07:00:00.000Z') / 1000;
+  const historyCalls = [];
+  const sseCalls = [];
+  const szseCalls = [];
+  const service = new MarketService({
+    db,
+    quoteProvider: async (etf) => ({
+      code: etf.code,
+      price: 4.4,
+      previousClose: 4.3,
+      change: 0.1,
+      changePercent: 2,
+      open: 4.3,
+      high: 4.4,
+      low: 4.2,
+      volume: 100,
+      amount: 100,
+      turnoverRate: 1,
+      shares: 2000,
+      marketValue: 4000,
+      timestamp: quoteTimestamp
+    }),
+    klineProvider: async (etf) => {
+      historyCalls.push(etf.code);
+      return fullBars;
+    },
+    sseShareProvider: async (date) => {
+      sseCalls.push(date);
+      return new Map(ETFS
+        .filter((etf) => !etf.code.startsWith('1'))
+        .map((etf) => [etf.code, 150000]));
+    },
+    szseShareProvider: async (codes, date) => {
+      szseCalls.push(date);
+      return new Map(codes.map((code) => [code, 150000]));
+    },
+    szseRangeProvider: async () => [],
+    officialIopvProvider: mockOfficialIopv,
+    supplementaryIopvProvider: mockSupplementaryIopv,
+    calendarProvider: async () => ({
+      month: '2026-11',
+      source: '深交所',
+      sourceUrl: 'https://www.szse.cn/aboutus/calendar/',
+      rows: [{
+        date: '2026-11-20',
+        isTrading: true,
+        exchangeStatus: '1',
+        name: null
+      }]
+    }),
+    now: () => new Date('2026-11-20T10:00:00.000Z')
+  });
+
+  await service.initialize();
+  assert.equal(historyCalls.length, ETFS.length);
+  assert.deepEqual(sseCalls, [missingShareDate]);
+  assert.deepEqual(szseCalls, [missingShareDate]);
+  assert.ok(db.getOfficialShareHistory('510300', 251)
+    .some((row) => row.tradeDate === missingShareDate));
+
+  const historyTask = db.getSyncTask('history');
+  assert.equal(historyTask.status, 'success');
+  assert.equal(historyTask.lastSuccessDate, '2026-11-19');
+  assert.deepEqual(historyTask.failedDates, []);
+  const status = service.getDataStatus();
+  assert.equal(status.dates.quoteDate, '2026-11-19');
+  assert.equal(status.dates.barDate, '2026-11-19');
+  assert.equal(status.dates.officialShareDate, '2026-11-19');
+  assert.ok(status.tasks.shares.lastSuccessDate);
   db.close();
 });
 

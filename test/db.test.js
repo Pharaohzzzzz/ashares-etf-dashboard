@@ -141,3 +141,29 @@ test('recent trade dates return the requested window in ascending order', () => 
   );
   db.close();
 });
+
+test('sync task state persists failed dates and retry counts', () => {
+  const db = createDatabase(':memory:');
+  db.startSyncTask('history', {
+    targetDates: ['2026-11-19'],
+    attemptedAt: '2026-11-20T01:00:00.000Z'
+  });
+  db.finishSyncTask('history', {
+    status: 'partial',
+    lastSuccessDate: '2026-11-19',
+    failedDates: ['2026-11-18', '2026-11-18', '2026-11-19'],
+    message: '1 只失败',
+    attemptedAt: '2026-11-20T01:01:00.000Z'
+  });
+  db.startSyncTask('history', {
+    targetDates: ['2026-11-20'],
+    attemptedAt: '2026-11-20T02:00:00.000Z'
+  });
+  const task = db.getSyncTask('history');
+  assert.equal(task.status, 'running');
+  assert.equal(task.retryCount, 1);
+  assert.deepEqual(task.targetDates, ['2026-11-20']);
+  assert.equal(task.lastSuccessDate, '2026-11-19');
+  assert.deepEqual(task.failedDates, ['2026-11-18', '2026-11-19']);
+  db.close();
+});
