@@ -627,6 +627,8 @@ class MarketService {
           : null,
         officialShareDate: latestOfficial?.tradeDate || null,
         officialShareSource: latestOfficial?.source || null,
+        officialShareFetchedAt: latestOfficial?.officialFetchedAt || latestOfficial?.fetchedAt || null,
+        snapshotFetchedAt: currentShareRecord?.snapshotFetchedAt || null,
         officialShareDays: officialHistory.length,
         shareStreak: calculateShareStreak(officialHistory, officialTradeDates),
         sharePercentile: latestOfficial

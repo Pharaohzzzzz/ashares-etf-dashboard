@@ -2,6 +2,10 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { DatabaseSync } = require('node:sqlite');
 const { createDatabase } = require('../server/db');
 
 test('database seeds all configured ETFs and stores bars idempotently', () => {
@@ -50,11 +54,46 @@ test('official share history takes precedence over quote snapshots', () => {
   assert.equal(record.source, 'SSE');
   db.saveShareHistory([
     { code: '510300', tradeDate: '2026-11-18', shares: 777, source: '行情快照' }
-  ]);
+  ], '2026-11-20T02:00:00.000Z');
   const protectedRecord = db.getShareRecord('510300', '2026-11-18');
   assert.equal(protectedRecord.shares, 980);
   assert.equal(protectedRecord.source, 'SSE');
+  assert.equal(protectedRecord.fetchedAt, '2026-11-20T00:00:00.000Z');
+  assert.equal(protectedRecord.officialFetchedAt, '2026-11-20T00:00:00.000Z');
+  assert.equal(protectedRecord.snapshotFetchedAt, '2026-11-20T02:00:00.000Z');
   db.close();
+});
+
+test('share provenance migration backfills old official and snapshot timestamps', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'etf-provenance-'));
+  const filePath = path.join(directory, 'dashboard.db');
+  const legacy = new DatabaseSync(filePath);
+  legacy.exec(`
+    CREATE TABLE share_history (
+      code TEXT NOT NULL,
+      trade_date TEXT NOT NULL,
+      shares REAL NOT NULL,
+      source TEXT NOT NULL,
+      fetched_at TEXT NOT NULL,
+      PRIMARY KEY (code, trade_date)
+    )
+  `);
+  legacy.prepare(`
+    INSERT INTO share_history(code, trade_date, shares, source, fetched_at)
+    VALUES ('510300', '2026-11-18', 1000, '上交所', '2026-11-19T00:00:00.000Z')
+  `).run();
+  legacy.close();
+
+  const migrated = createDatabase(filePath);
+  const row = migrated.raw.prepare(`
+    SELECT official_fetched_at, snapshot_fetched_at
+    FROM share_history
+    WHERE code = '510300' AND trade_date = '2026-11-18'
+  `).get();
+  assert.equal(row.official_fetched_at, '2026-11-19T00:00:00.000Z');
+  assert.equal(row.snapshot_fetched_at, null);
+  migrated.close();
+  fs.rmSync(directory, { recursive: true, force: true });
 });
 
 test('official share history and completed sync dates are idempotent', () => {

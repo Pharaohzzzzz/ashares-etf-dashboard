@@ -5,6 +5,12 @@ const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
 const { ETFS } = require('../config/etfs');
 
+function ensureColumn(db, table, column, definition) {
+  const exists = db.prepare(`PRAGMA table_info(${table})`).all()
+    .some((row) => row.name === column);
+  if (!exists) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+}
+
 function createDatabase(filePath) {
   if (filePath !== ':memory:') fs.mkdirSync(path.dirname(filePath), { recursive: true });
   const db = new DatabaseSync(filePath);
@@ -186,6 +192,20 @@ function createDatabase(filePath) {
       ON signal_events(run_id, signal_date DESC);
     CREATE INDEX IF NOT EXISTS idx_signal_events_run_code
       ON signal_events(run_id, code, signal_date DESC);
+  `);
+
+  ensureColumn(db, 'share_history', 'official_fetched_at', 'TEXT');
+  ensureColumn(db, 'share_history', 'snapshot_fetched_at', 'TEXT');
+  db.exec(`
+    UPDATE share_history
+    SET official_fetched_at = fetched_at
+    WHERE official_fetched_at IS NULL
+      AND source IN ('上交所', '深交所', 'SSE', 'SZSE');
+
+    UPDATE share_history
+    SET snapshot_fetched_at = fetched_at
+    WHERE snapshot_fetched_at IS NULL
+      AND source IN ('行情快照', '快照');
   `);
 
   const insertEtf = db.prepare(`
@@ -454,7 +474,9 @@ function createDatabase(filePath) {
     },
     getPreviousShareRecord(code, tradeDate) {
       const official = db.prepare(`
-        SELECT trade_date AS tradeDate, shares, source
+        SELECT trade_date AS tradeDate, shares, source, fetched_at AS fetchedAt,
+               official_fetched_at AS officialFetchedAt,
+               snapshot_fetched_at AS snapshotFetchedAt
         FROM share_history
         WHERE code = ? AND trade_date < ?
         ORDER BY trade_date DESC
@@ -462,7 +484,10 @@ function createDatabase(filePath) {
       `).get(code, tradeDate);
       if (official) return official;
       const snapshot = db.prepare(`
-        SELECT trade_date AS tradeDate, shares, '快照' AS source
+        SELECT trade_date AS tradeDate, shares, '快照' AS source,
+               captured_at AS fetchedAt,
+               NULL AS officialFetchedAt,
+               captured_at AS snapshotFetchedAt
         FROM snapshots
         WHERE code = ? AND trade_date < ? AND shares IS NOT NULL
         ORDER BY trade_date DESC, captured_at DESC
@@ -472,7 +497,9 @@ function createDatabase(filePath) {
     },
     getShareRecord(code, tradeDate) {
       const official = db.prepare(`
-        SELECT trade_date AS tradeDate, shares, source
+        SELECT trade_date AS tradeDate, shares, source, fetched_at AS fetchedAt,
+               official_fetched_at AS officialFetchedAt,
+               snapshot_fetched_at AS snapshotFetchedAt
         FROM share_history
         WHERE code = ? AND trade_date = ?
         LIMIT 1
@@ -482,7 +509,9 @@ function createDatabase(filePath) {
     getOfficialShareHistory(code, limit = 251) {
       if (!Number.isInteger(limit) || limit < 1) return [];
       return db.prepare(`
-        SELECT trade_date AS tradeDate, shares, source, fetched_at AS fetchedAt
+        SELECT trade_date AS tradeDate, shares, source, fetched_at AS fetchedAt,
+               official_fetched_at AS officialFetchedAt,
+               snapshot_fetched_at AS snapshotFetchedAt
         FROM (
           SELECT *
           FROM share_history
@@ -544,25 +573,59 @@ function createDatabase(filePath) {
     },
     saveShareHistory(entries, fetchedAt = new Date().toISOString()) {
       const statement = db.prepare(`
-        INSERT INTO share_history(code, trade_date, shares, source, fetched_at)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO share_history(
+          code, trade_date, shares, source, fetched_at,
+          official_fetched_at, snapshot_fetched_at
+        )
+        VALUES (
+          ?, ?, ?, ?, ?,
+          CASE WHEN ? IN ('上交所', '深交所', 'SSE', 'SZSE') THEN ? ELSE NULL END,
+          CASE WHEN ? NOT IN ('上交所', '深交所', 'SSE', 'SZSE') THEN ? ELSE NULL END
+        )
         ON CONFLICT(code, trade_date) DO UPDATE SET
           shares = CASE
-            WHEN share_history.source IN ('上交所', '深交所', 'SSE', 'SZSE') AND excluded.source = '行情快照'
+            WHEN share_history.source IN ('上交所', '深交所', 'SSE', 'SZSE')
+                 AND excluded.source NOT IN ('上交所', '深交所', 'SSE', 'SZSE')
               THEN share_history.shares
             ELSE excluded.shares
           END,
           source = CASE
-            WHEN share_history.source IN ('上交所', '深交所', 'SSE', 'SZSE') AND excluded.source = '行情快照'
+            WHEN share_history.source IN ('上交所', '深交所', 'SSE', 'SZSE')
+                 AND excluded.source NOT IN ('上交所', '深交所', 'SSE', 'SZSE')
               THEN share_history.source
             ELSE excluded.source
           END,
-          fetched_at = excluded.fetched_at
+          fetched_at = CASE
+            WHEN share_history.source IN ('上交所', '深交所', 'SSE', 'SZSE')
+                 AND excluded.source NOT IN ('上交所', '深交所', 'SSE', 'SZSE')
+              THEN share_history.fetched_at
+            ELSE excluded.fetched_at
+          END,
+          official_fetched_at = CASE
+            WHEN excluded.source IN ('上交所', '深交所', 'SSE', 'SZSE')
+              THEN excluded.official_fetched_at
+            ELSE share_history.official_fetched_at
+          END,
+          snapshot_fetched_at = CASE
+            WHEN excluded.source NOT IN ('上交所', '深交所', 'SSE', 'SZSE')
+              THEN excluded.snapshot_fetched_at
+            ELSE share_history.snapshot_fetched_at
+          END
       `);
       db.exec('BEGIN');
       try {
         for (const entry of entries) {
-          statement.run(entry.code, entry.tradeDate, entry.shares, entry.source, fetchedAt);
+          statement.run(
+            entry.code,
+            entry.tradeDate,
+            entry.shares,
+            entry.source,
+            fetchedAt,
+            entry.source,
+            fetchedAt,
+            entry.source,
+            fetchedAt
+          );
         }
         db.exec('COMMIT');
       } catch (error) {
