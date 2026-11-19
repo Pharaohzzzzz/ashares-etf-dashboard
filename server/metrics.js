@@ -153,7 +153,13 @@ function calculateSignals({
     (ratio !== null && ratio >= 2 && shareDelta !== null && shareDelta > 0) ||
     participatesInResonance
   );
-  if (composite) signals.push({ key: 'candidate', label: '护盘候选', level: 'high' });
+  if (composite) {
+    signals.push({
+      key: 'candidate',
+      label: '异常放量+份额变化候选',
+      level: 'high'
+    });
+  }
   return { signals, composite };
 }
 

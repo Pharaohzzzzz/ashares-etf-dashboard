@@ -119,6 +119,10 @@ test('signals flag broad resonance and composite candidate', () => {
     result.signals.map((signal) => signal.key),
     ['volume', 'sustained-volume', 'tail-volume', 'share-up', 'broad-resonance', 'candidate']
   );
+  assert.equal(
+    result.signals.find((signal) => signal.key === 'candidate').label,
+    '异常放量+份额变化候选'
+  );
 });
 
 test('a single share increase is not a composite signal', () => {
