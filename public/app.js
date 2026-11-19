@@ -1482,6 +1482,12 @@ function renderBacktestSummary() {
     document.createElement('br'),
     document.createTextNode(`验证 ${run.validationStart} 至 ${run.validationEnd}`)
   );
+  if (summary.parameters?.entryPriceMode) {
+    elements.backtestRunMeta.append(
+      document.createElement('br'),
+      document.createTextNode('次日开盘入场 · N 日收盘退出')
+    );
+  }
   elements.parameterVersion.textContent = summary.parameterVersion;
   elements.splitComparisonRows.replaceChildren();
   for (const horizon of [1, 3, 5, 10]) {
@@ -1519,11 +1525,23 @@ function renderBacktestSummary() {
   }
   chips.append(
     createElement('span', 'parameter-chip', '阈值 40 / 60 / 80'),
-    createElement('span', 'parameter-chip', '训练 70% · 验证 30%')
+    createElement('span', 'parameter-chip', '训练 70% · 验证 30%'),
+    createElement('span', 'parameter-chip', '次日开盘入场')
   );
+  const baselineCost = summary.parameters?.costScenarios?.baseline;
+  if (baselineCost) {
+    const oneWay = baselineCost.commissionRate + baselineCost.slippageRate + baselineCost.impactRate;
+    chips.append(createElement(
+      'span',
+      'parameter-chip',
+      `基准单边成本 ${(oneWay * 100).toFixed(2)}%`
+    ));
+  }
   elements.backtestMethodology.replaceChildren(chips);
   for (const text of Object.values(summary.methodology || {})) {
-    elements.backtestMethodology.append(createElement('p', '', text));
+    if (typeof text === 'string') {
+      elements.backtestMethodology.append(createElement('p', '', text));
+    }
   }
 
   elements.backtestEtfStatus.replaceChildren();
@@ -1578,7 +1596,7 @@ function renderBacktestData() {
     ? `${state.backtestFilters.from || '起点'} 至 ${state.backtestFilters.to || '终点'}`
     : `${summary.run.trainStart || '--'} 至 ${summary.run.validationEnd || '--'}`;
   elements.backtestDataNote.textContent = aggregate.samples
-    ? `${splitLabel} ${dates}；当前筛选有 ${aggregate.samples} 个具备未来 ${horizon} 日结果的信号样本。相对提升为百分点差，不是收益率。ETF 当前价与历史结果不用于生成当日评分。`
+    ? `${splitLabel} ${dates}；当前筛选有 ${aggregate.samples} 个具备未来 ${horizon} 日结果的信号样本。收益按信号次日开盘入场、持有 ${horizon} 个交易日后收盘退出；页面主结果使用基准成本，事件详情另示零成本结果。相对提升为百分点差，不是收益率。`
     : `数据不足：当前筛选没有具备未来 ${horizon} 日结果的信号样本。请扩大日期范围或调整 ETF、分类和评分等级；不把缺失结果记为 0。`;
   if (insufficient.length) {
     elements.backtestDataNote.textContent += ` 另有 ${insufficient.length} 只 ETF 因历史数据不足被排除：${insufficient.map((etf) => `${etf.code}（${etf.reason}）`).join('；')}。`;
@@ -1852,7 +1870,7 @@ function renderSignalEventDetail(detail) {
         'span',
         '',
         outcome
-          ? `未来 ${horizon} 日 · 基准 ${formatter.percent(outcome.benchmarkReturn)} · 回撤 ${formatter.percent(outcome.drawdown)}`
+          ? `次日 ${outcome.entryDate} 开盘 ${formatter.price(outcome.entryPrice)} · ${outcome.exitDate} 收盘退出 · 基准 ${formatter.percent(outcome.benchmarkReturn)} · 盘中低点回撤 ${formatter.percent(outcome.drawdown)}`
           : `未来 ${horizon} 日结果尚未形成`
       )
     );
@@ -1863,7 +1881,7 @@ function renderSignalEventDetail(detail) {
     createElement(
       'p',
       'data-note',
-      '命中指未来收益高于监测池同期等权基准；无条件样本按同 ETF、同数据切分计算。未来路径只用于评价，不回流到信号日评分。'
+      `基准成本单边 ${formatter.plainPercent((detail.outcomes?.[1]?.oneWayCostRate || 0) * 100, 2)}；零成本结果保留在 CSV。命中指未来收益高于监测池同期等权基准；基准使用相同入场、退出和成本规则。未来路径只用于评价，不回流到信号日评分。`
     )
   );
   elements.drawerBody.append(outcomes);
@@ -1938,7 +1956,7 @@ function buildSignalPathOption(points, horizon) {
       textStyle: { color: '#dce8f8' },
       formatter: (items) => {
         const item = items[0];
-        return item ? `${item.axisValue}<br>相对信号日：${formatter.percentDirect(item.value)}` : '';
+        return item ? `${item.axisValue}<br>相对次日开盘：${formatter.percentDirect(item.value)}` : '';
       }
     },
     xAxis: {

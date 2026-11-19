@@ -291,6 +291,9 @@ function createDatabase(filePath) {
   ensureColumn(db, 'official_share_sync_dates', 'actual_count', 'INTEGER');
   ensureColumn(db, 'official_share_sync_dates', 'expected_codes_json', 'TEXT');
   ensureColumn(db, 'official_share_sync_dates', 'written_codes_json', 'TEXT');
+  ensureColumn(db, 'signal_events', 'signal_available_at', 'TEXT');
+  ensureColumn(db, 'signal_events', 'earliest_entry_date', 'TEXT');
+  ensureColumn(db, 'signal_events', 'entry_price_mode', 'TEXT');
   db.exec(`
     UPDATE share_history
     SET official_fetched_at = fetched_at
@@ -870,8 +873,9 @@ function createDatabase(filePath) {
         INSERT INTO signal_events(
           run_id, code, signal_date, split_name, score, level_key, level_label,
           components_json, reasons_json, outcomes_json, future_path_json,
-          legacy_composite, legacy_signals_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          legacy_composite, legacy_signals_json,
+          signal_available_at, earliest_entry_date, entry_price_mode
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       const {
         events: ignoredEvents,
@@ -911,7 +915,10 @@ function createDatabase(filePath) {
             JSON.stringify(event.outcomes),
             JSON.stringify(event.futurePath),
             event.legacyComposite ? 1 : 0,
-            JSON.stringify(event.legacySignals)
+            JSON.stringify(event.legacySignals),
+            event.signalAvailableAt ?? null,
+            event.earliestEntryDate ?? null,
+            event.entryPriceMode ?? null
           );
         }
         db.exec('COMMIT');
@@ -1177,6 +1184,10 @@ function parseSignalEvent(row) {
     name: row.name,
     category: row.category,
     date: row.signal_date,
+    signalDate: row.signal_date,
+    signalAvailableAt: row.signal_available_at || null,
+    earliestEntryDate: row.earliest_entry_date || null,
+    entryPriceMode: row.entry_price_mode || null,
     split: row.split_name,
     score: row.score,
     level: { key: row.level_key, label: row.level_label },

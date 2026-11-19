@@ -117,6 +117,9 @@ const service = {
           name: '沪深300ETF华泰柏瑞',
           category: '宽基核心',
           date: '2026-10-15',
+          signalAvailableAt: '2026-10-15T15:00:00+08:00',
+          earliestEntryDate: '2026-10-16',
+          entryPriceMode: 'next_trading_day_open',
           split: 'validation',
           score: 72.5,
           level: { key: 'active', label: '活跃异动' },
@@ -124,7 +127,12 @@ const service = {
           outcomes: {
             5: {
               futureReturn: 0.03,
+              zeroCostReturn: 0.032,
+              costDrag: 0.002,
               drawdown: -0.02,
+              maxDrawdownMethod: 'entry_to_future_intraday_low',
+              entryPrice: 4.1,
+              exitDate: '2026-10-22',
               maxFavorable: 0.04,
               benchmarkReturn: 0.01,
               outperformedBenchmark: true,
@@ -199,6 +207,9 @@ test('summary, health, detail and CSV APIs respond', async (context) => {
   const backtestCsv = await fetch(`${base}/api/export.csv?type=backtest&horizon=5&code=510300`)
     .then((response) => response.text());
   assert.match(backtestCsv, /信号日期/);
+  assert.match(backtestCsv, /最早入场日/);
+  assert.match(backtestCsv, /零成本未来收益/);
+  assert.match(backtestCsv, /2026-10-16/);
   assert.match(backtestCsv, /72.5/);
   const missingOutcomeCsv = await fetch(`${base}/api/export.csv?type=backtest&horizon=5&code=588170`)
     .then((response) => response.text());

@@ -4,7 +4,7 @@ const crypto = require('node:crypto');
 const { calculateSignals, percentile } = require('./metrics');
 
 const SIGNAL_PARAMETERS = Object.freeze({
-  version: 'signal-score-v1.0.1',
+  version: 'signal-score-v2.0.0',
   weights: Object.freeze({
     volume: 35,
     shareChange: 30,
@@ -25,7 +25,24 @@ const SIGNAL_PARAMETERS = Object.freeze({
   streakCapDays: 5,
   resonanceVolumeRatio: 1.5,
   legacyResonanceVolumeRatio: 2,
-  resonanceMinCount: 2
+  resonanceMinCount: 2,
+  entryPriceMode: 'next_trading_day_open',
+  exitPriceMode: 'close_after_horizon',
+  maxDrawdownMethod: 'entry_to_future_intraday_low',
+  costScenarios: Object.freeze({
+    zero: Object.freeze({
+      label: '零成本',
+      commissionRate: 0,
+      slippageRate: 0,
+      impactRate: 0
+    }),
+    baseline: Object.freeze({
+      label: '基准成本',
+      commissionRate: 0.0003,
+      slippageRate: 0.0005,
+      impactRate: 0.0002
+    })
+  })
 });
 
 function finite(value) {
@@ -400,8 +417,61 @@ function splitDates(observations) {
   };
 }
 
+function scenarioRate(scenario) {
+  return (scenario.commissionRate || 0) +
+    (scenario.slippageRate || 0) +
+    (scenario.impactRate || 0);
+}
+
+function priceOutcome(bars, signalIndex, horizon, scenario) {
+  const entryIndex = signalIndex + 1;
+  const exitIndex = entryIndex + horizon - 1;
+  const entryBar = bars[entryIndex];
+  const exitBar = bars[exitIndex];
+  if (
+    !entryBar ||
+    !exitBar ||
+    !finite(entryBar.open) ||
+    entryBar.open <= 0 ||
+    !finite(exitBar.close) ||
+    exitBar.close <= 0
+  ) {
+    return null;
+  }
+  const rate = scenarioRate(scenario);
+  const entryEffectivePrice = entryBar.open * (1 + rate);
+  const exitEffectivePrice = exitBar.close * (1 - rate);
+  const pathBars = bars.slice(entryIndex, exitIndex + 1);
+  const netReturn = exitEffectivePrice / entryEffectivePrice - 1;
+  const drawdown = Math.min(
+    0,
+    Math.min(...pathBars.map((bar) => (
+      finite(bar.low) ? bar.low : finite(bar.close) ? bar.close : Infinity
+    ))) / entryEffectivePrice - 1
+  );
+  const favorable = Math.max(
+    0,
+    Math.max(...pathBars.map((bar) => (
+      finite(bar.high) ? bar.high : finite(bar.close) ? bar.close : -Infinity
+    ))) / entryEffectivePrice - 1
+  );
+  return {
+    netReturn,
+    grossReturn: exitBar.close / entryBar.open - 1,
+    drawdown,
+    favorable,
+    entryBar,
+    exitBar,
+    pathBars,
+    entryEffectivePrice
+  };
+}
+
 function buildBenchmarkReturns(prepared, horizons) {
-  const returns = new Map();
+  const returns = {
+    baseline: new Map(),
+    zero: new Map()
+  };
   const barIndexes = new Map(prepared.map((item) => [
     item.etf.code,
     new Map(item.bars.map((bar, index) => [bar.date, index]))
@@ -414,16 +484,34 @@ function buildBenchmarkReturns(prepared, horizons) {
       const indexes = barIndexes.get(item.etf.code);
       for (const bar of item.bars) {
         const index = indexes.get(bar.date);
-        const futureBar = item.bars[index + horizon];
-        if (!futureBar || !finite(bar.close) || !finite(futureBar.close) || bar.close <= 0) {
-          continue;
-        }
+        const baseline = priceOutcome(
+          item.bars,
+          index,
+          horizon,
+          SIGNAL_PARAMETERS.costScenarios.baseline
+        );
+        const zero = priceOutcome(
+          item.bars,
+          index,
+          horizon,
+          SIGNAL_PARAMETERS.costScenarios.zero
+        );
+        if (!baseline || !zero) continue;
         if (!byDate.has(bar.date)) byDate.set(bar.date, []);
-        byDate.get(bar.date).push(futureBar.close / bar.close - 1);
+        byDate.get(bar.date).push({ baseline: baseline.netReturn, zero: zero.netReturn });
       }
     }
-    returns.set(horizon, new Map(
-      [...byDate.entries()].map(([date, values]) => [date, average(values)])
+    returns.baseline.set(horizon, new Map(
+      [...byDate.entries()].map(([date, values]) => [
+        date,
+        average(values.map((item) => item.baseline))
+      ])
+    ));
+    returns.zero.set(horizon, new Map(
+      [...byDate.entries()].map(([date, values]) => [
+        date,
+        average(values.map((item) => item.zero))
+      ])
     ));
   }
   return { returns, barIndexes };
@@ -437,48 +525,76 @@ function attachOutcomes(observations, prepared) {
   for (const observation of observations) {
     const bars = barsByCode.get(observation.code);
     const index = barIndexes.get(observation.code).get(observation.date);
-    const entry = bars[index];
+    const entry = bars[index + 1] || null;
+    observation.signalDate = observation.date;
+    observation.signalAvailableAt = `${observation.date}T15:00:00+08:00`;
+    observation.earliestEntryDate = entry?.date || null;
+    observation.entryPriceMode = SIGNAL_PARAMETERS.entryPriceMode;
     observation.outcomes = {};
     observation.futurePath = {};
     for (const horizon of horizons) {
-      const future = bars[index + horizon];
-      const benchmarkReturn = benchmarkReturns.get(horizon).get(observation.date) ?? null;
+      const baseline = priceOutcome(
+        bars,
+        index,
+        horizon,
+        SIGNAL_PARAMETERS.costScenarios.baseline
+      );
+      const zero = priceOutcome(
+        bars,
+        index,
+        horizon,
+        SIGNAL_PARAMETERS.costScenarios.zero
+      );
+      const benchmarkReturn = benchmarkReturns.baseline.get(horizon).get(observation.date) ?? null;
+      const benchmarkZeroCostReturn = benchmarkReturns.zero.get(horizon).get(observation.date) ?? null;
       if (
-        !future ||
-        !Number.isFinite(entry?.close) ||
-        entry.close <= 0 ||
-        !Number.isFinite(future.close) ||
+        !baseline ||
+        !zero ||
         !finite(benchmarkReturn)
       ) {
         observation.outcomes[horizon] = null;
         observation.futurePath[horizon] = [];
         continue;
       }
-      const pathBars = bars.slice(index + 1, index + horizon + 1);
-      const futureReturn = future.close / entry.close - 1;
-      const drawdown = Math.min(
-        0,
-        Math.min(...pathBars.map((bar) => bar.close)) / entry.close - 1
-      );
-      const favorable = Math.max(
-        0,
-        Math.max(...pathBars.map((bar) => bar.close)) / entry.close - 1
-      );
       observation.outcomes[horizon] = {
         horizon,
-        futureReturn: round(futureReturn, 6),
+        futureReturn: round(baseline.netReturn, 6),
+        zeroCostReturn: round(zero.netReturn, 6),
+        costDrag: round(zero.netReturn - baseline.netReturn, 6),
         benchmarkReturn: round(benchmarkReturn, 6),
-        benchmarkExcess: round(futureReturn - benchmarkReturn, 6),
-        drawdown: round(drawdown, 6),
-        maxFavorable: round(favorable, 6),
-        outperformedBenchmark: futureReturn > benchmarkReturn,
-        entryDate: entry.date,
-        exitDate: future.date
+        benchmarkZeroCostReturn: round(benchmarkZeroCostReturn, 6),
+        benchmarkExcess: round(baseline.netReturn - benchmarkReturn, 6),
+        drawdown: round(baseline.drawdown, 6),
+        maxFavorable: round(baseline.favorable, 6),
+        outperformedBenchmark: baseline.netReturn > benchmarkReturn,
+        signalDate: observation.date,
+        signalAvailableAt: observation.signalAvailableAt,
+        earliestEntryDate: baseline.entryBar.date,
+        entryDate: baseline.entryBar.date,
+        entryPriceMode: SIGNAL_PARAMETERS.entryPriceMode,
+        entryPrice: baseline.entryBar.open,
+        entryEffectivePrice: round(baseline.entryEffectivePrice, 6),
+        exitDate: baseline.exitBar.date,
+        exitPriceMode: SIGNAL_PARAMETERS.exitPriceMode,
+        exitPrice: baseline.exitBar.close,
+        maxDrawdownMethod: SIGNAL_PARAMETERS.maxDrawdownMethod,
+        costScenario: SIGNAL_PARAMETERS.costScenarios.baseline.label,
+        oneWayCostRate: round(scenarioRate(SIGNAL_PARAMETERS.costScenarios.baseline), 6)
       };
-      observation.futurePath[horizon] = pathBars.map((bar) => ({
+      observation.futurePath[horizon] = baseline.pathBars.map((bar) => ({
         date: bar.date,
+        open: bar.open,
         close: bar.close,
-        relative: round(bar.close / entry.close - 1, 6)
+        high: bar.high,
+        low: bar.low,
+        relative: round(
+          (finite(bar.close) ? bar.close : null) / baseline.entryBar.open - 1,
+          6
+        ),
+        relativeLow: round(
+          (finite(bar.low) ? bar.low : bar.close) / baseline.entryBar.open - 1,
+          6
+        )
       }));
     }
   }
@@ -527,7 +643,10 @@ function aggregateOutcomes(observations, horizon, selector) {
       worstDrawdown: null,
       averageMaxFavorable: null,
       averageBenchmarkReturn: null,
-      relativeReturnImprovement: null
+      relativeReturnImprovement: null,
+      averageZeroCostReturn: null,
+      averageCostDrag: null,
+      maxDrawdownMethod: SIGNAL_PARAMETERS.maxDrawdownMethod
     };
   }
   const hitRate = selected.filter((outcome) => outcome.outperformedBenchmark).length / selected.length;
@@ -548,7 +667,13 @@ function aggregateOutcomes(observations, horizon, selector) {
       average(selected.map((outcome) => outcome.benchmarkReturn)),
       6
     ),
-    relativeReturnImprovement: round(averageReturn - baselineAverageReturn, 6)
+    relativeReturnImprovement: round(averageReturn - baselineAverageReturn, 6),
+    averageZeroCostReturn: round(
+      average(selected.map((outcome) => outcome.zeroCostReturn)),
+      6
+    ),
+    averageCostDrag: round(average(selected.map((outcome) => outcome.costDrag)), 6),
+    maxDrawdownMethod: SIGNAL_PARAMETERS.maxDrawdownMethod
   };
 }
 
@@ -658,11 +783,15 @@ function buildBacktest(dataset) {
     },
     methodology: {
       signalDayInputs: '评分只读取信号日及以前的数据；未来数据仅用于事后结果评价',
-      benchmark: '同期基准为监测池内具备相同起止日数据 ETF 的等权平均收益',
+      entry: `信号在 ${SIGNAL_PARAMETERS.entryPriceMode === 'next_trading_day_open' ? '信号日收盘后生成，于下一可交易日开盘入场' : SIGNAL_PARAMETERS.entryPriceMode}`,
+      exit: '自入场日起持有 N 个交易日，在第 N 个交易日收盘退出',
+      benchmark: '同期基准为监测池内具备相同起止日数据 ETF 的等权平均收益，并使用与信号完全相同的次日开盘入场、N 日收盘退出和成本规则',
       hit: '命中指 ETF 未来收益高于同期等权基准；相对提升为信号命中率减去同 ETF 同期间无条件命中率',
       missingShares: '官方份额缺失或不足时不插值、不回填，并排除该日评分',
       split: '按全池可评分交易日的先后顺序前 70% 训练、后 30% 留出验证，验证期不参与参数调整',
-      tailVolume: '尾盘成交占比仅作当日辅助标签，不进入长期回测评分'
+      tailVolume: '尾盘成交占比仅作当日辅助标签，不进入长期回测评分',
+      drawdown: '最大回撤从次日开盘入场价起算，使用持有期内后续交易日最低价；不是收盘价回撤',
+      costs: SIGNAL_PARAMETERS.costScenarios
     },
     splits: {
       train: summarizeSplit(observations, 'train'),
@@ -675,7 +804,11 @@ function buildBacktest(dataset) {
         code: observation.code,
         name: observation.name,
         category: observation.category,
-        date: observation.date,
+        date: observation.signalDate,
+        signalDate: observation.signalDate,
+        signalAvailableAt: observation.signalAvailableAt,
+        earliestEntryDate: observation.earliestEntryDate,
+        entryPriceMode: observation.entryPriceMode,
         split: observation.split,
         score: observation.score,
         level: observation.level,

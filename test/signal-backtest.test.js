@@ -114,9 +114,37 @@ test('backtest outcomes use subsequent dates while scores use the signal date', 
   );
   assert.equal(changedEvent.score, event.score);
   assert.notEqual(changedEvent.outcomes[5].futureReturn, event.outcomes[5].futureReturn);
-  assert.equal(changedEvent.outcomes[5].drawdown, 0);
+  assert.ok(changedEvent.outcomes[5].drawdown <= 0);
   assert.ok(changedEvent.outcomes[5].maxFavorable > 0);
   assert.ok(changedEvent.futurePath[5].every((point) => point.date > event.date));
+  assert.equal(event.signalDate, createDate(55));
+  assert.equal(event.signalAvailableAt, `${createDate(55)}T15:00:00+08:00`);
+  assert.equal(event.earliestEntryDate, createDate(56));
+  assert.equal(event.entryPriceMode, 'next_trading_day_open');
+  assert.equal(event.outcomes[5].entryDate, createDate(56));
+  assert.equal(event.outcomes[5].entryPrice, event.futurePath[5][0].open);
+  assert.equal(event.outcomes[5].maxDrawdownMethod, 'entry_to_future_intraday_low');
+  assert.ok(event.outcomes[5].zeroCostReturn > event.outcomes[5].futureReturn);
+  assert.ok(event.outcomes[5].costDrag > 0);
+});
+
+test('signal-day close cannot be used as the same-day entry price', () => {
+  const dataset = createDataset();
+  const signalIndex = 55;
+  for (const etf of dataset) {
+    etf.bars[signalIndex].close = etf.bars[signalIndex].open * 100;
+    etf.bars[signalIndex].high = etf.bars[signalIndex].close;
+    etf.bars[signalIndex].low = etf.bars[signalIndex].open;
+  }
+  const result = buildBacktest(dataset);
+  const event = result.events.find((item) => item.date === createDate(signalIndex));
+  assert.ok(event);
+  assert.equal(event.outcomes[5].entryDate, createDate(signalIndex + 1));
+  assert.notEqual(
+    event.outcomes[5].entryPrice,
+    dataset[0].bars[signalIndex].close
+  );
+  assert.ok(event.futurePath[5].every((point) => point.date > event.signalDate));
 });
 
 test('backtest uses a chronological 70/30 split and reports samples', () => {
