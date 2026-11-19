@@ -82,6 +82,15 @@ function createDatabase(filePath) {
       PRIMARY KEY (code, trade_date)
     );
 
+    CREATE TABLE IF NOT EXISTS official_share_sync_dates (
+      exchange TEXT NOT NULL,
+      trade_date TEXT NOT NULL,
+      status TEXT NOT NULL,
+      message TEXT,
+      fetched_at TEXT NOT NULL,
+      PRIMARY KEY (exchange, trade_date)
+    );
+
     CREATE TABLE IF NOT EXISTS update_log (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       scope TEXT NOT NULL,
@@ -98,6 +107,8 @@ function createDatabase(filePath) {
     CREATE INDEX IF NOT EXISTS idx_snapshots_latest ON snapshots(code, captured_at DESC);
     CREATE INDEX IF NOT EXISTS idx_bars_code_date ON daily_bars(code, date);
     CREATE INDEX IF NOT EXISTS idx_share_history_code_date ON share_history(code, trade_date DESC);
+    CREATE INDEX IF NOT EXISTS idx_share_sync_exchange_date
+      ON official_share_sync_dates(exchange, trade_date DESC);
   `);
 
   const insertEtf = db.prepare(`
@@ -156,6 +167,19 @@ function createDatabase(filePath) {
       return db.prepare(
         'SELECT MAX(date) AS date FROM daily_bars WHERE date < ?'
       ).get(tradeDate)?.date || null;
+    },
+    getRecentTradeDates(limit = 250, endDate = null) {
+      if (!Number.isInteger(limit) || limit < 1) return [];
+      return db.prepare(`
+        SELECT date
+        FROM daily_bars
+        WHERE (? IS NULL OR date <= ?)
+        GROUP BY date
+        ORDER BY date DESC
+        LIMIT ?
+      `).all(endDate, endDate, limit)
+        .map((row) => row.date)
+        .reverse();
     },
     saveSnapshot(quote, tradeDate, capturedAt) {
       const dataTime = quote.timestamp
@@ -234,6 +258,69 @@ function createDatabase(filePath) {
         LIMIT 1
       `).get(code, tradeDate);
       return official || null;
+    },
+    getOfficialShareHistory(code, limit = 251) {
+      if (!Number.isInteger(limit) || limit < 1) return [];
+      return db.prepare(`
+        SELECT trade_date AS tradeDate, shares, source, fetched_at AS fetchedAt
+        FROM (
+          SELECT *
+          FROM share_history
+          WHERE code = ?
+            AND source IN ('上交所', '深交所', 'SSE', 'SZSE')
+          ORDER BY trade_date DESC
+          LIMIT ?
+        )
+        ORDER BY trade_date ASC
+      `).all(code, limit);
+    },
+    countOfficialShareHistory(code) {
+      return db.prepare(`
+        SELECT COUNT(*) AS count
+        FROM share_history
+        WHERE code = ?
+          AND source IN ('上交所', '深交所', 'SSE', 'SZSE')
+      `).get(code).count;
+    },
+    getCompletedOfficialShareSyncDates(exchange, tradeDates) {
+      if (!tradeDates.length) return new Set();
+      const placeholders = tradeDates.map(() => '?').join(',');
+      const rows = db.prepare(`
+        SELECT trade_date AS tradeDate
+        FROM official_share_sync_dates
+        WHERE exchange = ?
+          AND status = 'success'
+          AND trade_date IN (${placeholders})
+        ORDER BY trade_date ASC
+      `).all(exchange, ...tradeDates);
+      return new Set(rows.map((row) => row.tradeDate));
+    },
+    markOfficialShareSyncDates(
+      exchange,
+      tradeDates,
+      status = 'success',
+      message = null,
+      fetchedAt = new Date().toISOString()
+    ) {
+      const statement = db.prepare(`
+        INSERT INTO official_share_sync_dates(
+          exchange, trade_date, status, message, fetched_at
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(exchange, trade_date) DO UPDATE SET
+          status = excluded.status,
+          message = excluded.message,
+          fetched_at = excluded.fetched_at
+      `);
+      db.exec('BEGIN');
+      try {
+        for (const tradeDate of tradeDates) {
+          statement.run(exchange, tradeDate, status, message, fetchedAt);
+        }
+        db.exec('COMMIT');
+      } catch (error) {
+        db.exec('ROLLBACK');
+        throw error;
+      }
     },
     saveShareHistory(entries, fetchedAt = new Date().toISOString()) {
       const statement = db.prepare(`

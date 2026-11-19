@@ -31,6 +31,101 @@ function periodReturn(close, closesAscending, periods = 1) {
   return close / prior - 1;
 }
 
+function calculateShareStreak(history, tradeDates) {
+  const latest = history.at(-1);
+  if (!latest || !tradeDates.length || tradeDates.at(-1) !== latest.tradeDate) {
+    return { direction: null, label: '持平', days: 0 };
+  }
+  const sharesByDate = new Map(history.map((row) => [row.tradeDate, row.shares]));
+  let direction = null;
+  let days = 0;
+  for (let index = tradeDates.length - 1; index > 0; index -= 1) {
+    const currentShares = sharesByDate.get(tradeDates[index]);
+    const previousShares = sharesByDate.get(tradeDates[index - 1]);
+    if (!Number.isFinite(currentShares) || !Number.isFinite(previousShares)) break;
+    const change = currentShares - previousShares;
+    if (change === 0) {
+      if (days === 0) direction = null;
+      break;
+    }
+    const currentDirection = change > 0 ? 'subscription' : 'redemption';
+    if (direction === null) direction = currentDirection;
+    if (currentDirection !== direction) break;
+    days += 1;
+  }
+  if (direction === null) return { direction: null, label: '持平', days: 0 };
+  return {
+    direction,
+    label: direction === 'subscription' ? '连续净申购' : '连续净赎回',
+    days
+  };
+}
+
+function calculateShareWindow(history, bars, days) {
+  if (!history.length || !Number.isInteger(days) || days < 1) {
+    return {
+      days,
+      points: [],
+      periodShareDelta: null,
+      periodEstimatedSubscription: null,
+      sharePercentile: null,
+      startDate: null,
+      endDate: null
+    };
+  }
+  const closeByDate = new Map(bars.map((bar) => [bar.date, bar.close]));
+  const baseHistory = history.slice(-(days + 1));
+  const points = [];
+  let runningEstimatedSubscription = 0;
+  let runningShareDelta = 0;
+  for (let index = 1; index < baseHistory.length; index += 1) {
+    const current = baseHistory[index];
+    const previous = baseHistory[index - 1];
+    const shareDelta = current.shares - previous.shares;
+    const close = closeByDate.get(current.tradeDate) ?? null;
+    const estimatedSubscription = Number.isFinite(close)
+      ? shareDelta * close
+      : null;
+    runningShareDelta += shareDelta;
+    if (Number.isFinite(estimatedSubscription)) {
+      runningEstimatedSubscription += estimatedSubscription;
+    }
+    points.push({
+      tradeDate: current.tradeDate,
+      shares: current.shares,
+      source: current.source,
+      shareDelta,
+      close,
+      estimatedSubscription,
+      cumulativeShareDelta: runningShareDelta,
+      cumulativeEstimatedSubscription: Number.isFinite(estimatedSubscription)
+        ? runningEstimatedSubscription
+        : null
+    });
+  }
+  const windowPoints = points.slice(-days);
+  const finiteEstimates = windowPoints
+    .map((point) => point.estimatedSubscription)
+    .filter((value) => Number.isFinite(value));
+  const currentShares = baseHistory.at(-1).shares;
+  return {
+    days,
+    points: windowPoints,
+    periodShareDelta: windowPoints.length
+      ? windowPoints.reduce((sum, point) => sum + point.shareDelta, 0)
+      : null,
+    periodEstimatedSubscription: finiteEstimates.length
+      ? finiteEstimates.reduce((sum, value) => sum + value, 0)
+      : null,
+    sharePercentile: percentile(
+      currentShares,
+      baseHistory.slice(-days).map((row) => row.shares)
+    ),
+    startDate: windowPoints[0]?.tradeDate || null,
+    endDate: windowPoints.at(-1)?.tradeDate || null
+  };
+}
+
 function calculateSignals({
   isBroad,
   volumeRatio: ratio,
@@ -68,6 +163,8 @@ module.exports = {
   volumeRatio,
   percentile,
   periodReturn,
+  calculateShareStreak,
+  calculateShareWindow,
   calculateSignals
 };
 

@@ -4,6 +4,7 @@ const { unzipSync, strFromU8 } = require('fflate');
 
 const SSE_URL = 'https://query.sse.com.cn/commonQuery.do';
 const SZSE_URL = 'https://fund.szse.cn/api/report/ShowReport';
+const SZSE_RANGE_DAYS = 90;
 
 async function fetchWithRetry(url, options, retries = 2) {
   let lastError;
@@ -103,6 +104,54 @@ function extractSzseShare(rows, code, tradeDate) {
   return Number.isFinite(shares) ? shares : null;
 }
 
+function splitDateRange(startDate, endDate, maxDays = SZSE_RANGE_DAYS) {
+  const start = new Date(`${startDate}T00:00:00Z`);
+  const end = new Date(`${endDate}T00:00:00Z`);
+  if (
+    Number.isNaN(start.getTime()) ||
+    Number.isNaN(end.getTime()) ||
+    start > end ||
+    !Number.isInteger(maxDays) ||
+    maxDays < 1
+  ) {
+    throw new Error('无效的深交所份额查询日期范围');
+  }
+  const chunks = [];
+  let cursor = start;
+  while (cursor <= end) {
+    const chunkEnd = new Date(Math.min(
+      cursor.getTime() + (maxDays - 1) * 86400000,
+      end.getTime()
+    ));
+    chunks.push({
+      startDate: cursor.toISOString().slice(0, 10),
+      endDate: chunkEnd.toISOString().slice(0, 10)
+    });
+    cursor = new Date(chunkEnd.getTime() + 86400000);
+  }
+  return chunks;
+}
+
+function extractSzseShareRange(rows, codes, startDate, endDate) {
+  const codeSet = new Set(codes);
+  return rows.flatMap((row) => {
+    const tradeDate = row[0]?.trim();
+    const code = row[1]?.trim();
+    if (
+      !codeSet.has(code) ||
+      !tradeDate ||
+      tradeDate < startDate ||
+      tradeDate > endDate
+    ) {
+      return [];
+    }
+    const shares = Number(String(row[3]).replaceAll(',', ''));
+    return Number.isFinite(shares)
+      ? [{ code, tradeDate, shares, source: '深交所' }]
+      : [];
+  });
+}
+
 async function fetchSzseEtfShares(codes, tradeDate) {
   const result = new Map();
   for (const code of codes) {
@@ -127,12 +176,43 @@ async function fetchSzseEtfShares(codes, tradeDate) {
   return result;
 }
 
+async function fetchSzseEtfShareRange(codes, startDate, endDate) {
+  if (!codes.length) return [];
+  const entries = [];
+  for (const chunk of splitDateRange(startDate, endDate)) {
+    const query = new URLSearchParams({
+      SHOWTYPE: 'xlsx',
+      CATALOGID: 'fund_jjgm',
+      TABKEY: 'tab1',
+      txtStart: chunk.startDate,
+      txtEnd: chunk.endDate
+    });
+    const response = await fetchWithRetry(`${SZSE_URL}?${query}`, {
+      headers: {
+        Referer: 'https://fund.szse.cn/marketdata/fundslist/index.html',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+      }
+    });
+    const rows = parseSzseWorkbook(await response.arrayBuffer());
+    entries.push(...extractSzseShareRange(
+      rows,
+      codes,
+      chunk.startDate,
+      chunk.endDate
+    ));
+  }
+  return entries;
+}
+
 module.exports = {
   parseSseShares,
   fetchSseEtfShares,
   parseWorksheetRows,
   parseSzseWorkbook,
   extractSzseShare,
-  fetchSzseEtfShares
+  fetchSzseEtfShares,
+  splitDateRange,
+  extractSzseShareRange,
+  fetchSzseEtfShareRange
 };
 

@@ -56,3 +56,49 @@ test('official share history takes precedence over quote snapshots', () => {
   assert.equal(protectedRecord.source, 'SSE');
   db.close();
 });
+
+test('official share history and completed sync dates are idempotent', () => {
+  const db = createDatabase(':memory:');
+  const entries = [
+    { code: '510300', tradeDate: '2026-11-18', shares: 980, source: '上交所' },
+    { code: '510300', tradeDate: '2026-11-19', shares: 1000, source: '上交所' }
+  ];
+  db.saveShareHistory(entries, '2026-11-20T00:00:00.000Z');
+  db.saveShareHistory(entries, '2026-11-20T01:00:00.000Z');
+  db.markOfficialShareSyncDates('SSE', ['2026-11-18', '2026-11-19']);
+  db.markOfficialShareSyncDates('SSE', ['2026-11-18', '2026-11-19']);
+  assert.equal(db.countOfficialShareHistory('510300'), 2);
+  assert.deepEqual(
+    db.getOfficialShareHistory('510300').map((row) => row.tradeDate),
+    ['2026-11-18', '2026-11-19']
+  );
+  assert.equal(
+    db.raw.prepare('SELECT COUNT(*) AS count FROM official_share_sync_dates').get().count,
+    2
+  );
+  assert.deepEqual(
+    [...db.getCompletedOfficialShareSyncDates(
+      'SSE',
+      ['2026-11-17', '2026-11-18', '2026-11-19']
+    )],
+    ['2026-11-18', '2026-11-19']
+  );
+  db.close();
+});
+
+test('recent trade dates return the requested window in ascending order', () => {
+  const db = createDatabase(':memory:');
+  db.upsertBars('510300', ['2026-11-17', '2026-11-18', '2026-11-19'].map((date) => ({
+    date, open: 4, close: 4, high: 4, low: 4, volume: 1, amount: 1,
+    amplitude: 0, changePercent: 0, change: 0, turnoverRate: 0
+  })));
+  assert.deepEqual(
+    db.getRecentTradeDates(2),
+    ['2026-11-18', '2026-11-19']
+  );
+  assert.deepEqual(
+    db.getRecentTradeDates(3, '2026-11-18'),
+    ['2026-11-17', '2026-11-18']
+  );
+  db.close();
+});

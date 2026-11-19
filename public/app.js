@@ -9,6 +9,9 @@ const state = {
   sortDirection: 'desc',
   loading: false,
   detailCode: null,
+  detailData: null,
+  shareRange: 250,
+  shareChart: null,
   charts: []
 };
 
@@ -406,6 +409,8 @@ function renderLogs() {
 
 async function openDetail(code) {
   state.detailCode = code;
+  state.detailData = null;
+  state.shareRange = 250;
   const row = state.rows.find((item) => item.code === code);
   elements.drawerCategory.textContent = `${code} · ${row?.category || 'ETF'}`;
   elements.drawerTitle.textContent = row?.name || code;
@@ -427,6 +432,7 @@ async function openDetail(code) {
 
 function renderDetail(detail, intraday) {
   const row = detail.quote;
+  state.detailData = detail;
   elements.drawerBody.replaceChildren();
   const metrics = createElement('div', 'detail-metrics');
   const items = [
@@ -448,6 +454,9 @@ function renderDetail(detail, intraday) {
     ['份额变化', row.shareDelta === null ? '待积累' : formatter.signedShares(row.shareDelta), directionClass(row.shareDelta)],
     ['估算净申赎', row.estimatedSubscription === null ? '--' : formatter.signedAmount(row.estimatedSubscription), directionClass(row.estimatedSubscription)],
     ['成交额分位', formatter.plainPercent(row.amountPercentile === null ? null : row.amountPercentile * 100, 1), ''],
+    ['连续净申赎', row.shareStreak?.days ? `${row.shareStreak.label} ${row.shareStreak.days}日` : '无连续序列', directionClass(row.shareStreak?.direction === 'subscription' ? 1 : row.shareStreak?.direction === 'redemption' ? -1 : 0)],
+    ['250日份额分位', formatter.plainPercent(row.sharePercentile === null ? null : row.sharePercentile * 100, 1), ''],
+    ['官方份额截至', row.officialShareDate ? `${row.officialShareDate} · ${row.officialShareSource}` : '暂无官方记录', 'neutral'],
     ['折溢价', '暂无', 'neutral'],
     ['尾盘成交占比', formatter.plainPercent(intraday.tailVolumeShare === null ? null : intraday.tailVolumeShare * 100), '']
   ];
@@ -459,7 +468,7 @@ function renderDetail(detail, intraday) {
   elements.drawerBody.append(metrics);
 
   const disclaimer = createElement('div', 'detail-note');
-  disclaimer.textContent = '份额变化优先使用交易所上一交易日官方份额。若交易所回填暂时失败，才退回到网站自身快照。二级市场买入不增加总份额，候选信号不代表已确认的国家队成交。当前公开行情接口未提供可靠的 IOPV，因此折溢价显示“暂无”。';
+  disclaimer.textContent = '历史曲线只使用上交所、深交所官方份额，不使用模拟值补齐缺失日期。当前份额仍优先使用官方记录，交易所尚未返回当日数据时才显示行情快照。二级市场买入不增加总份额，候选信号不代表已确认的国家队成交；公开行情接口未提供可靠 IOPV，因此折溢价显示“暂无”。';
   elements.drawerBody.append(disclaimer);
 
   const signalNote = createElement('section', 'signal-note');
@@ -487,11 +496,55 @@ function renderDetail(detail, intraday) {
   signalNote.append(signalList);
   elements.drawerBody.append(signalNote);
 
-  const sourceLink = createElement('a', 'source-link', '在东方财富查看原始行情 ↗');
+  const sourceLinks = createElement('div', 'source-links');
+  const sourceLink = createElement('a', 'source-link', '东方财富原始行情 ↗');
   sourceLink.href = `https://quote.eastmoney.com/${row.code}.html`;
   sourceLink.target = '_blank';
   sourceLink.rel = 'noopener noreferrer';
-  elements.drawerBody.append(sourceLink);
+  sourceLinks.append(sourceLink);
+  if (detail.shareHistory?.sourceUrl) {
+    const officialLink = createElement(
+      'a',
+      'source-link',
+      `${detail.shareHistory.sourceName}官方份额 ↗`
+    );
+    officialLink.href = detail.shareHistory.sourceUrl;
+    officialLink.target = '_blank';
+    officialLink.rel = 'noopener noreferrer';
+    sourceLinks.append(officialLink);
+  }
+  elements.drawerBody.append(sourceLinks);
+
+  const shareCard = createElement('section', 'chart-card share-chart-card');
+  const shareHeading = createElement('div', 'chart-card-heading');
+  shareHeading.append(createElement('h3', '', '官方份额与累计净申赎'));
+  const rangeTabs = createElement('div', 'range-tabs');
+  rangeTabs.setAttribute('role', 'tablist');
+  rangeTabs.setAttribute('aria-label', '份额历史视角');
+  for (const days of [20, 60, 250]) {
+    const button = createElement(
+      'button',
+      `range-tab ${state.shareRange === days ? 'active' : ''}`,
+      `${days}日`
+    );
+    button.type = 'button';
+    button.dataset.range = String(days);
+    button.setAttribute('role', 'tab');
+    button.setAttribute('aria-selected', String(state.shareRange === days));
+    button.addEventListener('click', () => selectShareRange(days));
+    rangeTabs.append(button);
+  }
+  shareHeading.append(rangeTabs);
+  const rangeSummary = createElement('div', 'share-range-summary');
+  rangeSummary.id = 'shareRangeSummary';
+  const shareChart = createElement('div', 'chart chart-tall');
+  shareChart.id = 'shareHistoryChart';
+  const coverageNote = createElement('div', 'share-coverage-note');
+  coverageNote.id = 'shareCoverageNote';
+  const shareExport = createElement('a', 'button button-quiet share-export', '导出官方份额 CSV');
+  shareExport.href = `/api/export.csv?code=${row.code}&type=shares`;
+  shareCard.append(shareHeading, rangeSummary, shareChart, coverageNote, shareExport);
+  elements.drawerBody.append(shareCard);
 
   const intradayCard = createElement('section', 'chart-card');
   intradayCard.append(createElement('h3', '', '当日分时'));
@@ -510,12 +563,205 @@ function renderDetail(detail, intraday) {
   requestAnimationFrame(() => {
     if (!window.echarts) return;
     state.charts.forEach((instance) => instance.dispose());
+    const shareInstance = echarts.init(shareChart);
     const intradayInstance = echarts.init(intradayChart);
     const dailyInstance = echarts.init(dailyChart);
+    state.shareChart = shareInstance;
+    renderShareRange();
     intradayInstance.setOption(buildIntradayOption(intraday));
     dailyInstance.setOption(buildDailyOption(detail.bars || []));
-    state.charts = [intradayInstance, dailyInstance];
+    state.charts = [shareInstance, intradayInstance, dailyInstance];
   });
+}
+
+function selectShareRange(days) {
+  state.shareRange = days;
+  document.querySelectorAll('.range-tab').forEach((button) => {
+    const active = Number(button.dataset.range) === days;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-selected', String(active));
+  });
+  renderShareRange();
+}
+
+function renderShareRange() {
+  const history = state.detailData?.shareHistory;
+  const summary = document.querySelector('#shareRangeSummary');
+  const note = document.querySelector('#shareCoverageNote');
+  if (!summary || !note) return;
+  summary.replaceChildren();
+  if (!history) {
+    summary.append(createElement('div', 'share-empty', '官方份额历史暂不可用'));
+    note.textContent = '尚未取得官方份额记录，不以模拟数据补齐。';
+    state.shareChart?.clear();
+    return;
+  }
+  const range = history.ranges?.[state.shareRange] || history.range;
+  if (!range) {
+    summary.append(createElement('div', 'share-empty', '该视角暂无可用数据'));
+    note.textContent = '官方接口暂未返回该区间记录。';
+    state.shareChart?.clear();
+    return;
+  }
+  const items = [
+    ['区间累计净申赎', range.periodEstimatedSubscription === null
+      ? '--'
+      : formatter.signedAmount(range.periodEstimatedSubscription),
+    directionClass(range.periodEstimatedSubscription)],
+    ['区间份额变化', range.periodShareDelta === null
+      ? '--'
+      : formatter.signedShares(range.periodShareDelta),
+    directionClass(range.periodShareDelta)],
+    ['期末份额分位', formatter.plainPercent(
+      range.sharePercentile === null ? null : range.sharePercentile * 100,
+      1
+    ), ''],
+    ['官方可取得', `${range.coverage?.availableDays ?? 0} / ${state.shareRange} 日`, 'neutral']
+  ];
+  for (const [label, value, className] of items) {
+    const card = createElement('div', 'share-range-stat');
+    card.append(createElement('span', '', label), createElement('strong', className, value));
+    summary.append(card);
+  }
+  const coverage = range.coverage;
+  const statusText = coverage?.status === 'complete'
+    ? '窗口完整'
+    : coverage?.status === 'partial'
+      ? `缺少 ${coverage.missingDays} 个交易日`
+      : '暂无官方记录';
+  const missingText = coverage?.missingRecentDates?.length
+    ? `；近期缺口 ${coverage.missingRecentDates.join('、')}`
+    : '';
+  note.textContent = `${statusText}${missingText}。数据来源：${history.sourceName || '交易所'}官方接口；${history.note}`;
+  state.shareChart?.setOption(buildShareOption(range, history), true);
+}
+
+function buildShareOption(range, history) {
+  const points = range.points || [];
+  const dates = points.map((point) => point.tradeDate);
+  const shares = points.map((point) => (
+    Number.isFinite(point.shares) ? point.shares / 1e8 : null
+  ));
+  const cumulative = points.map((point) => (
+    Number.isFinite(point.cumulativeEstimatedSubscription)
+      ? point.cumulativeEstimatedSubscription / 1e8
+      : null
+  ));
+  return {
+    animation: false,
+    backgroundColor: 'transparent',
+    aria: { enabled: true },
+    color: ['#4d8dff', '#f0b857'],
+    legend: {
+      top: 0,
+      left: 'center',
+      textStyle: { color: '#8493a7', fontSize: 11 },
+      data: ['官方总份额', '累计估算净申赎']
+    },
+    tooltip: {
+      trigger: 'axis',
+      backgroundColor: '#111824',
+      borderColor: '#29364c',
+      textStyle: { color: '#dce8f8' },
+      formatter: (items) => {
+        const index = items[0]?.dataIndex ?? 0;
+        const point = points[index];
+        if (!point) return '';
+        return [
+          point.tradeDate,
+          `官方总份额：${formatter.shares(point.shares)}`,
+          `当日份额变化：${point.shareDelta === null ? '--' : formatter.signedShares(point.shareDelta)}`,
+          `当日估算净申赎：${point.estimatedSubscription === null ? '--' : formatter.signedAmount(point.estimatedSubscription)}`,
+          `累计估算净申赎：${point.cumulativeEstimatedSubscription === null ? '--' : formatter.signedAmount(point.cumulativeEstimatedSubscription)}`,
+          `来源：${point.source || history.sourceName}`
+        ].join('<br>');
+      }
+    },
+    axisPointer: { link: [{ xAxisIndex: 'all' }] },
+    grid: { left: 56, right: 58, top: 42, bottom: 54 },
+    xAxis: {
+      type: 'category',
+      data: dates,
+      boundaryGap: false,
+      axisLine: { lineStyle: { color: '#263246' } },
+      axisLabel: {
+        color: '#66768a',
+        hideOverlap: true,
+        formatter: (value) => value.slice(5)
+      },
+      axisTick: { show: false }
+    },
+    yAxis: [
+      {
+        type: 'value',
+        name: '总份额（亿份）',
+        scale: true,
+        nameTextStyle: { color: '#66768a', fontSize: 10 },
+        splitLine: { lineStyle: { color: 'rgba(150,170,195,0.08)' } },
+        axisLabel: {
+          color: '#66768a',
+          formatter: (value) => value.toFixed(value >= 10 ? 0 : 1)
+        }
+      },
+      {
+        type: 'value',
+        name: '累计净申赎（亿元）',
+        scale: true,
+        nameTextStyle: { color: '#66768a', fontSize: 10 },
+        splitLine: { show: false },
+        axisLabel: {
+          color: '#66768a',
+          formatter: (value) => value.toFixed(Math.abs(value) >= 10 ? 0 : 1)
+        }
+      }
+    ],
+    dataZoom: [{
+      type: 'inside',
+      xAxisIndex: [0],
+      start: 0,
+      end: 100
+    }],
+    series: [
+      {
+        name: '官方总份额',
+        type: 'line',
+        data: shares,
+        showSymbol: points.length <= 60,
+        symbolSize: 4,
+        connectNulls: false,
+        lineStyle: { color: '#4d8dff', width: 2 },
+        itemStyle: { color: '#4d8dff' },
+        areaStyle: {
+          color: {
+            type: 'linear',
+            x: 0, y: 0, x2: 0, y2: 1,
+            colorStops: [
+              { offset: 0, color: 'rgba(77,141,255,0.20)' },
+              { offset: 1, color: 'rgba(77,141,255,0.01)' }
+            ]
+          }
+        }
+      },
+      {
+        name: '累计估算净申赎',
+        type: 'line',
+        yAxisIndex: 1,
+        data: cumulative,
+        showSymbol: points.length <= 60,
+        symbolSize: 4,
+        connectNulls: false,
+        lineStyle: { color: '#f0b857', width: 2 },
+        itemStyle: { color: '#f0b857' },
+        markLine: {
+          silent: true,
+          symbol: 'none',
+          label: { show: false },
+          lineStyle: { color: 'rgba(240,184,87,0.22)', type: 'dashed', width: 1 },
+          data: [{ yAxis: 0 }]
+        }
+      }
+    ]
+  };
 }
 
 function signalCondition(key, row) {
@@ -679,6 +925,8 @@ function buildDailyOption(bars) {
 
 function closeDrawer() {
   state.detailCode = null;
+  state.detailData = null;
+  state.shareChart = null;
   state.charts.forEach((instance) => instance.dispose());
   state.charts = [];
   elements.drawer.classList.remove('is-open');

@@ -816,9 +816,16 @@ td {
 
 .source-link {
   display: inline-flex;
-  margin: 0 0 14px;
+  margin: 0;
   color: #7fb0ff;
   font-size: 11px;
+}
+
+.source-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  margin-bottom: 14px;
 }
 
 .source-link:hover {
@@ -864,6 +871,110 @@ td {
 .chart-card h3 {
   margin-bottom: 10px;
   font-size: 14px;
+}
+
+.chart-card-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 12px;
+}
+
+.chart-card-heading h3 {
+  margin-bottom: 0;
+}
+
+.range-tabs {
+  display: inline-flex;
+  gap: 4px;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: rgba(7, 11, 18, 0.66);
+}
+
+.range-tab {
+  min-width: 48px;
+  padding: 5px 9px;
+  color: var(--muted);
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  cursor: pointer;
+  font-size: 11px;
+  transition: color 150ms ease, background 150ms ease;
+}
+
+.range-tab:hover {
+  color: var(--text);
+}
+
+.range-tab.active {
+  color: #e9f2ff;
+  background: rgba(77, 141, 255, 0.18);
+  box-shadow: inset 0 0 0 1px rgba(77, 141, 255, 0.2);
+}
+
+.range-tab:focus-visible,
+.range-tab:focus {
+  outline: 2px solid rgba(77, 141, 255, 0.55);
+  outline-offset: 1px;
+}
+
+.share-range-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.share-range-stat {
+  min-width: 0;
+  padding: 10px 11px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: rgba(18, 26, 39, 0.66);
+}
+
+.share-range-stat span {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--faint);
+  font-size: 10px;
+}
+
+.share-range-stat strong {
+  display: block;
+  overflow: hidden;
+  color: #dce8f8;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.share-coverage-note,
+.share-empty {
+  margin-top: 8px;
+  color: #75869b;
+  font-size: 10px;
+  line-height: 1.65;
+}
+
+.share-empty {
+  grid-column: 1 / -1;
+  padding: 18px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 9px;
+  text-align: center;
+}
+
+.share-export {
+  min-height: 32px;
+  margin-top: 10px;
+  padding: 0 11px;
+  font-size: 11px;
 }
 
 .chart {
@@ -994,6 +1105,15 @@ td {
   }
 
   .detail-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .chart-card-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .share-range-summary {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 

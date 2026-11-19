@@ -7,7 +7,9 @@ const {
   parseSseShares,
   parseWorksheetRows,
   parseSzseWorkbook,
-  extractSzseShare
+  extractSzseShare,
+  splitDateRange,
+  extractSzseShareRange
 } = require('../server/official-shares');
 
 const worksheet = `<?xml version="1.0" encoding="UTF-8"?>
@@ -53,4 +55,27 @@ test('parseSzseWorkbook extracts the requested historical share value', () => {
   const rows = parseSzseWorkbook(zip);
   assert.equal(extractSzseShare(rows, '159919', '2026-11-18'), 14191416676);
   assert.equal(extractSzseShare(rows, '159919', '2026-11-17'), null);
+});
+
+test('splitDateRange respects the official API range limit', () => {
+  assert.deepEqual(splitDateRange('2025-11-20', '2026-11-19', 90), [
+    { startDate: '2025-11-20', endDate: '2026-02-17' },
+    { startDate: '2026-02-18', endDate: '2026-05-18' },
+    { startDate: '2026-05-19', endDate: '2026-08-16' },
+    { startDate: '2026-08-17', endDate: '2026-11-14' },
+    { startDate: '2026-11-15', endDate: '2026-11-19' }
+  ]);
+});
+
+test('extractSzseShareRange filters selected ETFs and dates', () => {
+  const rows = parseWorksheetRows(worksheet);
+  assert.deepEqual(extractSzseShareRange(
+    rows,
+    ['159919'],
+    '2026-11-18',
+    '2026-11-19'
+  ), [
+    { code: '159919', tradeDate: '2026-11-19', shares: 16186716676, source: '深交所' },
+    { code: '159919', tradeDate: '2026-11-18', shares: 14191416676, source: '深交所' }
+  ]);
 });

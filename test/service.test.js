@@ -24,6 +24,23 @@ function createBars(count = 25) {
   });
 }
 
+function createConsecutiveBars(count) {
+  const start = Date.UTC(2025, 0, 2);
+  return Array.from({ length: count }, (_, index) => ({
+    date: new Date(start + index * 86400000).toISOString().slice(0, 10),
+    open: 4,
+    close: 4 + index * 0.001,
+    high: 4.1,
+    low: 3.9,
+    volume: 100,
+    amount: 100,
+    amplitude: 1,
+    changePercent: 1,
+    change: 0.01,
+    turnoverRate: 1
+  }));
+}
+
 test('summary calculates ratio, returns, shares and a broad resonance candidate', () => {
   const db = createDatabase(':memory:');
   db.upsertBars('510300', createBars());
@@ -140,5 +157,110 @@ test('official previous-day shares populate ETF share delta immediately', async 
   assert.equal(row.previousShareSource, '上交所');
   assert.equal(row.shareDelta, 200);
   assert.equal(row.estimatedSubscription, 840);
+  db.close();
+});
+
+test('official history backfill covers the 250-day analytics window and stays idempotent', async () => {
+  const db = createDatabase(':memory:');
+  const bars = createConsecutiveBars(251);
+  db.upsertBars('510300', bars);
+  const lastDate = bars.at(-1).date;
+  db.saveSnapshot({
+    code: '510300', price: 4.4, previousClose: 4.3, change: 0.1,
+    changePercent: 2, open: 4.3, high: 4.4, low: 4.2, volume: 100,
+    amount: 100, turnoverRate: 1, shares: 2000, marketValue: 4000,
+    timestamp: 1795114800
+  }, lastDate, `${lastDate}T07:00:00.000Z`);
+  const sseAttempts = [];
+  let rangeCalls = 0;
+  const service = new MarketService({
+    db,
+    sseShareProvider: async (date) => {
+      sseAttempts.push(date);
+      return new Map([['510300', 1000 + sseAttempts.length]]);
+    },
+    szseRangeProvider: async () => {
+      rangeCalls += 1;
+      return [];
+    },
+    now: () => new Date('2026-11-20T00:00:00.000Z')
+  });
+
+  const first = await service.syncOfficialShareHistory(lastDate);
+  assert.equal(first.requestedDates.length, 251);
+  assert.equal(sseAttempts.length, 251);
+  assert.equal(rangeCalls, 1);
+  assert.equal(db.countOfficialShareHistory('510300'), 251);
+  assert.equal(db.recentLogs(1)[0].status, 'success');
+
+  const second = await service.syncOfficialShareHistory(lastDate);
+  assert.equal(second.requestedDates.length, 251);
+  assert.equal(sseAttempts.length, 251);
+  assert.equal(rangeCalls, 1);
+  assert.equal(db.countOfficialShareHistory('510300'), 251);
+  db.close();
+});
+
+test('one failed exchange does not discard the other exchange share history', async () => {
+  const db = createDatabase(':memory:');
+  const bars = createConsecutiveBars(5);
+  db.upsertBars('159919', bars);
+  const lastDate = bars.at(-1).date;
+  db.saveSnapshot({
+    code: '159919', price: 4.4, previousClose: 4.3, change: 0.1,
+    changePercent: 2, open: 4.3, high: 4.4, low: 4.2, volume: 100,
+    amount: 100, turnoverRate: 1, shares: 1200, marketValue: 4000,
+    timestamp: 1795114800
+  }, lastDate, `${lastDate}T07:00:00.000Z`);
+  const service = new MarketService({
+    db,
+    sseShareProvider: async () => {
+      throw new Error('mock SSE failure');
+    },
+    szseRangeProvider: async (codes, startDate, endDate) => [{
+      code: '159919',
+      tradeDate: endDate,
+      shares: 1200,
+      source: '深交所'
+    }],
+    now: () => new Date('2026-11-20T00:00:00.000Z')
+  });
+
+  const result = await service.syncOfficialShareHistory(lastDate, { historyDays: 5 });
+  assert.equal(result.entries.length, 1);
+  assert.equal(result.failures.length, 5);
+  assert.equal(db.countOfficialShareHistory('159919'), 1);
+  assert.equal(
+    db.getCompletedOfficialShareSyncDates('SZSE', result.requestedDates).size,
+    5
+  );
+  assert.equal(db.recentLogs(1)[0].status, 'partial');
+  db.close();
+});
+
+test('share history API model exposes 20/60/250 windows and real coverage', () => {
+  const db = createDatabase(':memory:');
+  const bars = createConsecutiveBars(30);
+  db.upsertBars('510300', bars);
+  db.saveShareHistory(bars.map((bar, index) => ({
+    code: '510300',
+    tradeDate: bar.date,
+    shares: 1000 + index * 10,
+    source: '上交所'
+  })));
+  const service = new MarketService({
+    db,
+    now: () => new Date('2026-11-20T00:00:00.000Z')
+  });
+  const history = service.getShareHistory('510300', 20);
+  assert.equal(history.range.days, 20);
+  assert.equal(history.range.points.length, 20);
+  assert.equal(history.range.coverage.availableDays, 20);
+  assert.equal(history.range.coverage.status, 'complete');
+  assert.equal(history.ranges[60].coverage.availableDays, 30);
+  assert.equal(history.ranges[60].coverage.status, 'partial');
+  assert.equal(history.streak.days, 29);
+  assert.ok(Number.isFinite(history.range.periodEstimatedSubscription));
+  assert.ok(Number.isFinite(history.range.sharePercentile));
   db.close();
 });

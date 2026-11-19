@@ -8,6 +8,8 @@ const {
   volumeRatio,
   percentile,
   periodReturn,
+  calculateShareStreak,
+  calculateShareWindow,
   calculateSignals
 } = require('../server/metrics');
 
@@ -40,6 +42,67 @@ test('period return uses the last prior close', () => {
 test('period return can use a multi-day lookback', () => {
   assert.ok(Math.abs(periodReturn(120, [80, 90, 100], 3) - 0.5) < 1e-12);
   assert.equal(periodReturn(120, [80, 90], 3), null);
+});
+
+test('share streak counts consecutive subscriptions and redemptions', () => {
+  const dates = ['2026-11-17', '2026-11-18', '2026-11-19', '2026-11-20'];
+  const subscriptions = [
+    { tradeDate: dates[0], shares: 90 },
+    { tradeDate: dates[1], shares: 100 },
+    { tradeDate: dates[2], shares: 110 },
+    { tradeDate: dates[3], shares: 120 }
+  ];
+  assert.deepEqual(calculateShareStreak(subscriptions, dates), {
+    direction: 'subscription', label: '连续净申购', days: 3
+  });
+  const redemptions = [
+    { tradeDate: dates[0], shares: 120 },
+    { tradeDate: dates[1], shares: 130 },
+    { tradeDate: dates[2], shares: 120 },
+    { tradeDate: dates[3], shares: 110 }
+  ];
+  assert.deepEqual(calculateShareStreak(redemptions, dates), {
+    direction: 'redemption', label: '连续净赎回', days: 2
+  });
+  const flat = [
+    { tradeDate: dates[0], shares: 100 },
+    { tradeDate: dates[1], shares: 110 },
+    { tradeDate: dates[2], shares: 110 }
+  ];
+  assert.deepEqual(calculateShareStreak(flat, dates.slice(1)), {
+    direction: null, label: '持平', days: 0
+  });
+});
+
+test('share streak stops when an official trading date is missing', () => {
+  const dates = ['2026-11-17', '2026-11-18', '2026-11-19'];
+  const history = [
+    { tradeDate: '2026-11-17', shares: 100 },
+    { tradeDate: '2026-11-19', shares: 120 }
+  ];
+  assert.deepEqual(calculateShareStreak(history, dates), {
+    direction: null, label: '持平', days: 0
+  });
+});
+
+test('share window calculates cumulative net subscription and percentile', () => {
+  const history = [
+    { tradeDate: '2026-11-17', shares: 100, source: '上交所' },
+    { tradeDate: '2026-11-18', shares: 110, source: '上交所' },
+    { tradeDate: '2026-11-19', shares: 130, source: '上交所' }
+  ];
+  const bars = [
+    { date: '2026-11-17', close: 4 },
+    { date: '2026-11-18', close: 4 },
+    { date: '2026-11-19', close: 4 }
+  ];
+  const result = calculateShareWindow(history, bars, 2);
+  assert.equal(result.periodShareDelta, 30);
+  assert.equal(result.periodEstimatedSubscription, 120);
+  assert.equal(result.sharePercentile, 1);
+  assert.equal(result.points.at(-1).cumulativeEstimatedSubscription, 120);
+  assert.equal(result.startDate, '2026-11-18');
+  assert.equal(result.endDate, '2026-11-19');
 });
 
 test('signals flag broad resonance and composite candidate', () => {

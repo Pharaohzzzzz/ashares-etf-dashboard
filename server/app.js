@@ -69,6 +69,18 @@ function createApp({ service, publicDir = path.join(__dirname, '..', 'public') }
           : sendJson(response, 404, { error: 'ETF 不存在' });
       }
 
+      const shareHistoryMatch = url.pathname.match(/^\/api\/etfs\/(\d{6})\/share-history$/);
+      if (shareHistoryMatch && request.method === 'GET') {
+        const days = Number(url.searchParams.get('days') || 250);
+        if (![20, 60, 250].includes(days)) {
+          return sendJson(response, 400, { error: '历史视角仅支持 20、60 或 250 日' });
+        }
+        const shareHistory = service.getShareHistory(shareHistoryMatch[1], days);
+        return shareHistory
+          ? sendJson(response, 200, shareHistory)
+          : sendJson(response, 404, { error: 'ETF 不存在' });
+      }
+
       const detailMatch = url.pathname.match(/^\/api\/etfs\/(\d{6})$/);
       if (detailMatch && request.method === 'GET') {
         const detail = service.getDetail(detailMatch[1]);
@@ -84,18 +96,33 @@ function createApp({ service, publicDir = path.join(__dirname, '..', 'public') }
         if (code && /^\d{6}$/.test(code)) {
           const detail = service.getDetail(code);
           if (!detail) return sendJson(response, 404, { error: 'ETF 不存在' });
-          csv = toCsv([
-            { key: 'date', label: '日期' },
-            { key: 'open', label: '开盘' },
-            { key: 'close', label: '收盘' },
-            { key: 'high', label: '最高' },
-            { key: 'low', label: '最低' },
-            { key: 'volume', label: '成交量' },
-            { key: 'amount', label: '成交额' },
-            { key: 'changePercent', label: '涨跌幅' },
-            { key: 'turnoverRate', label: '换手率' }
-          ], detail.bars);
-          filename = `${code}-daily.csv`;
+          if (url.searchParams.get('type') === 'shares') {
+            const shareHistory = service.getShareHistory(code, 250);
+            csv = toCsv([
+              { key: 'tradeDate', label: '日期' },
+              { key: 'shares', label: '官方总份额' },
+              { key: 'shareDelta', label: '份额变化' },
+              { key: 'close', label: '收盘价' },
+              { key: 'estimatedSubscription', label: '估算净申赎' },
+              { key: 'cumulativeShareDelta', label: '累计份额变化' },
+              { key: 'cumulativeEstimatedSubscription', label: '累计估算净申赎' },
+              { key: 'source', label: '来源' }
+            ], shareHistory?.range?.points || []);
+            filename = `${code}-official-shares.csv`;
+          } else {
+            csv = toCsv([
+              { key: 'date', label: '日期' },
+              { key: 'open', label: '开盘' },
+              { key: 'close', label: '收盘' },
+              { key: 'high', label: '最高' },
+              { key: 'low', label: '最低' },
+              { key: 'volume', label: '成交量' },
+              { key: 'amount', label: '成交额' },
+              { key: 'changePercent', label: '涨跌幅' },
+              { key: 'turnoverRate', label: '换手率' }
+            ], detail.bars);
+            filename = `${code}-daily.csv`;
+          }
         } else {
           const summary = service.getSummary();
           const headers = [
@@ -110,11 +137,19 @@ function createApp({ service, publicDir = path.join(__dirname, '..', 'public') }
             { key: 'shares', label: '份额' },
             { key: 'shareDelta', label: '份额变化' },
             { key: 'estimatedSubscription', label: '估算净申赎' },
+            { key: 'shareStreak', label: '连续净申赎' },
+            { key: 'sharePercentile', label: '份额历史分位' },
             { key: 'tradeDate', label: '交易日' },
             { key: 'signals', label: '候选信号' }
           ];
           csv = toCsv(headers, summary.etfs.map((row) => ({
             ...row,
+            shareStreak: row.shareStreak?.days
+              ? `${row.shareStreak.label} ${row.shareStreak.days}日`
+              : '无连续序列',
+            sharePercentile: Number.isFinite(row.sharePercentile)
+              ? `${(row.sharePercentile * 100).toFixed(1)}%`
+              : '数据不足',
             signals: row.signals.map((signal) => signal.label).join('、')
           })));
           filename = 'etf-summary.csv';
