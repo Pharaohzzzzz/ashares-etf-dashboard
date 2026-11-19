@@ -650,6 +650,24 @@ td {
   background: rgba(255, 104, 116, 0.08);
 }
 
+.sort-button {
+  width: 100%;
+  padding: 0;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  letter-spacing: inherit;
+  text-align: inherit;
+  cursor: pointer;
+}
+
+.sort-button:focus-visible {
+  outline: 2px solid #4d8dff;
+  outline-offset: 4px;
+  border-radius: 4px;
+}
+
 .rolling-grid {
   margin-top: 18px;
 }

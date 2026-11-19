@@ -29,7 +29,8 @@ const state = {
   },
   backtestHeatmap: null,
   signalDetailChart: null,
-  signalDetailHorizon: 5
+  signalDetailHorizon: 5,
+  drawerTrigger: null
 };
 
 const elements = {
@@ -96,6 +97,9 @@ const elements = {
   backtestMethodology: document.querySelector('#backtestMethodology'),
   backtestEtfStatus: document.querySelector('#backtestEtfStatus')
 };
+
+const pageMain = document.querySelector('main');
+const pageHeader = document.querySelector('.site-header');
 
 const toneColors = {
   broad: '#4d8dff',
@@ -299,6 +303,7 @@ function renderSignalBoard() {
   for (const row of candidates) {
     const card = createElement('article', 'signal-card');
     card.tabIndex = 0;
+    card.dataset.etfCode = row.code;
     card.setAttribute('role', 'button');
     card.setAttribute('aria-label', `查看 ${row.name} 详情`);
     const top = createElement('div', 'signal-card-top');
@@ -331,7 +336,10 @@ function renderSignalBoard() {
     card.append(top, value, tags);
     card.addEventListener('click', () => openDetail(row.code));
     card.addEventListener('keydown', (event) => {
-      if (event.key === 'Enter' || event.key === ' ') openDetail(row.code);
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        openDetail(row.code);
+      }
     });
     elements.signalBoard.append(card);
   }
@@ -377,6 +385,13 @@ function visibleRows() {
 
 function renderTable() {
   const rows = visibleRows();
+  document.querySelectorAll('th[data-sort]').forEach((header) => {
+    const active = header.dataset.sort === state.sortKey;
+    header.setAttribute(
+      'aria-sort',
+      active ? (state.sortDirection === 'asc' ? 'ascending' : 'descending') : 'none'
+    );
+  });
   elements.resultCount.textContent = `${rows.length} / ${state.rows.length} 只 ETF`;
   elements.etfRows.replaceChildren();
   if (!rows.length) {
@@ -390,6 +405,8 @@ function renderTable() {
   for (const row of rows) {
     const tr = document.createElement('tr');
     tr.tabIndex = 0;
+    tr.dataset.etfCode = row.code;
+    tr.setAttribute('role', 'button');
     tr.classList.toggle('is-candidate', row.scoreSignal);
     tr.classList.toggle('is-stale', row.isStale);
     if (row.isStale) tr.title = row.staleness || '行情数据已过期';
@@ -421,7 +438,10 @@ function renderTable() {
     tr.append(createSignalCell(row));
     tr.addEventListener('click', () => openDetail(row.code));
     tr.addEventListener('keydown', (event) => {
-      if (event.key === 'Enter' || event.key === ' ') openDetail(row.code);
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        openDetail(row.code);
+      }
     });
     elements.etfRows.append(tr);
   }
@@ -528,6 +548,7 @@ function renderLogs() {
 }
 
 async function openDetail(code) {
+  rememberDrawerTrigger(`[data-etf-code="${code}"]`);
   state.detailCode = code;
   state.detailData = null;
   state.shareRange = 250;
@@ -539,6 +560,9 @@ async function openDetail(code) {
   elements.drawer.classList.add('is-open');
   elements.drawer.setAttribute('aria-hidden', 'false');
   document.body.style.overflow = 'hidden';
+  if (pageMain) pageMain.inert = true;
+  if (pageHeader) pageHeader.inert = true;
+  elements.drawerClose.focus();
   try {
     const [detail, intraday] = await Promise.all([
       fetchJson(`/api/etfs/${code}`),
@@ -1805,6 +1829,7 @@ function renderSignalTimeline(events, horizon) {
     const outcome = event.outcomes?.[horizon];
     const row = createElement('div', 'event-row');
     row.tabIndex = 0;
+    row.dataset.eventId = String(event.id);
     row.setAttribute('role', 'button');
     row.setAttribute('aria-label', `查看 ${event.name} ${event.date} 信号解释`);
     const etf = createElement('div', 'event-etf');
@@ -1880,6 +1905,7 @@ async function openSignalEvaluation({ code, date }) {
 }
 
 async function openSignalEvent(id) {
+  rememberDrawerTrigger(`[data-event-id="${id}"]`);
   elements.drawerCategory.textContent = 'SIGNAL EVENT';
   elements.drawerTitle.textContent = '加载信号解释';
   elements.drawerBody.replaceChildren(createElement('div', 'table-loading', '正在加载信号贡献与未来路径...'));
@@ -1887,6 +1913,9 @@ async function openSignalEvent(id) {
   elements.drawer.classList.add('is-open');
   elements.drawer.setAttribute('aria-hidden', 'false');
   document.body.style.overflow = 'hidden';
+  if (pageMain) pageMain.inert = true;
+  if (pageHeader) pageHeader.inert = true;
+  elements.drawerClose.focus();
   try {
     const detail = await fetchJson(`/api/backtests/events/${id}`);
     renderSignalEventDetail(detail);
@@ -2228,6 +2257,46 @@ function closeDrawer() {
   elements.drawer.setAttribute('aria-hidden', 'true');
   elements.drawerBackdrop.hidden = true;
   document.body.style.overflow = '';
+  if (pageMain) pageMain.inert = false;
+  if (pageHeader) pageHeader.inert = false;
+  const trigger = state.drawerTrigger;
+  state.drawerTrigger = null;
+  const target = trigger?.element?.isConnected
+    ? trigger.element
+    : trigger?.selector
+      ? document.querySelector(trigger.selector)
+      : null;
+  target?.focus();
+}
+
+function rememberDrawerTrigger(selector) {
+  state.drawerTrigger = {
+    element: document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null,
+    selector
+  };
+}
+
+function trapDrawerFocus(event) {
+  if (event.key !== 'Tab' || !elements.drawer.classList.contains('is-open')) return;
+  const focusable = [...elements.drawer.querySelectorAll(
+    'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+  )].filter((element) => !element.hidden && element.getClientRects().length > 0);
+  if (!focusable.length) {
+    event.preventDefault();
+    elements.drawer.focus();
+    return;
+  }
+  const first = focusable[0];
+  const last = focusable.at(-1);
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
 }
 
 window.addEventListener('resize', () => {
@@ -2257,10 +2326,16 @@ function bindEvents() {
   elements.drawerClose.addEventListener('click', closeDrawer);
   elements.drawerBackdrop.addEventListener('click', closeDrawer);
   document.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape') closeDrawer();
+    if (event.key === 'Escape' && elements.drawer.classList.contains('is-open')) {
+      event.preventDefault();
+      closeDrawer();
+    } else {
+      trapDrawerFocus(event);
+    }
   });
   document.querySelectorAll('th[data-sort]').forEach((header) => {
-    header.addEventListener('click', () => {
+    const button = header.querySelector('.sort-button');
+    button.addEventListener('click', () => {
       const key = header.dataset.sort;
       if (state.sortKey === key) {
         state.sortDirection = state.sortDirection === 'desc' ? 'asc' : 'desc';
