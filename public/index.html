@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#080b11">
+  <title>ETF资金雷达</title>
+  <link rel="stylesheet" href="/styles.css?v=20261120-5">
+  <script src="/vendor/echarts.min.js?v=6.1.0" defer></script>
+  <script src="/app.js?v=20261120-5" defer></script>
+</head>
+<body>
+  <div class="ambient ambient-a"></div>
+  <div class="ambient ambient-b"></div>
+
+  <header class="site-header">
+    <div class="brand-block">
+      <div class="brand-mark" aria-hidden="true">
+        <span></span><span></span><span></span>
+      </div>
+      <div>
+        <p class="eyebrow">A-SHARE ETF MONITOR</p>
+        <h1>ETF 资金雷达</h1>
+      </div>
+    </div>
+    <div class="header-actions">
+      <div id="marketStatus" class="status-pill status-loading">
+        <span class="status-dot"></span>
+        <span id="marketStatusText">连接数据源</span>
+      </div>
+      <button id="refreshButton" class="button button-primary" type="button">
+        <span class="button-icon" aria-hidden="true">↻</span>
+        刷新数据
+      </button>
+    </div>
+  </header>
+
+  <main class="page-shell">
+    <section class="hero-row">
+      <div>
+        <p class="eyebrow">14 只重点 ETF · 公开行情监测</p>
+        <h2>观察资金痕迹，不猜测账户身份</h2>
+        <p class="hero-copy">把成交放量、份额变化与宽基共振放在同一张图里。信号用于发现异常，不代表已确认的“国家队”成交。</p>
+      </div>
+      <div class="time-card">
+        <span>最近行情</span>
+        <strong id="dataTime">等待数据</strong>
+        <small id="generatedTime">尚未刷新</small>
+      </div>
+    </section>
+
+    <div id="errorBanner" class="error-banner" role="alert" hidden></div>
+
+    <section class="summary-grid" aria-label="市场摘要">
+      <article class="summary-card accent-blue">
+        <div class="summary-label">监测池成交额</div>
+        <strong id="totalAmount">--</strong>
+        <span class="summary-foot">14 只 ETF 合计</span>
+      </article>
+      <article class="summary-card accent-red">
+        <div class="summary-label">20日显著放量</div>
+        <strong id="volumeUpCount">--</strong>
+        <span class="summary-foot">成交额达到均值 2 倍</span>
+      </article>
+      <article class="summary-card accent-amber">
+        <div class="summary-label">份额增加</div>
+        <strong id="shareUpCount">--</strong>
+        <span class="summary-foot">相对上一已记录交易日</span>
+      </article>
+      <article class="summary-card accent-cyan">
+        <div class="summary-label">护盘候选</div>
+        <strong id="compositeCount">--</strong>
+        <span class="summary-foot" id="resonanceHint">等待宽基信号</span>
+      </article>
+    </section>
+
+    <section class="signal-panel">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">SIGNAL BOARD</p>
+          <h3>今日异动线索</h3>
+        </div>
+        <span class="muted-note">按信号强度排序</span>
+      </div>
+      <div id="signalBoard" class="signal-board">
+        <div class="skeleton-card"></div>
+        <div class="skeleton-card"></div>
+        <div class="skeleton-card"></div>
+      </div>
+    </section>
+
+    <section class="table-panel">
+      <div class="section-heading table-heading">
+        <div>
+          <p class="eyebrow">MARKET MATRIX</p>
+          <h3>ETF 全景表</h3>
+        </div>
+        <div class="table-actions">
+          <label class="search-box">
+            <span aria-hidden="true">⌕</span>
+            <input id="searchInput" type="search" placeholder="搜索代码或名称" autocomplete="off">
+          </label>
+          <a class="button button-quiet" href="/api/export.csv">导出 CSV</a>
+        </div>
+      </div>
+
+      <div class="toolbar">
+        <div id="categoryTabs" class="category-tabs" role="tablist" aria-label="ETF分类"></div>
+        <div id="resultCount" class="result-count">正在加载</div>
+      </div>
+
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th class="sticky-col">ETF</th>
+              <th data-sort="price">最新价</th>
+              <th data-sort="changePercent">涨跌幅</th>
+              <th data-sort="amount">成交额</th>
+              <th data-sort="volumeRatio">20日量比</th>
+              <th data-sort="return5d">近5日</th>
+              <th data-sort="return20d">近20日</th>
+              <th data-sort="shareDelta">份额变化</th>
+              <th data-sort="estimatedSubscription">估算净申赎</th>
+              <th>候选信号</th>
+            </tr>
+          </thead>
+          <tbody id="etfRows">
+            <tr><td colspan="10"><div class="table-loading">正在读取 14 只 ETF 的行情与历史数据...</div></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="footer-grid">
+      <article class="info-panel">
+        <p class="eyebrow">METHODOLOGY</p>
+        <h3>数据口径</h3>
+        <p>20日量比使用当前成交额与前 20 个完整交易日成交额均值计算。ETF 二级市场买入不改变基金总份额，因此份额变化只能作为一级市场净申赎代理，不能识别交易账户。</p>
+        <p>“护盘候选”提示交投异常与宽基共振，不构成国家队身份确认或投资建议。</p>
+      </article>
+      <article class="info-panel">
+        <p class="eyebrow">UPDATE LOG</p>
+        <h3>运行记录</h3>
+        <div id="updateLogs" class="update-logs">
+          <div class="log-line">等待首次更新</div>
+        </div>
+      </article>
+    </section>
+  </main>
+
+  <div id="drawerBackdrop" class="drawer-backdrop" hidden></div>
+  <aside id="detailDrawer" class="detail-drawer" aria-hidden="true" aria-labelledby="drawerTitle">
+    <div class="drawer-head">
+      <div>
+        <p id="drawerCategory" class="eyebrow">ETF DETAIL</p>
+        <h2 id="drawerTitle">ETF 详情</h2>
+      </div>
+      <button id="drawerClose" class="icon-button" type="button" aria-label="关闭详情">×</button>
+    </div>
+    <div id="drawerBody" class="drawer-body">
+      <div class="table-loading">选择一只 ETF 查看详情</div>
+    </div>
+  </aside>
+
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>
+

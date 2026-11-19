@@ -130,7 +130,8 @@ function createApp({ service, publicDir = path.join(__dirname, '..', 'public') }
       if (url.pathname === '/vendor/echarts.min.js') {
         return serveFile(
           response,
-          path.join(__dirname, '..', 'node_modules', 'echarts', 'dist', 'echarts.min.js')
+          path.join(__dirname, '..', 'node_modules', 'echarts', 'dist', 'echarts.min.js'),
+          'public, max-age=3600'
         );
       }
 
@@ -151,7 +152,7 @@ function createApp({ service, publicDir = path.join(__dirname, '..', 'public') }
   return server;
 }
 
-function serveFile(response, filePath) {
+function serveFile(response, filePath, cacheControl = 'no-cache') {
   if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
     return sendJson(response, 404, { error: '文件不存在' });
   }
@@ -159,7 +160,7 @@ function serveFile(response, filePath) {
   response.writeHead(200, {
     'Content-Type': CONTENT_TYPES[path.extname(filePath)] || 'application/octet-stream',
     'Content-Length': stat.size,
-    'Cache-Control': path.extname(filePath) === '.html' ? 'no-cache' : 'public, max-age=3600',
+    'Cache-Control': cacheControl,
     'X-Content-Type-Options': 'nosniff'
   });
   fs.createReadStream(filePath).pipe(response);

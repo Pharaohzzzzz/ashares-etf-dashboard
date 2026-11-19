@@ -51,3 +51,15 @@ test('summary, health, detail and CSV APIs respond', async (context) => {
   assert.match(csv, /代码/);
   assert.match(csv, /510300/);
 });
+
+test('local application assets are served without stale caching', async (context) => {
+  const server = createApp({ service });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  context.after(() => server.close());
+  const base = `http://127.0.0.1:${server.address().port}`;
+  for (const path of ['/', '/app.js', '/styles.css']) {
+    const response = await fetch(`${base}${path}`);
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get('cache-control'), /no-cache/);
+  }
+});
