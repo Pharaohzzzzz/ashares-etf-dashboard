@@ -7,6 +7,11 @@ const { createApp } = require('../server/app');
 const summary = {
   generatedAt: '2026-11-20T08:00:00.000Z',
   dataTime: '2026-11-19T07:00:00.000Z',
+  oldestDataTime: '2026-11-19T07:00:00.000Z',
+  latestDataTime: '2026-11-19T07:00:00.000Z',
+  quoteStatus: 'ok',
+  quoteStatusLabel: '行情已连接',
+  staleCount: 0,
   totalAmount: 100,
   volumeUpCount: 1,
   shareUpCount: 0,
@@ -15,6 +20,14 @@ const summary = {
   etfs: [{
     code: '510300', name: '沪深300ETF华泰柏瑞', category: '宽基核心',
     price: 4.06, changePercent: 0.05, amount: 100, turnoverRate: 5.62,
+    capturedAt: '2026-11-19T07:00:05.000Z',
+    dataTime: '2026-11-19T07:00:00.000Z',
+    quoteStatus: 'fresh',
+    quoteStatusLabel: '行情已连接',
+    isStale: false,
+    officialShareDate: '2026-11-19',
+    officialShareSource: '上交所',
+    officialShareFetchedAt: '2026-11-20T00:00:00.000Z',
     volumeRatio: 2.1, shares: 1000, shareDelta: null,
     estimatedSubscription: null, tradeDate: '2026-11-19',
     shareStreak: { direction: 'subscription', label: '连续净申购', days: 3 },
@@ -42,7 +55,8 @@ const service = {
         points: [{
           tradeDate: '2026-11-19', shares: 1000, shareDelta: 10,
           estimatedSubscription: 40, cumulativeEstimatedSubscription: 40,
-          source: '上交所'
+          source: '上交所', fetchedAt: '2026-11-20T00:00:00.000Z',
+          officialFetchedAt: '2026-11-20T00:00:00.000Z'
         }]
       },
       ranges: {}
@@ -177,15 +191,21 @@ test('summary, health, detail and CSV APIs respond', async (context) => {
   const invalidIopvHistory = await fetch(`${base}/api/etfs/510300/iopv-history?days=0`);
   assert.equal(invalidIopvHistory.status, 400);
   const missing = await fetch(`${base}/api/etfs/000000`);
-  assert.equal(missing.status, 404);
+  assert.equal(missing.status, 400);
+  assert.equal((await missing.json()).error.code, 'INVALID_CODE');
   const csv = await fetch(`${base}/api/export.csv`).then((response) => response.text());
   assert.match(csv, /代码/);
   assert.match(csv, /510300/);
   assert.match(csv, /连续净申赎/);
+  assert.match(csv, /行情状态/);
+  assert.match(csv, /官方份额抓取时间/);
   const shareCsv = await fetch(`${base}/api/export.csv?code=510300&type=shares`)
     .then((response) => response.text());
   assert.match(shareCsv, /官方总份额/);
   assert.match(shareCsv, /2026-11-19/);
+  assert.match(shareCsv, /行情时间/);
+  assert.match(shareCsv, /官方份额来源/);
+  assert.match(shareCsv, /官方份额抓取时间/);
   const iopvCsv = await fetch(`${base}/api/export.csv?code=510300&type=iopv`)
     .then((response) => response.text());
   assert.match(iopvCsv, /折溢价率/);
@@ -199,11 +219,24 @@ test('summary, health, detail and CSV APIs respond', async (context) => {
   assert.equal(backtestEvents.events[0].score, 72.5);
   const invalidHorizon = await fetch(`${base}/api/backtests/events?horizon=2`);
   assert.equal(invalidHorizon.status, 400);
+  assert.equal((await invalidHorizon.json()).error.code, 'INVALID_HORIZON');
+  for (const [query, code] of [
+    ['?code=not-a-code', 'INVALID_CODE'],
+    ['?category=不存在', 'INVALID_CATEGORY'],
+    ['?level=unknown', 'INVALID_LEVEL'],
+    ['?from=2026-02-30', 'INVALID_DATE'],
+    ['?split=holdout', 'INVALID_SPLIT']
+  ]) {
+    const invalid = await fetch(`${base}/api/backtests/events${query}`);
+    assert.equal(invalid.status, 400);
+    assert.equal((await invalid.json()).error.code, code);
+  }
   const signalEvent = await fetch(`${base}/api/backtests/events/11`)
     .then((response) => response.json());
   assert.equal(signalEvent.components[0].contribution, 20);
   const missingSignalEvent = await fetch(`${base}/api/backtests/events/12`);
   assert.equal(missingSignalEvent.status, 404);
+  assert.equal((await missingSignalEvent.json()).error.code, 'SIGNAL_EVENT_NOT_FOUND');
   const backtestCsv = await fetch(`${base}/api/export.csv?type=backtest&horizon=5&code=510300`)
     .then((response) => response.text());
   assert.match(backtestCsv, /信号日期/);
@@ -215,6 +248,12 @@ test('summary, health, detail and CSV APIs respond', async (context) => {
     .then((response) => response.text());
   assert.match(missingOutcomeCsv, /数据不足/);
   assert.doesNotMatch(missingOutcomeCsv, /2026-11-19,验证期,63.8,活跃异动,5日,,,,,否/);
+  const invalidCsvType = await fetch(`${base}/api/export.csv?type=unknown`);
+  assert.equal(invalidCsvType.status, 400);
+  assert.equal((await invalidCsvType.json()).error.code, 'INVALID_CSV_TYPE');
+  const invalidCsvDate = await fetch(`${base}/api/export.csv?type=backtest&from=bad-date`);
+  assert.equal(invalidCsvDate.status, 400);
+  assert.equal((await invalidCsvDate.json()).error.code, 'INVALID_DATE');
 });
 
 test('local application assets are served without stale caching', async (context) => {
@@ -227,4 +266,28 @@ test('local application assets are served without stale caching', async (context
     assert.equal(response.status, 200);
     assert.match(response.headers.get('cache-control'), /no-cache/);
   }
+});
+
+test('internal errors are logged without exposing stack or messages', async (context) => {
+  const logged = [];
+  const failingService = {
+    ...service,
+    getSummary: () => {
+      throw new Error('secret internal path C:\\private');
+    }
+  };
+  const server = createApp({
+    service: failingService,
+    logger: { error: (message) => logged.push(message) }
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  context.after(() => server.close());
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const response = await fetch(`${base}/api/summary`);
+  assert.equal(response.status, 500);
+  const body = await response.json();
+  assert.equal(body.error.code, 'INTERNAL_ERROR');
+  assert.equal(body.error.message, '服务内部错误');
+  assert.doesNotMatch(JSON.stringify(body), /secret internal path/);
+  assert.match(logged[0], /secret internal path/);
 });

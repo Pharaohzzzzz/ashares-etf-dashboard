@@ -94,6 +94,8 @@ function calculateShareWindow(history, bars, days) {
       tradeDate: current.tradeDate,
       shares: current.shares,
       source: current.source,
+      fetchedAt: current.fetchedAt || null,
+      officialFetchedAt: current.officialFetchedAt || null,
       shareDelta,
       close,
       estimatedSubscription,

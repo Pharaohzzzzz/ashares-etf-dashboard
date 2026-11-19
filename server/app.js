@@ -3,6 +3,14 @@
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
+const { ETFS } = require('../config/etfs');
+
+const ETF_CODES = new Set(ETFS.map((etf) => etf.code));
+const CATEGORIES = new Set(ETFS.map((etf) => etf.category));
+const LEVELS = new Set(['observe', 'active', 'high']);
+const SPLITS = new Set(['train', 'validation']);
+const HORIZONS = new Set([1, 3, 5, 10]);
+const CSV_TYPES = new Set(['summary', 'daily', 'shares', 'iopv', 'backtest']);
 
 const CONTENT_TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -22,6 +30,17 @@ function sendJson(response, status, data) {
     'Content-Length': Buffer.byteLength(body)
   });
   response.end(body);
+}
+
+function sendError(response, status, code, message) {
+  return sendJson(response, status, { error: { code, message } });
+}
+
+function isValidDate(value) {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const parsed = new Date(`${value}T00:00:00Z`);
+  return Number.isFinite(parsed.getTime()) &&
+    parsed.toISOString().slice(0, 10) === value;
 }
 
 function csvCell(value) {
@@ -53,18 +72,59 @@ function parseBacktestFilters(url) {
   };
 }
 
-function createApp({ service, publicDir = path.join(__dirname, '..', 'public') }) {
+function validateBacktestFilters(url) {
+  const filters = parseBacktestFilters(url);
+  if (!HORIZONS.has(filters.horizon)) {
+    return { error: ['INVALID_HORIZON', '回测周期仅支持 1、3、5 或 10 日'] };
+  }
+  if (filters.code && !ETF_CODES.has(filters.code)) {
+    return { error: ['INVALID_CODE', 'ETF 代码不在监测清单内'] };
+  }
+  if (filters.category && !CATEGORIES.has(filters.category)) {
+    return { error: ['INVALID_CATEGORY', 'ETF 分类不在白名单内'] };
+  }
+  if (filters.level && !LEVELS.has(filters.level)) {
+    return { error: ['INVALID_LEVEL', '评分等级不在白名单内'] };
+  }
+  if (filters.split && !SPLITS.has(filters.split)) {
+    return { error: ['INVALID_SPLIT', '数据切分仅支持 train 或 validation'] };
+  }
+  for (const key of ['from', 'to']) {
+    if (filters[key] && !isValidDate(filters[key])) {
+      return { error: ['INVALID_DATE', '日期必须为有效的 YYYY-MM-DD'] };
+    }
+  }
+  if (filters.from && filters.to && filters.from > filters.to) {
+    return { error: ['INVALID_DATE_RANGE', '开始日期不得晚于结束日期'] };
+  }
+  return { filters };
+}
+
+function createApp({
+  service,
+  publicDir = path.join(__dirname, '..', 'public'),
+  logger = console
+}) {
   const server = http.createServer(async (request, response) => {
     const url = new URL(request.url, 'http://127.0.0.1');
     try {
       if (url.pathname === '/api/health') {
         const summary = service.getSummary();
+        const status = !summary.etfs.length
+          ? 'starting'
+          : summary.quoteStatus === 'ok'
+            ? 'ok'
+            : 'degraded';
         return sendJson(response, 200, {
-          status: summary.etfs.length ? 'ok' : 'starting',
+          status,
           initializedAt: service.initializedAt,
           dataTime: summary.dataTime,
           etfs: summary.etfs.length,
-          initializing: service.initializing
+          initializing: service.initializing,
+          quoteStatus: summary.quoteStatus || null,
+          staleCount: summary.staleCount ?? null,
+          oldestDataTime: summary.oldestDataTime || null,
+          latestDataTime: summary.latestDataTime || null
         });
       }
 
@@ -77,36 +137,41 @@ function createApp({ service, publicDir = path.join(__dirname, '..', 'public') }
         return sendJson(response, 200, summary);
       }
 
+      const etfPathMatch = url.pathname.match(/^\/api\/etfs\/([^/]+)/);
+      if (etfPathMatch && !ETF_CODES.has(etfPathMatch[1])) {
+        return sendError(response, 400, 'INVALID_CODE', 'ETF 代码不在监测清单内');
+      }
+
       const intradayMatch = url.pathname.match(/^\/api\/etfs\/(\d{6})\/intraday$/);
       if (intradayMatch && request.method === 'GET') {
         const intraday = await service.getIntraday(intradayMatch[1]);
         return intraday
           ? sendJson(response, 200, intraday)
-          : sendJson(response, 404, { error: 'ETF 不存在' });
+          : sendError(response, 404, 'ETF_NOT_FOUND', 'ETF 不存在');
       }
 
       const shareHistoryMatch = url.pathname.match(/^\/api\/etfs\/(\d{6})\/share-history$/);
       if (shareHistoryMatch && request.method === 'GET') {
         const days = Number(url.searchParams.get('days') || 250);
         if (![20, 60, 250].includes(days)) {
-          return sendJson(response, 400, { error: '历史视角仅支持 20、60 或 250 日' });
+          return sendError(response, 400, 'INVALID_SHARE_DAYS', '历史视角仅支持 20、60 或 250 日');
         }
         const shareHistory = service.getShareHistory(shareHistoryMatch[1], days);
         return shareHistory
           ? sendJson(response, 200, shareHistory)
-          : sendJson(response, 404, { error: 'ETF 不存在' });
+          : sendError(response, 404, 'ETF_NOT_FOUND', 'ETF 不存在');
       }
 
       const iopvHistoryMatch = url.pathname.match(/^\/api\/etfs\/(\d{6})\/iopv-history$/);
       if (iopvHistoryMatch && request.method === 'GET') {
         const days = Number(url.searchParams.get('days') || 250);
         if (!Number.isInteger(days) || days < 1 || days > 250) {
-          return sendJson(response, 400, { error: 'IOPV 历史视角需为 1 至 250 日' });
+          return sendError(response, 400, 'INVALID_IOPV_DAYS', 'IOPV 历史视角需为 1 至 250 日');
         }
         const history = service.getIopvHistory(iopvHistoryMatch[1], days);
         return history
           ? sendJson(response, 200, history)
-          : sendJson(response, 404, { error: 'ETF 不存在' });
+          : sendError(response, 404, 'ETF_NOT_FOUND', 'ETF 不存在');
       }
 
       if (url.pathname === '/api/backtests/summary' && request.method === 'GET') {
@@ -114,10 +179,9 @@ function createApp({ service, publicDir = path.join(__dirname, '..', 'public') }
       }
 
       if (url.pathname === '/api/backtests/events' && request.method === 'GET') {
-        const filters = parseBacktestFilters(url);
-        if (![1, 3, 5, 10].includes(filters.horizon)) {
-          return sendJson(response, 400, { error: '回测周期仅支持 1、3、5 或 10 日' });
-        }
+        const validated = validateBacktestFilters(url);
+        if (validated.error) return sendError(response, 400, ...validated.error);
+        const { filters } = validated;
         return sendJson(response, 200, await service.getBacktestEvents(filters));
       }
 
@@ -126,7 +190,7 @@ function createApp({ service, publicDir = path.join(__dirname, '..', 'public') }
         const event = await service.getBacktestEvent(signalEventMatch[1]);
         return event
           ? sendJson(response, 200, event)
-          : sendJson(response, 404, { error: '信号事件不存在' });
+          : sendError(response, 404, 'SIGNAL_EVENT_NOT_FOUND', '信号事件不存在');
       }
 
       const detailMatch = url.pathname.match(/^\/api\/etfs\/(\d{6})$/);
@@ -134,18 +198,27 @@ function createApp({ service, publicDir = path.join(__dirname, '..', 'public') }
         const detail = service.getDetail(detailMatch[1]);
         return detail
           ? sendJson(response, 200, detail)
-          : sendJson(response, 404, { error: 'ETF 不存在' });
+          : sendError(response, 404, 'ETF_NOT_FOUND', 'ETF 不存在');
       }
 
       if (url.pathname === '/api/export.csv' && request.method === 'GET') {
         const code = url.searchParams.get('code');
+        const requestedType = url.searchParams.get('type') || (code ? 'daily' : 'summary');
+        if (!CSV_TYPES.has(requestedType)) {
+          return sendError(response, 400, 'INVALID_CSV_TYPE', 'CSV type 不在白名单内');
+        }
+        if (code && !ETF_CODES.has(code)) {
+          return sendError(response, 400, 'INVALID_CODE', 'ETF 代码不在监测清单内');
+        }
+        if (['shares', 'iopv', 'daily'].includes(requestedType) && !code) {
+          return sendError(response, 400, 'CODE_REQUIRED', '该 CSV 类型必须指定 ETF 代码');
+        }
         let csv;
         let filename;
-        if (url.searchParams.get('type') === 'backtest') {
-          const filters = parseBacktestFilters(url);
-          if (![1, 3, 5, 10].includes(filters.horizon)) {
-            return sendJson(response, 400, { error: '回测周期仅支持 1、3、5 或 10 日' });
-          }
+        if (requestedType === 'backtest') {
+          const validated = validateBacktestFilters(url);
+          if (validated.error) return sendError(response, 400, ...validated.error);
+          const { filters } = validated;
           const { events } = await service.getBacktestEvents(filters);
           csv = toCsv([
             { key: 'code', label: '代码' },
@@ -204,10 +277,10 @@ function createApp({ service, publicDir = path.join(__dirname, '..', 'public') }
             };
           }));
           filename = 'etf-signal-backtest.csv';
-        } else if (code && /^\d{6}$/.test(code)) {
+        } else if (code) {
           const detail = service.getDetail(code);
-          if (!detail) return sendJson(response, 404, { error: 'ETF 不存在' });
-          if (url.searchParams.get('type') === 'shares') {
+          if (!detail) return sendError(response, 404, 'ETF_NOT_FOUND', 'ETF 不存在');
+          if (requestedType === 'shares') {
             const shareHistory = service.getShareHistory(code, 250);
             csv = toCsv([
               { key: 'tradeDate', label: '日期' },
@@ -217,10 +290,24 @@ function createApp({ service, publicDir = path.join(__dirname, '..', 'public') }
               { key: 'estimatedSubscription', label: '估算净申赎' },
               { key: 'cumulativeShareDelta', label: '累计份额变化' },
               { key: 'cumulativeEstimatedSubscription', label: '累计估算净申赎' },
-              { key: 'source', label: '来源' }
-            ], shareHistory?.range?.points || []);
+              { key: 'source', label: '来源' },
+              { key: 'dataTime', label: '行情时间' },
+              { key: 'capturedAt', label: '抓取时间' },
+              { key: 'quoteStatus', label: '行情状态' },
+              { key: 'officialShareDate', label: '官方份额日期' },
+              { key: 'officialShareSource', label: '官方份额来源' },
+              { key: 'officialShareFetchedAt', label: '官方份额抓取时间' }
+            ], (shareHistory?.range?.points || []).map((point) => ({
+              ...point,
+              dataTime: detail.quote.dataTime,
+              capturedAt: detail.quote.capturedAt,
+              quoteStatus: detail.quote.quoteStatusLabel || detail.quote.quoteStatus,
+              officialShareDate: point.tradeDate,
+              officialShareSource: point.source,
+              officialShareFetchedAt: point.officialFetchedAt || point.fetchedAt || null
+            })));
             filename = `${code}-official-shares.csv`;
-          } else if (url.searchParams.get('type') === 'iopv') {
+          } else if (requestedType === 'iopv') {
             const iopvHistory = service.getIopvHistory(code, 250);
             csv = toCsv([
               { key: 'tradeDate', label: '交易日' },
@@ -275,6 +362,12 @@ function createApp({ service, publicDir = path.join(__dirname, '..', 'public') }
             { key: 'shareStreak', label: '连续净申赎' },
             { key: 'sharePercentile', label: '份额历史分位' },
             { key: 'tradeDate', label: '交易日' },
+            { key: 'dataTime', label: '行情时间' },
+            { key: 'capturedAt', label: '抓取时间' },
+            { key: 'quoteStatus', label: '行情状态' },
+            { key: 'officialShareDate', label: '官方份额日期' },
+            { key: 'officialShareSource', label: '官方份额来源' },
+            { key: 'officialShareFetchedAt', label: '官方份额抓取时间' },
             { key: 'signals', label: '候选信号' }
           ];
           csv = toCsv(headers, summary.etfs.map((row) => ({
@@ -288,6 +381,7 @@ function createApp({ service, publicDir = path.join(__dirname, '..', 'public') }
             sharePercentile: Number.isFinite(row.sharePercentile)
               ? `${(row.sharePercentile * 100).toFixed(1)}%`
               : '数据不足',
+            quoteStatus: row.quoteStatusLabel || row.quoteStatus,
             signals: row.signals.map((signal) => signal.label).join('、')
           })));
           filename = 'etf-summary.csv';
@@ -317,9 +411,10 @@ function createApp({ service, publicDir = path.join(__dirname, '..', 'public') }
         return serveFile(response, fullPath);
       }
 
-      return sendJson(response, 404, { error: '接口不存在' });
+      return sendError(response, 404, 'NOT_FOUND', '接口不存在');
     } catch (error) {
-      return sendJson(response, 500, { error: error.message });
+      logger.error(error?.stack || error);
+      return sendError(response, 500, 'INTERNAL_ERROR', '服务内部错误');
     }
   });
   return server;
@@ -327,7 +422,7 @@ function createApp({ service, publicDir = path.join(__dirname, '..', 'public') }
 
 function serveFile(response, filePath, cacheControl = 'no-cache') {
   if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
-    return sendJson(response, 404, { error: '文件不存在' });
+    return sendJson(response, 404, { error: { code: 'FILE_NOT_FOUND', message: '文件不存在' } });
   }
   const stat = fs.statSync(filePath);
   response.writeHead(200, {
@@ -339,5 +434,10 @@ function serveFile(response, filePath, cacheControl = 'no-cache') {
   fs.createReadStream(filePath).pipe(response);
 }
 
-module.exports = { createApp, toCsv };
+module.exports = {
+  createApp,
+  toCsv,
+  isValidDate,
+  validateBacktestFilters
+};
 

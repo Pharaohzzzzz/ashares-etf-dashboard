@@ -10,7 +10,7 @@ New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
 
 try {
   $health = Invoke-RestMethod -Uri "$dashboardUrl/api/health" -TimeoutSec 2
-  if ($health.status -in @('ok', 'starting')) {
+  if ($health.status -in @('ok', 'starting', 'degraded')) {
     Write-Output ('ETF dashboard is already running: ' + $dashboardUrl)
     exit 0
   }
@@ -32,7 +32,7 @@ for ($attempt = 0; $attempt -lt 30; $attempt++) {
   Start-Sleep -Milliseconds 500
   try {
     $health = Invoke-RestMethod -Uri "$dashboardUrl/api/health" -TimeoutSec 2
-    if ($health.status -in @('ok', 'starting')) {
+    if ($health.status -in @('ok', 'starting', 'degraded')) {
       $started = $true
       break
     }
