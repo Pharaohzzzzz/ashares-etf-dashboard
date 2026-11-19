@@ -53,7 +53,15 @@
 - 临时数据库在线备份、清理、安全恢复和日志轮转。
 - dialog/焦点/排序控件静态语义。
 
-实际命令和结果记录在最终交付信息中；没有执行的检查不会标记为通过。
+最终验收实际结果：
+
+- `npm test`：71 项通过，0 失败。
+- `npm audit --omit=dev --audit-level=moderate`：0 个漏洞。
+- 全部 30 个 JavaScript 文件通过 `node --check`。
+- 当前数据库 `PRAGMA integrity_check` 返回 `ok`，`PRAGMA foreign_key_check` 返回空结果。
+- 在线备份实际生成 `data/backups/dashboard-20261120-025236.db`，备份完整性检查通过；日常清理删除 0 条快照、0 条日志。
+- 真实浏览器在桌面、390px、320px 下无整页横向溢出；排序、Enter/Space、dialog Tab 循环、Escape、焦点恢复、IOPV 图表均通过，控制台错误/警告为 0。
+- 当前服务健康，14 只 ETF 可访问；行情、日线、官方份额、IOPV、回测均更新到 2026-11-19。
 
 ## 已知限制
 
