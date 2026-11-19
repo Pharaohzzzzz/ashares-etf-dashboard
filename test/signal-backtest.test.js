@@ -162,3 +162,40 @@ test('backtest uses a chronological 70/30 split and reports samples', () => {
   assert.equal(result.etfStatus.length, 2);
   assert.ok(result.etfStatus.every((etf) => etf.status === 'ready'));
 });
+
+test('robustness report is deterministic and accounts for overlapping holdings', () => {
+  const first = buildBacktest(createDataset());
+  const second = buildBacktest(createDataset());
+  assert.deepEqual(second.robustness, first.robustness);
+  assert.equal(first.robustness.deterministic, true);
+
+  for (const split of ['train', 'validation']) {
+    for (const horizon of SIGNAL_PARAMETERS.horizons) {
+      const independent = first.robustness.nonOverlapping[split][horizon];
+      const raw = first.splits[split].byHorizon[horizon];
+      assert.ok(independent.independentSamples <= raw.samples);
+      assert.equal(
+        independent.independentSamples + independent.overlappingSignalsExcluded,
+        raw.samples
+      );
+      const uncertainty = first.robustness.bootstrap[split][horizon];
+      assert.equal(uncertainty.method, 'date_block_bootstrap');
+      if (uncertainty.averageReturnConfidenceInterval) {
+        assert.ok(
+          uncertainty.averageReturnConfidenceInterval.low <=
+          uncertainty.averageReturnConfidenceInterval.high
+        );
+      }
+    }
+  }
+
+  const rolling = first.robustness.rollingValidation[5];
+  assert.ok(rolling.length >= 1);
+  assert.ok(rolling.every((window) => (
+    window.startDate <= window.endDate &&
+    Number.isInteger(window.samples) &&
+    window.samples >= 0
+  )));
+  assert.ok(first.methodology.overlap.includes('重叠'));
+  assert.ok(first.methodology.uncertainty.includes('bootstrap'));
+});

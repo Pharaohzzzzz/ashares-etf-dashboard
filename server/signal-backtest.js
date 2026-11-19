@@ -677,6 +677,202 @@ function aggregateOutcomes(observations, horizon, selector) {
   };
 }
 
+function hashSeed(value) {
+  let hash = 2166136261;
+  for (const character of value) {
+    hash ^= character.charCodeAt(0);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+function seededRandom(seed) {
+  let state = seed >>> 0;
+  return () => {
+    state += 0x6d2b79f5;
+    let value = state;
+    value = Math.imul(value ^ (value >>> 15), value | 1);
+    value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
+    return ((value ^ (value >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function quantile(sorted, probability) {
+  if (!sorted.length) return null;
+  const position = (sorted.length - 1) * probability;
+  const lower = Math.floor(position);
+  const upper = Math.ceil(position);
+  if (lower === upper) return sorted[lower];
+  return sorted[lower] + (sorted[upper] - sorted[lower]) * (position - lower);
+}
+
+function independentSignalObservations(observations, horizon) {
+  const byCode = new Map();
+  for (const observation of observations) {
+    if (!observation.isSignal || !observation.outcomes?.[horizon]) continue;
+    if (!byCode.has(observation.code)) byCode.set(observation.code, []);
+    byCode.get(observation.code).push(observation);
+  }
+  const selected = [];
+  for (const rows of byCode.values()) {
+    rows.sort((left, right) => left.signalDate.localeCompare(right.signalDate));
+    let lastExitDate = null;
+    for (const observation of rows) {
+      const outcome = observation.outcomes[horizon];
+      if (lastExitDate && outcome.earliestEntryDate <= lastExitDate) continue;
+      selected.push(observation);
+      lastExitDate = outcome.exitDate;
+    }
+  }
+  return selected.sort((left, right) => (
+    left.signalDate.localeCompare(right.signalDate) || left.code.localeCompare(right.code)
+  ));
+}
+
+function aggregateIndependent(observations, horizon) {
+  const selected = independentSignalObservations(observations, horizon);
+  const rawCount = observations.filter((row) => (
+    row.isSignal && row.outcomes?.[horizon]
+  )).length;
+  return {
+    ...aggregateOutcomes(selected, horizon, () => true),
+    independentSamples: selected.length,
+    overlappingSignalsExcluded: rawCount - selected.length
+  };
+}
+
+function bootstrapUncertainty(observations, horizon, seed) {
+  const rows = observations.filter((observation) => (
+    observation.isSignal && observation.outcomes?.[horizon]
+  ));
+  const byDate = new Map();
+  for (const observation of rows) {
+    if (!byDate.has(observation.signalDate)) byDate.set(observation.signalDate, []);
+    byDate.get(observation.signalDate).push(observation.outcomes[horizon]);
+  }
+  const dates = [...byDate.keys()].sort();
+  if (dates.length < 2) {
+    return {
+      method: 'date_block_bootstrap',
+      iterations: 0,
+      blockSize: 0,
+      uniqueDates: dates.length,
+      averageReturnConfidenceInterval: null,
+      hitRateConfidenceInterval: null
+    };
+  }
+  const blockSize = Math.min(5, dates.length);
+  const blocks = [];
+  for (let index = 0; index < dates.length; index += blockSize) {
+    blocks.push(dates.slice(index, index + blockSize));
+  }
+  const random = seededRandom(seed);
+  const returnMeans = [];
+  const hitRates = [];
+  const targetDateCount = dates.length;
+  for (let iteration = 0; iteration < 1000; iteration += 1) {
+    const sampledDates = [];
+    while (sampledDates.length < targetDateCount) {
+      const block = blocks[Math.floor(random() * blocks.length)];
+      sampledDates.push(...block);
+    }
+    const sampled = sampledDates
+      .slice(0, targetDateCount)
+      .flatMap((date) => byDate.get(date) || []);
+    const mean = average(sampled.map((outcome) => outcome.futureReturn));
+    if (mean !== null) returnMeans.push(mean);
+    if (sampled.length) {
+      hitRates.push(
+        sampled.filter((outcome) => outcome.outperformedBenchmark).length / sampled.length
+      );
+    }
+  }
+  returnMeans.sort((left, right) => left - right);
+  hitRates.sort((left, right) => left - right);
+  return {
+    method: 'date_block_bootstrap',
+    iterations: 1000,
+    blockSize,
+    uniqueDates: dates.length,
+    averageReturnConfidenceInterval: returnMeans.length
+      ? {
+        low: round(quantile(returnMeans, 0.025), 6),
+        high: round(quantile(returnMeans, 0.975), 6)
+      }
+      : null,
+    hitRateConfidenceInterval: hitRates.length
+      ? {
+        low: round(quantile(hitRates, 0.025), 6),
+        high: round(quantile(hitRates, 0.975), 6)
+      }
+      : null
+  };
+}
+
+function rollingSubsamples(observations, splitName, horizon) {
+  const rows = observations.filter((observation) => observation.split === splitName);
+  const dates = [...new Set(rows.map((row) => row.signalDate))].sort();
+  if (dates.length < 4) return [];
+  const windowSize = Math.max(3, Math.floor(dates.length * 0.5));
+  const starts = [...new Set([
+    0,
+    Math.max(0, Math.floor((dates.length - windowSize) / 2)),
+    Math.max(0, dates.length - windowSize)
+  ])].sort((left, right) => left - right);
+  return starts.map((start, index) => {
+    const intervalDates = dates.slice(start, start + windowSize);
+    const startDate = intervalDates[0];
+    const endDate = intervalDates.at(-1);
+    const aggregate = aggregateOutcomes(
+      rows.filter((row) => row.signalDate >= startDate && row.signalDate <= endDate),
+      horizon,
+      (observation) => observation.isSignal
+    );
+    return {
+      index,
+      startDate,
+      endDate,
+      samples: aggregate.samples,
+      hitRate: aggregate.hitRate,
+      hitRateLift: aggregate.hitRateLift,
+      averageReturn: aggregate.averageReturn,
+      worstDrawdown: aggregate.worstDrawdown
+    };
+  });
+}
+
+function buildRobustness(observations, fingerprint) {
+  const seedBase = hashSeed(fingerprint);
+  const bySplit = {};
+  const independent = {};
+  const rolling = {};
+  for (const splitName of ['train', 'validation']) {
+    const rows = observations.filter((observation) => observation.split === splitName);
+    bySplit[splitName] = {};
+    independent[splitName] = {};
+    for (const horizon of SIGNAL_PARAMETERS.horizons) {
+      bySplit[splitName][horizon] = bootstrapUncertainty(
+        rows,
+        horizon,
+        seedBase + horizon * 101
+      );
+      independent[splitName][horizon] = aggregateIndependent(rows, horizon);
+    }
+  }
+  const validationRows = observations.filter((observation) => observation.split === 'validation');
+  for (const horizon of SIGNAL_PARAMETERS.horizons) {
+    rolling[horizon] = rollingSubsamples(validationRows, 'validation', horizon);
+  }
+  return {
+    seed: seedBase,
+    deterministic: true,
+    overlapMethod: 'per-ETF greedy non-overlapping holding intervals',
+    bootstrap: bySplit,
+    nonOverlapping: independent,
+    rollingValidation: rolling
+  };
+}
+
 function summarizeSplit(observations, split) {
   const rows = observations.filter((observation) => observation.split === split);
   const categories = [...new Set(rows.map((observation) => observation.category))];
@@ -737,6 +933,7 @@ function datasetFingerprint(dataset) {
 
 function buildBacktest(dataset) {
   const { observations, exclusions, prepared } = buildSignalObservations(dataset);
+  const fingerprint = datasetFingerprint(dataset);
   const split = splitDates(observations);
   for (const observation of observations) {
     observation.split = split.validationStart && observation.date >= split.validationStart
@@ -744,6 +941,7 @@ function buildBacktest(dataset) {
       : 'train';
   }
   attachOutcomes(observations, prepared);
+  const robustness = buildRobustness(observations, fingerprint);
 
   const etfStatus = exclusions.map((row) => {
     const eligible = observations.filter((observation) => observation.code === row.code);
@@ -772,7 +970,7 @@ function buildBacktest(dataset) {
     parameterVersion: SIGNAL_PARAMETERS.version,
     parameters: SIGNAL_PARAMETERS,
     generatedAt: new Date().toISOString(),
-    datasetFingerprint: datasetFingerprint(dataset),
+    datasetFingerprint: fingerprint,
     window: {
       trainStart: observations[0]?.date || null,
       trainEnd: split.trainEnd,
@@ -791,12 +989,15 @@ function buildBacktest(dataset) {
       split: '按全池可评分交易日的先后顺序前 70% 训练、后 30% 留出验证，验证期不参与参数调整',
       tailVolume: '尾盘成交占比仅作当日辅助标签，不进入长期回测评分',
       drawdown: '最大回撤从次日开盘入场价起算，使用持有期内后续交易日最低价；不是收盘价回撤',
+      overlap: '有效独立样本按每只 ETF 的持仓区间做贪心去重；相邻信号持仓重叠时只保留先发生且未结束的一笔',
+      uncertainty: '不确定性报告使用固定随机种子的日期分块 bootstrap，并保留验证期滚动子样本；区间表示历史样本不确定性，不代表未来收益保证',
       costs: SIGNAL_PARAMETERS.costScenarios
     },
     splits: {
       train: summarizeSplit(observations, 'train'),
       validation: summarizeSplit(observations, 'validation')
     },
+    robustness,
     etfStatus,
     events: observations
       .filter((observation) => observation.isSignal)

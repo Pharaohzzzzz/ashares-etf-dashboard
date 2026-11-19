@@ -284,6 +284,35 @@
       <section class="table-panel">
         <div class="section-heading">
           <div>
+            <p class="eyebrow">ROBUSTNESS</p>
+            <h3>重叠样本与不确定性</h3>
+          </div>
+          <span class="muted-note">日期分块 bootstrap · 固定随机种子</span>
+        </div>
+        <p id="robustnessNote" class="data-note">正在计算有效独立样本与置信区间...</p>
+        <div class="table-scroll compact-table">
+          <table>
+            <thead>
+              <tr>
+                <th>周期</th>
+                <th>原始信号样本</th>
+                <th>有效独立样本</th>
+                <th>重叠剔除</th>
+                <th>平均收益 95% 区间</th>
+                <th>命中率 95% 区间</th>
+              </tr>
+            </thead>
+            <tbody id="robustnessRows">
+              <tr><td colspan="6"><div class="table-loading">正在计算...</div></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div id="rollingSubsamples" class="etf-status-grid rolling-grid"></div>
+      </section>
+
+      <section class="table-panel">
+        <div class="section-heading">
+          <div>
             <p class="eyebrow">HIT-RATE LIFT</p>
             <h3>分类区分度热力图</h3>
           </div>

@@ -650,6 +650,10 @@ td {
   background: rgba(255, 104, 116, 0.08);
 }
 
+.rolling-grid {
+  margin-top: 18px;
+}
+
 tbody tr.is-stale > td {
   background: rgba(111, 125, 145, 0.045);
 }

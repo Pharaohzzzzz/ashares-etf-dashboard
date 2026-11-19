@@ -84,6 +84,9 @@ const elements = {
   backtestExport: document.querySelector('#backtestExport'),
   backtestDataNote: document.querySelector('#backtestDataNote'),
   splitComparisonRows: document.querySelector('#splitComparisonTable tbody'),
+  robustnessNote: document.querySelector('#robustnessNote'),
+  robustnessRows: document.querySelector('#robustnessRows'),
+  rollingSubsamples: document.querySelector('#rollingSubsamples'),
   backtestHeatmap: document.querySelector('#backtestHeatmap'),
   heatmapNote: document.querySelector('#heatmapNote'),
   backtestEtfRows: document.querySelector('#backtestEtfRows'),
@@ -1512,6 +1515,7 @@ function renderBacktestSummary() {
     }
     elements.splitComparisonRows.append(tr);
   }
+  renderRobustness(summary);
 
   const weights = summary.parameters?.weights || {};
   const chips = createElement('div', 'parameter-chips');
@@ -1562,6 +1566,71 @@ function renderBacktestSummary() {
     );
     elements.backtestEtfStatus.append(card);
   }
+}
+
+function renderRobustness(summary) {
+  elements.robustnessRows.replaceChildren();
+  elements.rollingSubsamples.replaceChildren();
+  const robustness = summary.robustness;
+  if (!robustness) {
+    const tr = document.createElement('tr');
+    const td = createElement('td', 'table-loading', '当前回测版本尚未包含稳健性报告');
+    td.colSpan = 6;
+    tr.append(td);
+    elements.robustnessRows.append(tr);
+    elements.robustnessNote.textContent = '需要重新生成回测后才能显示不确定性区间。';
+    return;
+  }
+  elements.robustnessNote.textContent = [
+    '验证期按每只 ETF 的持仓区间去重，避免相邻信号把同一段未来收益重复计入。',
+    'bootstrap 按连续交易日分块重采样，共 1000 次；同一数据指纹使用固定种子。',
+    '区间只描述当前历史样本的不确定性，不能解释为未来收益保证。'
+  ].join(' ');
+  for (const horizon of [1, 3, 5, 10]) {
+    const raw = summary.splits?.validation?.byHorizon?.[horizon];
+    const independent = robustness.nonOverlapping?.validation?.[horizon];
+    const uncertainty = robustness.bootstrap?.validation?.[horizon];
+    const tr = document.createElement('tr');
+    tr.append(
+      createElement('td', '', `未来 ${horizon} 日`),
+      createElement('td', '', raw?.samples ? String(raw.samples) : '数据不足'),
+      createElement('td', '', independent?.independentSamples
+        ? String(independent.independentSamples)
+        : '0'),
+      createElement('td', '', independent?.overlappingSignalsExcluded
+        ? String(independent.overlappingSignalsExcluded)
+        : '0'),
+      createElement('td', '', formatConfidenceInterval(
+        uncertainty?.averageReturnConfidenceInterval,
+        true
+      )),
+      createElement('td', '', formatConfidenceInterval(
+        uncertainty?.hitRateConfidenceInterval,
+        false
+      ))
+    );
+    elements.robustnessRows.append(tr);
+  }
+  for (const horizon of [1, 3, 5, 10]) {
+    const windows = robustness.rollingValidation?.[horizon] || [];
+    if (!windows.length) continue;
+    const card = createElement('div', 'etf-status-card');
+    card.append(
+      createElement('strong', '', `验证期滚动子样本 · ${horizon} 日`),
+      ...windows.map((window) => createElement(
+        'span',
+        '',
+        `${window.startDate} 至 ${window.endDate} · 样本 ${window.samples} · 命中率 ${formatNullablePercent(window.hitRate)} · 平均收益 ${formatNullableSignedPercent(window.averageReturn)}`
+      ))
+    );
+    elements.rollingSubsamples.append(card);
+  }
+}
+
+function formatConfidenceInterval(interval, signed) {
+  if (!interval) return '数据不足';
+  const format = signed ? formatNullableSignedPercent : formatNullablePercent;
+  return `${signed ? format(interval.low) : format(interval.low)} — ${format(interval.high)}`;
 }
 
 function formatNullablePercent(value, digits = 1) {
