@@ -96,6 +96,33 @@ test('summary calculates ratio, returns, shares and a broad resonance candidate'
   assert.equal(row.volumeRatio, 3);
   assert.equal(row.shareDelta, 200);
   assert.equal(row.signals.some((signal) => signal.key === 'volume'), true);
+  assert.equal(summary.totalAmount, 300);
+  assert.deepEqual(summary.amountCoverage, { available: 1, total: 1 });
+  db.close();
+});
+
+test('summary excludes missing amounts from totals while preserving valid zero', () => {
+  const db = createDatabase(':memory:');
+  const quote = {
+    code: '510300', price: 4, previousClose: 4, change: 0,
+    changePercent: 0, open: 4, high: 4, low: 4, volume: 0,
+    amount: 0, turnoverRate: 0, shares: 1000, marketValue: 4000,
+    timestamp: 1795114800
+  };
+  db.saveSnapshot(quote, '2026-11-19', '2026-11-19T07:00:00.000Z');
+  db.saveSnapshot({
+    ...quote,
+    code: '159919',
+    amount: null,
+    timestamp: 1795114801
+  }, '2026-11-19', '2026-11-19T07:00:01.000Z');
+  const service = new MarketService({
+    db,
+    now: () => new Date('2026-11-20T00:00:00.000Z')
+  });
+  const summary = service.getSummary();
+  assert.equal(summary.totalAmount, 0);
+  assert.deepEqual(summary.amountCoverage, { available: 1, total: 2 });
   db.close();
 });
 

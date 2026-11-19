@@ -2,7 +2,12 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { parseQuote, parseKlines, parseTrends } = require('../server/provider');
+const {
+  parseOptionalNumber,
+  parseQuote,
+  parseKlines,
+  parseTrends
+} = require('../server/provider');
 
 const etf = { code: '510300', name: '沪深300ETF华泰柏瑞', category: '宽基核心', tone: 'broad' };
 
@@ -56,4 +61,32 @@ test('parseTrends maps minute rows', () => {
     volume: 100,
     amount: 406000
   });
+});
+
+test('optional numeric fields preserve zero and reject missing or invalid values', () => {
+  assert.equal(parseOptionalNumber('0', { nonNegative: true }), 0);
+  assert.equal(parseOptionalNumber('', { nonNegative: true }), null);
+  assert.equal(parseOptionalNumber('-', { nonNegative: true }), null);
+  assert.equal(parseOptionalNumber('NaN', { nonNegative: true }), null);
+  assert.equal(parseOptionalNumber('-1', { nonNegative: true }), null);
+  assert.equal(parseOptionalNumber('-1'), -1);
+
+  const quote = parseQuote(etf, {
+    f43: 4060, f44: 4072, f45: 4013, f46: 4046,
+    f47: '0', f48: '-', f58: etf.name, f59: 3,
+    f60: 4058, f84: '', f86: 1795075898,
+    f168: 'NaN', f169: 2, f170: 5
+  });
+  assert.equal(quote.volume, 0);
+  assert.equal(quote.amount, null);
+  assert.equal(quote.shares, null);
+  assert.equal(quote.turnoverRate, null);
+
+  const bars = parseKlines(etf, {
+    klines: ['2026-11-19,4.046,4.060,4.072,4.013,0,-,1.45,,0.002,-1']
+  });
+  assert.equal(bars[0].volume, 0);
+  assert.equal(bars[0].amount, null);
+  assert.equal(bars[0].changePercent, null);
+  assert.equal(bars[0].turnoverRate, null);
 });

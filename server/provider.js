@@ -9,6 +9,15 @@ const QUOTE_HOSTS = [
 ];
 const HISTORY_HOST = 'https://push2his.eastmoney.com';
 
+function parseOptionalNumber(value, { nonNegative = false } = {}) {
+  if (value === null || value === undefined) return null;
+  const text = String(value).trim();
+  if (!text || text === '-' || text.toLowerCase() === 'nan') return null;
+  const number = Number(text.replaceAll(',', ''));
+  if (!Number.isFinite(number) || (nonNegative && number < 0)) return null;
+  return number;
+}
+
 async function fetchJson(url, { retries = 2 } = {}) {
   let lastError;
   for (let attempt = 0; attempt <= retries; attempt += 1) {
@@ -52,12 +61,12 @@ function parseQuote(etf, data) {
     open: scale(data.f46, decimals),
     high: scale(data.f44, decimals),
     low: scale(data.f45, decimals),
-    volume: Number(data.f47) || 0,
-    amount: Number(data.f48) || 0,
+    volume: parseOptionalNumber(data.f47, { nonNegative: true }),
+    amount: parseOptionalNumber(data.f48, { nonNegative: true }),
     turnoverRate: scale(data.f168, 2),
-    shares: Number(data.f84) || null,
-    marketValue: Number(data.f116) || null,
-    timestamp: Number(data.f86) || null
+    shares: parseOptionalNumber(data.f84, { nonNegative: true }),
+    marketValue: parseOptionalNumber(data.f116, { nonNegative: true }),
+    timestamp: parseOptionalNumber(data.f86, { nonNegative: true })
   };
 }
 
@@ -83,16 +92,16 @@ function parseKlines(etf, data) {
     return {
       code: etf.code,
       date,
-      open: Number(open),
-      close: Number(close),
-      high: Number(high),
-      low: Number(low),
-      volume: Number(volume),
-      amount: Number(amount),
-      amplitude: Number(amplitude),
-      changePercent: Number(pctChange),
-      change: Number(change),
-      turnoverRate: Number(turnoverRate)
+      open: parseOptionalNumber(open),
+      close: parseOptionalNumber(close),
+      high: parseOptionalNumber(high),
+      low: parseOptionalNumber(low),
+      volume: parseOptionalNumber(volume, { nonNegative: true }),
+      amount: parseOptionalNumber(amount, { nonNegative: true }),
+      amplitude: parseOptionalNumber(amplitude, { nonNegative: true }),
+      changePercent: parseOptionalNumber(pctChange),
+      change: parseOptionalNumber(change),
+      turnoverRate: parseOptionalNumber(turnoverRate, { nonNegative: true })
     };
   });
 }
@@ -111,10 +120,10 @@ function parseTrends(etf, data) {
     return {
       code: etf.code,
       time,
-      price: Number(price),
-      average: Number(average),
-      volume: Number(volume),
-      amount: Number(amount)
+      price: parseOptionalNumber(price),
+      average: parseOptionalNumber(average),
+      volume: parseOptionalNumber(volume, { nonNegative: true }),
+      amount: parseOptionalNumber(amount, { nonNegative: true })
     };
   });
 }
@@ -126,6 +135,7 @@ async function fetchTrends(etf) {
 }
 
 module.exports = {
+  parseOptionalNumber,
   fetchJson,
   parseQuote,
   fetchQuote,

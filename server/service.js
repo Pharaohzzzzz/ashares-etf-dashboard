@@ -690,10 +690,17 @@ class MarketService {
       .filter(Boolean)
       .sort()
       .at(-1) || null;
+    const amountRows = rows.filter((row) => Number.isFinite(row.amount));
     return {
       generatedAt: this.now().toISOString(),
       dataTime,
-      totalAmount: rows.reduce((sum, row) => sum + (row.amount || 0), 0),
+      totalAmount: amountRows.length
+        ? amountRows.reduce((sum, row) => sum + row.amount, 0)
+        : null,
+      amountCoverage: {
+        available: amountRows.length,
+        total: rows.length
+      },
       volumeUpCount: rows.filter((row) => row.volumeRatio !== null && row.volumeRatio >= 2).length,
       shareUpCount: rows.filter((row) => row.shareDelta !== null && row.shareDelta > 0).length,
       compositeCount: rows.filter((row) => row.composite).length,
