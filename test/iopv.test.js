@@ -292,13 +292,62 @@ test('same-day statistics and close history use recorded values without interpol
   });
   const history = service.getIopvHistory('510300', 20);
   assert.equal(history.stats.open, -0.002);
+  assert.equal(history.stats.first, -0.002);
   assert.equal(history.stats.high, 0.015);
   assert.equal(history.stats.low, -0.002);
   assert.equal(history.stats.latest, 0.015);
   assert.equal(history.stats.sampleCount, 6);
+  assert.equal(history.stats.firstRecordLabel, '首个记录时点');
+  assert.equal(history.stats.firstTime, '2026-11-19 14:50:00');
+  assert.equal(history.stats.lastTime, '2026-11-19 15:00:00');
   assert.equal(history.closeSampleCount, 6);
   assert.ok(Number.isFinite(history.closePercentile));
   assert.equal(history.closeHistory.some((point) => point.premiumRate === 0 && !dailyRates.includes(0)), false);
   assert.equal(history.coverage.status, 'partial');
+  db.close();
+});
+
+test('IOPV statistics label first samples without claiming an opening record', () => {
+  const db = createDatabase(':memory:');
+  const service = new MarketService({
+    db,
+    now: () => new Date('2026-11-20T00:00:00.000Z')
+  });
+  const insertSamples = (times) => {
+    db.raw.exec('DELETE FROM iopv_samples');
+    db.saveIopvSamples(times.map((time, index) => ({
+      ...sample(),
+      dataTime: `2026-11-19 ${time}:00`,
+      observedAt: new Date(`2026-11-19T${String(Number(time.slice(0, 2)) - 8).padStart(2, '0')}:${time.slice(3)}:00.000Z`).toISOString(),
+      marketPrice: 4,
+      iopv: 4,
+      premiumRate: (index + 1) / 1000
+    })));
+    db.saveIopvLatest({
+      ...sample(),
+      marketPrice: 4,
+      iopv: 4,
+      premiumRate: 0.003,
+      fetchedAt: '2026-11-20T00:00:00.000Z',
+      attemptedAt: '2026-11-20T00:00:00.000Z'
+    });
+    return service.getIopvHistory('510300', 1).stats;
+  };
+
+  const single = insertSamples(['10:17']);
+  assert.equal(single.sampleCount, 1);
+  assert.equal(single.firstRecordLabel, '首个记录时点');
+  assert.equal(single.firstTime, '2026-11-19 10:17:00');
+
+  const two = insertSamples(['10:17', '10:18']);
+  assert.equal(two.sampleCount, 2);
+  assert.equal(two.firstTime, '2026-11-19 10:17:00');
+  assert.equal(two.lastTime, '2026-11-19 10:18:00');
+  assert.equal(two.firstRecordLabel, '首个记录时点');
+
+  const full = insertSamples(['09:31', '09:32', '09:33']);
+  assert.equal(full.sampleCount, 3);
+  assert.equal(full.firstTime, '2026-11-19 09:31:00');
+  assert.equal(full.firstRecordLabel, '首个记录时点');
   db.close();
 });

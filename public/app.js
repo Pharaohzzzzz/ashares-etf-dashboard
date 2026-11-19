@@ -975,7 +975,7 @@ function renderIopvCharts(history, intradayInstance, closeInstance) {
 
   const stats = history?.stats || {};
   const statItems = [
-    ['折溢价开盘', formatter.percent(stats.open, 3)],
+    ['首个记录时点', formatter.percent(stats.first ?? stats.open, 3)],
     ['最高', formatter.percent(stats.high, 3)],
     ['最低', formatter.percent(stats.low, 3)],
     ['均值', formatter.percent(stats.mean, 3)],
@@ -991,6 +991,8 @@ function renderIopvCharts(history, intradayInstance, closeInstance) {
   coverageNode.textContent = [
     current.label || '暂无',
     `${stats.sampleCount || 0} 个已记录时点`,
+    stats.firstTime ? `首条：${stats.firstTime}` : null,
+    stats.lastTime ? `末条：${stats.lastTime}` : null,
     current.source ? `来源：${current.source}` : null,
     current.dataTime ? `数据时间：${current.dataTime}` : null,
     history?.note || 'IOPV 缺失时不补零或推算。'

@@ -815,19 +815,27 @@ class MarketService {
     const stats = rates.length
       ? {
         open: rates[0],
+        first: rates[0],
         high: Math.max(...rates),
         low: Math.min(...rates),
         mean: rates.reduce((sum, value) => sum + value, 0) / rates.length,
         latest: rates.at(-1),
-        sampleCount: rates.length
+        sampleCount: rates.length,
+        firstTime: intraday[0]?.dataTime || null,
+        lastTime: intraday.at(-1)?.dataTime || null,
+        firstRecordLabel: '首个记录时点'
       }
       : {
         open: null,
+        first: null,
         high: null,
         low: null,
         mean: null,
         latest: null,
-        sampleCount: 0
+        sampleCount: 0,
+        firstTime: null,
+        lastTime: null,
+        firstRecordLabel: '首个记录时点'
       };
     const targetDates = latestTradeDate
       ? this.db.getRecentTradeDates(days, latestTradeDate)
