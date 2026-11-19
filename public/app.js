@@ -1887,8 +1887,8 @@ function renderSignalEventDetail(detail) {
       'p',
       '',
       detail.legacyComposite
-        ? `旧版规则同日为“护盘候选”：${(detail.legacySignals || []).map((signal) => signal.label).join('、')}`
-        : '旧版规则同日未标记“护盘候选”；历史信号记录保留。'
+        ? `旧版规则同日标记为“旧版护盘候选”（行为代理）：${(detail.legacySignals || []).map((signal) => signal.label).join('、')}`
+        : '旧版规则同日未标记“旧版护盘候选”；历史信号记录仅用于对照。'
     )
   );
   elements.drawerBody.append(legacy);
