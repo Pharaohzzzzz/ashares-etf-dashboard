@@ -14,7 +14,7 @@ if (-not $processes) {
 }
 
 foreach ($process in $processes) {
-  Stop-Process -Id $process.Id -Force
+  Stop-Process -Id $process.Id
 }
 
 Write-Output ('Stopped ETF dashboard processes: ' + $processes.Count)

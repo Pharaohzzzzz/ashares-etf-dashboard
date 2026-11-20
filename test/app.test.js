@@ -5,6 +5,8 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { createApp } = require('../server/app');
+const { createDatabase } = require('../server/db');
+const { MarketService } = require('../server/service');
 
 const summary = {
   generatedAt: '2026-11-20T08:00:00.000Z',
@@ -51,6 +53,8 @@ const summary = {
   logs: []
 };
 
+let refreshAllCalls = 0;
+
 const service = {
   initializedAt: '2026-11-20T07:00:00.000Z',
   initializing: false,
@@ -59,6 +63,10 @@ const service = {
     ? { quote: summary.etfs[0], bars: [{ date: '2026-11-19', open: 4, close: 4.06 }] }
     : null,
   refreshQuotes: async () => summary,
+  refreshAllData: async () => {
+    refreshAllCalls += 1;
+    return summary;
+  },
   getIntraday: async (code) => code === '510300' ? { code, points: [], tailVolumeShare: 0.1 } : null,
   getShareHistory: (code, days) => code === '510300'
     ? {
@@ -111,87 +119,30 @@ const service = {
       closeSampleCount: 1,
       coverage: { requestedDays: days, availableDays: 1, status: 'partial' }
     }
-    : null,
-  getBacktestSummary: async () => ({
-    parameterVersion: 'signal-score-v2.0.0',
-    run: { id: 7, generatedAt: '2026-11-20T08:00:00.000Z' },
-    parameters: { weights: { volume: 35 }, horizons: [1, 3, 5, 10] },
-    splits: {
-      train: {},
-      validation: {}
-    }
-  }),
-  getBacktestEvents: async (filters) => ({
-    runId: 7,
-    parameterVersion: 'signal-score-v2.0.0',
-    events: filters.code === '000000'
-      ? []
-      : filters.code === '588170'
-        ? [{
-          id: 12,
-          code: '588170',
-          name: '科创半导体ETF华夏',
-          category: '半导体',
-          date: '2026-11-19',
-          split: 'validation',
-          score: 63.8,
-          level: { key: 'active', label: '活跃异动' },
-          legacyComposite: false,
-          outcomes: { 5: {} }
-        }]
-        : [{
-          id: 11,
-          code: '510300',
-          name: '沪深300ETF华泰柏瑞',
-          category: '宽基核心',
-          date: '2026-10-15',
-          signalAvailableAt: '2026-10-15T15:00:00+08:00',
-          earliestEntryDate: '2026-10-16',
-          entryPriceMode: 'next_trading_day_open',
-          split: 'validation',
-          score: 72.5,
-          level: { key: 'active', label: '活跃异动' },
-          legacyComposite: true,
-          outcomes: {
-            5: {
-              futureReturn: 0.03,
-              zeroCostReturn: 0.032,
-              costDrag: 0.002,
-              drawdown: -0.02,
-              maxDrawdownMethod: 'entry_to_future_intraday_low',
-              entryPrice: 4.1,
-              exitDate: '2026-10-22',
-              maxFavorable: 0.04,
-              benchmarkReturn: 0.01,
-              outperformedBenchmark: true,
-              baselineHitRate: 0.48,
-              returnVsUnconditional: 0.012
-            }
-          }
-        }]
-  }),
-  getBacktestEvent: async (id) => Number(id) === 11
-    ? {
-      id: 11,
-      code: '510300',
-      date: '2026-10-15',
-      components: [{ key: 'volume', contribution: 20 }],
-      outcomes: { 5: { futureReturn: 0.03 } },
-      futurePath: { 5: [{ date: '2026-10-16', close: 4.2, relative: 0.01 }] }
-    }
     : null
 };
 
 test('summary, health, detail and CSV APIs respond', async (context) => {
-  const server = createApp({ service });
+  const server = createApp({
+    service,
+    runtimeVersion: { apiVersion: 3, buildId: 'test-build' }
+  });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   context.after(() => server.close());
   const base = `http://127.0.0.1:${server.address().port}`;
 
   const health = await fetch(`${base}/api/health`).then((response) => response.json());
   assert.equal(health.status, 'ok');
+  assert.equal(health.apiVersion, 3);
+  assert.equal(health.buildId, 'test-build');
   const list = await fetch(`${base}/api/summary`).then((response) => response.json());
   assert.equal(list.etfs[0].code, '510300');
+  assert.equal(list.apiVersion, 3);
+  assert.equal(list.buildId, 'test-build');
+  const refresh = await fetch(`${base}/api/refresh`, { method: 'POST' })
+    .then((response) => response.json());
+  assert.equal(refresh.apiVersion, 3);
+  assert.equal(refreshAllCalls, 1);
   const detail = await fetch(`${base}/api/etfs/510300`).then((response) => response.json());
   assert.equal(detail.bars.length, 1);
   const shareHistory = await fetch(`${base}/api/etfs/510300/share-history?days=20`)
@@ -232,49 +183,21 @@ test('summary, health, detail and CSV APIs respond', async (context) => {
   assert.match(iopvCsv, /折溢价率/);
   assert.match(iopvCsv, /交易所官方/);
 
-  const backtestSummary = await fetch(`${base}/api/backtests/summary`)
-    .then((response) => response.json());
-  assert.equal(backtestSummary.run.id, 7);
-  const backtestEvents = await fetch(`${base}/api/backtests/events?horizon=5&code=510300`)
-    .then((response) => response.json());
-  assert.equal(backtestEvents.events[0].score, 72.5);
-  const invalidHorizon = await fetch(`${base}/api/backtests/events?horizon=2`);
-  assert.equal(invalidHorizon.status, 400);
-  assert.equal((await invalidHorizon.json()).error.code, 'INVALID_HORIZON');
-  for (const [query, code] of [
-    ['?code=not-a-code', 'INVALID_CODE'],
-    ['?category=不存在', 'INVALID_CATEGORY'],
-    ['?level=unknown', 'INVALID_LEVEL'],
-    ['?from=2026-02-30', 'INVALID_DATE'],
-    ['?split=holdout', 'INVALID_SPLIT']
+  for (const path of [
+    '/api/backtests/summary',
+    '/api/backtests/events?horizon=5',
+    '/api/backtests/events/11'
   ]) {
-    const invalid = await fetch(`${base}/api/backtests/events${query}`);
-    assert.equal(invalid.status, 400);
-    assert.equal((await invalid.json()).error.code, code);
+    const removed = await fetch(`${base}${path}`);
+    assert.equal(removed.status, 404);
+    assert.equal((await removed.json()).error.code, 'NOT_FOUND');
   }
-  const signalEvent = await fetch(`${base}/api/backtests/events/11`)
-    .then((response) => response.json());
-  assert.equal(signalEvent.components[0].contribution, 20);
-  const missingSignalEvent = await fetch(`${base}/api/backtests/events/12`);
-  assert.equal(missingSignalEvent.status, 404);
-  assert.equal((await missingSignalEvent.json()).error.code, 'SIGNAL_EVENT_NOT_FOUND');
-  const backtestCsv = await fetch(`${base}/api/export.csv?type=backtest&horizon=5&code=510300`)
-    .then((response) => response.text());
-  assert.match(backtestCsv, /信号日期/);
-  assert.match(backtestCsv, /最早入场日/);
-  assert.match(backtestCsv, /零成本未来收益/);
-  assert.match(backtestCsv, /2026-10-16/);
-  assert.match(backtestCsv, /72.5/);
-  const missingOutcomeCsv = await fetch(`${base}/api/export.csv?type=backtest&horizon=5&code=588170`)
-    .then((response) => response.text());
-  assert.match(missingOutcomeCsv, /数据不足/);
-  assert.doesNotMatch(missingOutcomeCsv, /2026-11-19,验证期,63.8,活跃异动,5日,,,,,否/);
+  const removedBacktestCsv = await fetch(`${base}/api/export.csv?type=backtest&horizon=5`);
+  assert.equal(removedBacktestCsv.status, 400);
+  assert.equal((await removedBacktestCsv.json()).error.code, 'INVALID_CSV_TYPE');
   const invalidCsvType = await fetch(`${base}/api/export.csv?type=unknown`);
   assert.equal(invalidCsvType.status, 400);
   assert.equal((await invalidCsvType.json()).error.code, 'INVALID_CSV_TYPE');
-  const invalidCsvDate = await fetch(`${base}/api/export.csv?type=backtest&from=bad-date`);
-  assert.equal(invalidCsvDate.status, 400);
-  assert.equal((await invalidCsvDate.json()).error.code, 'INVALID_DATE');
 });
 
 test('overview copy distinguishes pending current shares from the latest official day', () => {
@@ -285,12 +208,47 @@ test('overview copy distinguishes pending current shares from the latest officia
   assert.match(html, /今日官方净申购/);
   assert.match(html, /最近完整评分日异动线索/);
   assert.match(html, /评分基于/);
+  assert.match(html, /异常资金评分/);
   assert.match(html, /交易所官方份额通常不是盘中逐秒数据/);
+  assert.doesNotMatch(html, /信号评估/);
+  assert.doesNotMatch(html, /evaluationView/);
+  assert.doesNotMatch(html, /backtest/);
   assert.match(client, /待官方发布/);
   assert.match(client, /评分基于/);
   assert.match(client, /行情快照份额/);
   assert.match(client, /当前官方份额/);
   assert.match(client, /最近官方日/);
+  assert.doesNotMatch(client, /信号评估/);
+  assert.doesNotMatch(client, /backtest/);
+  assert.doesNotMatch(client, /evaluationView/);
+});
+
+test('frontend treats a missing or mismatched API contract as an outdated backend', () => {
+  const client = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
+  assert.match(client, /EXPECTED_API_VERSION/);
+  assert.match(client, /后台版本过旧/);
+  assert.match(client, /官方份额同步状态/);
+});
+
+test('detail keeps current IOPV premium while removing the historical premium chart', () => {
+  const root = path.join(__dirname, '..');
+  const client = fs.readFileSync(path.join(root, 'public', 'app.js'), 'utf8');
+  const styles = fs.readFileSync(path.join(root, 'public', 'styles.css'), 'utf8');
+
+  assert.match(client, /const iopv = detail\.iopvHistory/);
+  assert.match(client, /当日市场价与 IOPV/);
+  assert.match(client, /iopvIntradayChart/);
+  assert.match(client, /导出折溢价历史 CSV/);
+  assert.match(client, /当日暂无有效市场价与 IOPV 配对样本/);
+
+  assert.doesNotMatch(client, /收盘折溢价历史分位与近期趋势/);
+  assert.doesNotMatch(client, /收盘折溢价分位/);
+  assert.doesNotMatch(client, /最近收盘折溢价/);
+  assert.doesNotMatch(client, /历史有效样本/);
+  assert.doesNotMatch(client, /近期趋势/);
+  assert.doesNotMatch(client, /iopvHistory(?:Stats|Chart|Note)/);
+  assert.doesNotMatch(client, /buildIopvCloseOption/);
+  assert.doesNotMatch(styles, /\.iopv-history-stats/);
 });
 
 test('local application assets are served without stale caching', async (context) => {
@@ -327,4 +285,132 @@ test('internal errors are logged without exposing stack or messages', async (con
   assert.equal(body.error.message, '服务内部错误');
   assert.doesNotMatch(JSON.stringify(body), /secret internal path/);
   assert.match(logged[0], /secret internal path/);
+});
+
+test('catalog management APIs drive summary, detail and CSV visibility', async (context) => {
+  const db = createDatabase(':memory:');
+  context.after(() => db.close());
+  db.removeEtf('510050');
+  const marketService = new MarketService({
+    db,
+    etfLookupProvider: async (code) => ({
+      code,
+      name: `测试ETF${code}`,
+      market: code.startsWith('5') ? 1 : 0,
+      exchange: code.startsWith('5') ? '上交所' : '深交所',
+      securityType: '基金'
+    }),
+    now: () => new Date('2026-11-20T08:00:00.000Z')
+  });
+  let backfillCode = null;
+  marketService.backfillEtf = async (code) => {
+    backfillCode = code;
+    return marketService.getSummary();
+  };
+  const server = createApp({
+    service: marketService,
+    runtimeVersion: { apiVersion: 3, buildId: 'catalog-test' }
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  context.after(() => server.close());
+  const base = `http://127.0.0.1:${server.address().port}`;
+
+  const state = await fetch(`${base}/api/etfs/manage`).then((response) => response.json());
+  assert.equal(state.capacity, 30);
+  assert.equal(state.enabledCount, 13);
+  assert.equal(state.removed.some((etf) => etf.code === '510050'), true);
+
+  const invalid = await fetch(`${base}/api/etfs`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code: '51050', category: '测试', tone: 'broad' })
+  });
+  assert.equal(invalid.status, 400);
+  assert.equal((await invalid.json()).error.code, 'INVALID_CODE');
+
+  const addedResponse = await fetch(`${base}/api/etfs`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code: '159999', category: '测试分类', tone: 'tech' })
+  });
+  assert.equal(addedResponse.status, 201);
+  const added = await addedResponse.json();
+  assert.equal(added.etf.code, '159999');
+  assert.equal(added.etf.isPinned, false);
+  assert.equal(added.summary.etfs.some((etf) => etf.code === '159999'), true);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(backfillCode, '159999');
+
+  const editedResponse = await fetch(`${base}/api/etfs/159999`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      category: '科技测试',
+      tone: 'finance',
+      isPinned: true,
+      isHighlighted: true
+    })
+  });
+  assert.equal(editedResponse.status, 200);
+  const edited = await editedResponse.json();
+  assert.equal(edited.etf.isPinned, true);
+  assert.equal(edited.etf.isHighlighted, true);
+
+  const beforeOrder = marketService.getSummary().etfs;
+  const pinned = beforeOrder.filter((etf) => etf.isPinned).map((etf) => etf.code).reverse();
+  const normal = beforeOrder.filter((etf) => !etf.isPinned).map((etf) => etf.code).reverse();
+  const orderResponse = await fetch(`${base}/api/etfs/order`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ pinnedCodes: pinned, normalCodes: normal })
+  });
+  assert.equal(orderResponse.status, 200);
+  assert.equal((await orderResponse.clone().json()).apiVersion, 3);
+  assert.deepEqual(
+    marketService.getSummary().etfs.filter((etf) => etf.isPinned).map((etf) => etf.code),
+    pinned
+  );
+
+  const missingConfirmation = await fetch(`${base}/api/etfs/510300`, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({})
+  });
+  assert.equal(missingConfirmation.status, 400);
+  assert.equal((await missingConfirmation.json()).error.code, 'CONFIRMATION_REQUIRED');
+  const removedResponse = await fetch(`${base}/api/etfs/510300`, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ confirm: true })
+  });
+  assert.equal(removedResponse.status, 200);
+  assert.equal((await removedResponse.json()).summary.etfs.some((etf) => etf.code === '510300'), false);
+
+  const removedDetail = await fetch(`${base}/api/etfs/510300`);
+  assert.equal(removedDetail.status, 400);
+  const removedCsv = await fetch(`${base}/api/export.csv?code=510300&type=daily`);
+  assert.equal(removedCsv.status, 400);
+
+  const restoredResponse = await fetch(`${base}/api/etfs/510300/restore`, {
+    method: 'POST'
+  });
+  assert.equal(restoredResponse.status, 200);
+  const restored = await restoredResponse.json();
+  assert.equal(restored.etf.enabled, true);
+  assert.equal(restored.etf.isPinned, false);
+
+  const csv = await fetch(`${base}/api/export.csv`).then((response) => response.text());
+  assert.match(csv, /510300/);
+  assert.doesNotMatch(csv, /510050/);
+  assert.match(csv, /近5日累计估算净申赎/);
+  assert.match(csv, /近20日累计估算净申赎/);
+  assert.match(csv, /20日波动率/);
+  assert.match(csv, /估算基金规模/);
+
+  const restoredOrder = await fetch(`${base}/api/etfs/order/restore`, { method: 'POST' });
+  assert.equal(restoredOrder.status, 200);
+  assert.deepEqual(
+    marketService.getSummary().etfs.slice(0, 2).map((etf) => etf.code),
+    ['159915', '159516']
+  );
 });

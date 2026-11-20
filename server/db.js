@@ -3,7 +3,10 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
-const { ETFS } = require('../config/etfs');
+const {
+  ETFS,
+  INITIAL_FOCUS
+} = require('../config/etfs');
 
 function ensureColumn(db, table, column, definition) {
   const exists = db.prepare(`PRAGMA table_info(${table})`).all()
@@ -80,7 +83,10 @@ function createDatabase(filePath) {
       name TEXT NOT NULL,
       category TEXT NOT NULL,
       tone TEXT NOT NULL,
-      enabled INTEGER NOT NULL DEFAULT 1
+      enabled INTEGER NOT NULL DEFAULT 1,
+      is_pinned INTEGER NOT NULL DEFAULT 0,
+      is_highlighted INTEGER NOT NULL DEFAULT 0,
+      sort_order INTEGER NOT NULL DEFAULT 1000
     );
 
     CREATE TABLE IF NOT EXISTS daily_bars (
@@ -232,40 +238,6 @@ function createDatabase(filePath) {
       PRIMARY KEY (code, source)
     );
 
-    CREATE TABLE IF NOT EXISTS backtest_runs (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      parameter_version TEXT NOT NULL,
-      dataset_fingerprint TEXT NOT NULL,
-      parameters_json TEXT NOT NULL,
-      train_start TEXT,
-      train_end TEXT,
-      validation_start TEXT,
-      validation_end TEXT,
-      status TEXT NOT NULL,
-      result_json TEXT NOT NULL,
-      generated_at TEXT NOT NULL,
-      UNIQUE(parameter_version, dataset_fingerprint)
-    );
-
-    CREATE TABLE IF NOT EXISTS signal_events (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      run_id INTEGER NOT NULL,
-      code TEXT NOT NULL,
-      signal_date TEXT NOT NULL,
-      split_name TEXT NOT NULL,
-      score REAL NOT NULL,
-      level_key TEXT NOT NULL,
-      level_label TEXT NOT NULL,
-      components_json TEXT NOT NULL,
-      reasons_json TEXT NOT NULL,
-      outcomes_json TEXT NOT NULL,
-      future_path_json TEXT NOT NULL,
-      legacy_composite INTEGER NOT NULL DEFAULT 0,
-      legacy_signals_json TEXT NOT NULL,
-      FOREIGN KEY(run_id) REFERENCES backtest_runs(id) ON DELETE CASCADE,
-      UNIQUE(run_id, code, signal_date)
-    );
-
     CREATE INDEX IF NOT EXISTS idx_snapshots_latest ON snapshots(code, captured_at DESC);
     CREATE INDEX IF NOT EXISTS idx_bars_code_date ON daily_bars(code, date);
     CREATE INDEX IF NOT EXISTS idx_share_history_code_date ON share_history(code, trade_date DESC);
@@ -275,25 +247,23 @@ function createDatabase(filePath) {
       ON iopv_samples(code, data_time DESC);
     CREATE INDEX IF NOT EXISTS idx_iopv_samples_code_trade_date
       ON iopv_samples(code, trade_date DESC, data_time DESC);
-    CREATE INDEX IF NOT EXISTS idx_backtest_runs_generated
-      ON backtest_runs(generated_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_signal_events_run_date
-      ON signal_events(run_id, signal_date DESC);
-    CREATE INDEX IF NOT EXISTS idx_signal_events_run_code
-      ON signal_events(run_id, code, signal_date DESC);
     CREATE INDEX IF NOT EXISTS idx_trading_calendar_trading
       ON trading_calendar(is_trading, trade_date);
+  `);
+  db.exec(`
+    DROP TABLE IF EXISTS signal_events;
+    DROP TABLE IF EXISTS backtest_runs;
   `);
 
   ensureColumn(db, 'share_history', 'official_fetched_at', 'TEXT');
   ensureColumn(db, 'share_history', 'snapshot_fetched_at', 'TEXT');
+  ensureColumn(db, 'etfs', 'is_pinned', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn(db, 'etfs', 'is_highlighted', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn(db, 'etfs', 'sort_order', 'INTEGER NOT NULL DEFAULT 1000');
   ensureColumn(db, 'official_share_sync_dates', 'expected_count', 'INTEGER');
   ensureColumn(db, 'official_share_sync_dates', 'actual_count', 'INTEGER');
   ensureColumn(db, 'official_share_sync_dates', 'expected_codes_json', 'TEXT');
   ensureColumn(db, 'official_share_sync_dates', 'written_codes_json', 'TEXT');
-  ensureColumn(db, 'signal_events', 'signal_available_at', 'TEXT');
-  ensureColumn(db, 'signal_events', 'earliest_entry_date', 'TEXT');
-  ensureColumn(db, 'signal_events', 'entry_price_mode', 'TEXT');
   db.exec(`
     UPDATE share_history
     SET official_fetched_at = fetched_at
@@ -307,19 +277,213 @@ function createDatabase(filePath) {
   `);
 
   const insertEtf = db.prepare(`
-    INSERT INTO etfs(code, name, category, tone)
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT(code) DO UPDATE SET
-      name = excluded.name,
-      category = excluded.category,
-      tone = excluded.tone,
-      enabled = 1
+    INSERT INTO etfs(code, name, category, tone, sort_order)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(code) DO NOTHING
   `);
-  for (const etf of ETFS) insertEtf.run(etf.code, etf.name, etf.category, etf.tone);
+  ETFS.forEach((etf, index) => {
+    insertEtf.run(etf.code, etf.name, etf.category, etf.tone, 100 + index * 10);
+  });
+
+  const catalogLayoutVersion = '1';
+  if (db.prepare('SELECT value FROM app_meta WHERE key = ?')
+    .get('etfCatalogLayoutMigrated')?.value !== catalogLayoutVersion) {
+    db.exec('BEGIN');
+    try {
+      db.prepare(`
+        UPDATE etfs
+        SET is_pinned = 0, is_highlighted = 0
+      `).run();
+      ETFS.forEach((etf, index) => {
+        db.prepare(`
+          UPDATE etfs
+          SET sort_order = ?
+          WHERE code = ?
+        `).run(100 + index * 10, etf.code);
+      });
+      for (const focus of INITIAL_FOCUS) {
+        db.prepare(`
+          UPDATE etfs
+          SET is_pinned = 1, is_highlighted = 1, sort_order = ?
+          WHERE code = ?
+        `).run(focus.sortOrder, focus.code);
+      }
+      db.prepare(`
+        INSERT INTO app_meta(key, value) VALUES ('etfCatalogLayoutMigrated', ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+      `).run(catalogLayoutVersion);
+      db.exec('COMMIT');
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
+  }
 
   return {
     raw: db,
     close: () => db.close(),
+    getEtfs({ enabled = true } = {}) {
+      const rows = db.prepare(`
+        SELECT code, name, category, tone, enabled, is_pinned, is_highlighted, sort_order
+        FROM etfs
+        ${enabled === null ? '' : 'WHERE enabled = ?'}
+        ORDER BY is_pinned DESC, sort_order ASC, code ASC
+      `).all(...(enabled === null ? [] : [enabled ? 1 : 0]));
+      return rows.map(mapEtfConfig);
+    },
+    getEtfConfig(code) {
+      const row = db.prepare(`
+        SELECT code, name, category, tone, enabled, is_pinned, is_highlighted, sort_order
+        FROM etfs
+        WHERE code = ?
+      `).get(code);
+      return row ? mapEtfConfig(row) : null;
+    },
+    countEnabledEtfs() {
+      return db.prepare('SELECT COUNT(*) AS count FROM etfs WHERE enabled = 1').get().count;
+    },
+    addEtf({ code, name, category, tone, isPinned = false, isHighlighted = false }) {
+      const nextOrder = db.prepare(`
+        SELECT COALESCE(MAX(sort_order), 1000) + 10 AS nextOrder
+        FROM etfs
+        WHERE enabled = 1 AND is_pinned = ?
+      `).get(isPinned ? 1 : 0).nextOrder;
+      db.prepare(`
+        INSERT INTO etfs(
+          code, name, category, tone, enabled, is_pinned, is_highlighted, sort_order
+        ) VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+      `).run(
+        code,
+        name,
+        category,
+        tone,
+        isPinned ? 1 : 0,
+        isHighlighted ? 1 : 0,
+        nextOrder
+      );
+      return this.getEtfConfig(code);
+    },
+    updateEtf(code, updates) {
+      const current = this.getEtfConfig(code);
+      if (!current) return null;
+      const next = {
+        name: updates.name ?? current.name,
+        category: updates.category ?? current.category,
+        tone: updates.tone ?? current.tone,
+        isPinned: updates.isPinned ?? current.isPinned,
+        isHighlighted: updates.isHighlighted ?? current.isHighlighted,
+        sortOrder: current.sortOrder
+      };
+      if (next.isPinned !== current.isPinned) {
+        next.sortOrder = db.prepare(`
+          SELECT COALESCE(MAX(sort_order), 1000) + 10 AS nextOrder
+          FROM etfs
+          WHERE enabled = 1 AND is_pinned = ?
+        `).get(next.isPinned ? 1 : 0).nextOrder;
+      }
+      db.prepare(`
+        UPDATE etfs
+        SET name = ?, category = ?, tone = ?,
+            is_pinned = ?, is_highlighted = ?, sort_order = ?
+        WHERE code = ?
+      `).run(
+        next.name,
+        next.category,
+        next.tone,
+        next.isPinned ? 1 : 0,
+        next.isHighlighted ? 1 : 0,
+        next.sortOrder,
+        code
+      );
+      return this.getEtfConfig(code);
+    },
+    removeEtf(code) {
+      const result = db.prepare(`
+        UPDATE etfs
+        SET enabled = 0, is_pinned = 0, is_highlighted = 0
+        WHERE code = ?
+      `).run(code);
+      return result.changes ? this.getEtfConfig(code) : null;
+    },
+    restoreEtf(code) {
+      const current = this.getEtfConfig(code);
+      if (!current) return null;
+      const nextOrder = db.prepare(`
+        SELECT COALESCE(MAX(sort_order), 1000) + 10 AS nextOrder
+        FROM etfs
+        WHERE enabled = 1 AND is_pinned = 0
+      `).get().nextOrder;
+      db.prepare(`
+        UPDATE etfs
+        SET enabled = 1, is_pinned = 0, is_highlighted = 0, sort_order = ?
+        WHERE code = ?
+      `).run(nextOrder, code);
+      return this.getEtfConfig(code);
+    },
+    saveEtfOrder({ pinnedCodes = [], normalCodes = [] }) {
+      const enabledCodes = this.getEtfs().map((etf) => etf.code);
+      const orderedCodes = [...pinnedCodes, ...normalCodes];
+      const uniqueCodes = new Set(orderedCodes);
+      if (
+        uniqueCodes.size !== orderedCodes.length ||
+        orderedCodes.length !== enabledCodes.length ||
+        enabledCodes.some((code) => !uniqueCodes.has(code))
+      ) {
+        throw new Error('排序必须覆盖当前监控中的全部 ETF，且不能重复');
+      }
+      const statement = db.prepare(`
+        UPDATE etfs
+        SET is_pinned = ?, sort_order = ?
+        WHERE code = ? AND enabled = 1
+      `);
+      db.exec('BEGIN');
+      try {
+        pinnedCodes.forEach((code, index) => statement.run(1, (index + 1) * 10, code));
+        normalCodes.forEach((code, index) => statement.run(0, 1000 + index * 10, code));
+        db.exec('COMMIT');
+      } catch (error) {
+        db.exec('ROLLBACK');
+        throw error;
+      }
+      return this.getEtfs();
+    },
+    restoreEtfOrder() {
+      const enabled = this.getEtfs();
+      const custom = enabled
+        .filter((etf) => !ETFS.some((item) => item.code === etf.code))
+        .sort((left, right) => left.sortOrder - right.sortOrder);
+      const ordered = [
+        ...ETFS
+          .map((etf) => enabled.find((item) => item.code === etf.code))
+          .filter(Boolean),
+        ...custom
+      ];
+      const pinnedCodes = INITIAL_FOCUS.map((item) => item.code)
+        .filter((code) => ordered.some((etf) => etf.code === code));
+      const normalCodes = ordered
+        .map((etf) => etf.code)
+        .filter((code) => !pinnedCodes.includes(code));
+      const statement = db.prepare(`
+        UPDATE etfs
+        SET is_pinned = ?, is_highlighted = ?, sort_order = ?
+        WHERE code = ? AND enabled = 1
+      `);
+      db.exec('BEGIN');
+      try {
+        pinnedCodes.forEach((code, index) => {
+          statement.run(1, INITIAL_FOCUS.some((item) => item.code === code) ? 1 : 0,
+            (index + 1) * 10, code);
+        });
+        normalCodes.forEach((code, index) => {
+          statement.run(0, 0, 1000 + index * 10, code);
+        });
+        db.exec('COMMIT');
+      } catch (error) {
+        db.exec('ROLLBACK');
+        throw error;
+      }
+      return this.getEtfs();
+    },
     upsertBars(code, bars) {
       const statement = db.prepare(`
         INSERT INTO daily_bars(
@@ -752,7 +916,8 @@ function createDatabase(filePath) {
         .filter((entry) => (
           entry.tradeDate === tradeDate &&
           expected.includes(entry.code) &&
-          Number.isFinite(entry.shares)
+          Number.isFinite(entry.shares) &&
+          entry.shares > 0
         ))
         .map((entry) => [entry.code, entry]));
       const statement = db.prepare(shareUpsertSql());
@@ -808,11 +973,7 @@ function createDatabase(filePath) {
     }) {
       const expected = [...new Set(expectedCodes)];
       const actualCodes = this.getActualOfficialShareCodes(tradeDate, expected);
-      const status = !actualCodes.length
-        ? 'pending'
-        : actualCodes.length === expected.length
-          ? 'success'
-          : 'partial';
+      const status = 'error';
       db.prepare(`
         INSERT INTO official_share_sync_dates(
           exchange, trade_date, status, message, fetched_at,
@@ -892,130 +1053,6 @@ function createDatabase(filePath) {
         'SELECT scope, status, message, created_at AS createdAt FROM update_log ORDER BY id DESC LIMIT ?'
       ).all(limit);
     },
-    getBacktestRun(parameterVersion, datasetFingerprint) {
-      const row = db.prepare(`
-        SELECT *
-        FROM backtest_runs
-        WHERE parameter_version = ? AND dataset_fingerprint = ?
-      `).get(parameterVersion, datasetFingerprint);
-      return row ? parseBacktestRun(row) : null;
-    },
-    saveBacktestRun(run, events) {
-      const insertRun = db.prepare(`
-        INSERT INTO backtest_runs(
-          parameter_version, dataset_fingerprint, parameters_json,
-          train_start, train_end, validation_start, validation_end,
-          status, result_json, generated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
-      const insertEvent = db.prepare(`
-        INSERT INTO signal_events(
-          run_id, code, signal_date, split_name, score, level_key, level_label,
-          components_json, reasons_json, outcomes_json, future_path_json,
-          legacy_composite, legacy_signals_json,
-          signal_available_at, earliest_entry_date, entry_price_mode
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
-      const {
-        events: ignoredEvents,
-        parameterVersion,
-        datasetFingerprint,
-        parameters,
-        window,
-        generatedAt,
-        ...result
-      } = run;
-      db.exec('BEGIN');
-      try {
-        const runResult = insertRun.run(
-          parameterVersion,
-          datasetFingerprint,
-          JSON.stringify(parameters),
-          window.trainStart,
-          window.trainEnd,
-          window.validationStart,
-          window.validationEnd,
-          'complete',
-          JSON.stringify(result),
-          generatedAt
-        );
-        const runId = Number(runResult.lastInsertRowid);
-        for (const event of events) {
-          insertEvent.run(
-            runId,
-            event.code,
-            event.date,
-            event.split,
-            event.score,
-            event.level.key,
-            event.level.label,
-            JSON.stringify(event.components),
-            JSON.stringify(event.reasons),
-            JSON.stringify(event.outcomes),
-            JSON.stringify(event.futurePath),
-            event.legacyComposite ? 1 : 0,
-            JSON.stringify(event.legacySignals),
-            event.signalAvailableAt ?? null,
-            event.earliestEntryDate ?? null,
-            event.entryPriceMode ?? null
-          );
-        }
-        db.exec('COMMIT');
-        return runId;
-      } catch (error) {
-        db.exec('ROLLBACK');
-        throw error;
-      }
-    },
-    getSignalEvents(runId, filters = {}) {
-      const conditions = ['e.run_id = ?'];
-      const values = [runId];
-      if (filters.code) {
-        conditions.push('e.code = ?');
-        values.push(filters.code);
-      }
-      if (filters.category) {
-        conditions.push('f.category = ?');
-        values.push(filters.category);
-      }
-      if (filters.level) {
-        conditions.push('e.level_key = ?');
-        values.push(filters.level);
-      }
-      if (filters.split) {
-        conditions.push('e.split_name = ?');
-        values.push(filters.split);
-      }
-      if (filters.from) {
-        conditions.push('e.signal_date >= ?');
-        values.push(filters.from);
-      }
-      if (filters.to) {
-        conditions.push('e.signal_date <= ?');
-        values.push(filters.to);
-      }
-      return db.prepare(`
-        SELECT e.*, f.name, f.category
-        FROM signal_events e
-        JOIN etfs f ON f.code = e.code
-        WHERE ${conditions.join(' AND ')}
-        ORDER BY e.signal_date DESC, e.score DESC, e.code ASC
-      `).all(...values).map(parseSignalEvent);
-    },
-    getSignalEvent(id) {
-      const row = db.prepare(`
-        SELECT e.*, f.name, f.category
-        FROM signal_events e
-        JOIN etfs f ON f.code = e.code
-        WHERE e.id = ?
-      `).get(id);
-      return row ? parseSignalEvent(row) : null;
-    },
-    countSignalEvents(runId) {
-      return db.prepare(
-        'SELECT COUNT(*) AS count FROM signal_events WHERE run_id = ?'
-      ).get(runId).count;
-    },
     getMeta(key) {
       return db.prepare('SELECT value FROM app_meta WHERE key = ?').get(key)?.value ?? null;
     },
@@ -1079,8 +1116,7 @@ function createDatabase(filePath) {
           FROM share_history
           WHERE source IN ('上交所', '深交所', 'SSE', 'SZSE')
         `).get().date || null,
-        iopvDate: db.prepare('SELECT MAX(trade_date) AS date FROM iopv_latest').get().date || null,
-        backtestDate: db.prepare('SELECT MAX(signal_date) AS date FROM signal_events').get().date || null
+        iopvDate: db.prepare('SELECT MAX(trade_date) AS date FROM iopv_latest').get().date || null
       };
     },
     getEtfDataDates(code) {
@@ -1199,43 +1235,16 @@ function createDatabase(filePath) {
 
 module.exports = { createDatabase };
 
-function parseBacktestRun(row) {
+function mapEtfConfig(row) {
   return {
-    id: row.id,
-    parameterVersion: row.parameter_version,
-    datasetFingerprint: row.dataset_fingerprint,
-    parameters: JSON.parse(row.parameters_json),
-    trainStart: row.train_start,
-    trainEnd: row.train_end,
-    validationStart: row.validation_start,
-    validationEnd: row.validation_end,
-    status: row.status,
-    generatedAt: row.generated_at,
-    result: JSON.parse(row.result_json)
-  };
-}
-
-function parseSignalEvent(row) {
-  return {
-    id: row.id,
-    runId: row.run_id,
     code: row.code,
     name: row.name,
     category: row.category,
-    date: row.signal_date,
-    signalDate: row.signal_date,
-    signalAvailableAt: row.signal_available_at || null,
-    earliestEntryDate: row.earliest_entry_date || null,
-    entryPriceMode: row.entry_price_mode || null,
-    split: row.split_name,
-    score: row.score,
-    level: { key: row.level_key, label: row.level_label },
-    components: JSON.parse(row.components_json),
-    reasons: JSON.parse(row.reasons_json),
-    outcomes: JSON.parse(row.outcomes_json),
-    futurePath: JSON.parse(row.future_path_json),
-    legacyComposite: Boolean(row.legacy_composite),
-    legacySignals: JSON.parse(row.legacy_signals_json)
+    tone: row.tone,
+    enabled: row.enabled === 1,
+    isPinned: row.is_pinned === 1,
+    isHighlighted: row.is_highlighted === 1,
+    sortOrder: row.sort_order
   };
 }
 

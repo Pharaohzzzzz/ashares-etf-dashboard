@@ -8,6 +8,7 @@ const QUOTE_HOSTS = [
   'https://push2delay.eastmoney.com'
 ];
 const HISTORY_HOST = 'https://push2his.eastmoney.com';
+const SEARCH_HOST = 'https://searchadapter.eastmoney.com';
 
 function parseOptionalNumber(value, { nonNegative = false } = {}) {
   if (value === null || value === undefined) return null;
@@ -85,6 +86,35 @@ async function fetchQuote(etf) {
   throw lastError;
 }
 
+async function lookupEtf(code) {
+  const url = `${SEARCH_HOST}/api/suggest/get?input=${encodeURIComponent(code)}&type=14&count=20`;
+  const response = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+      Referer: 'https://quote.eastmoney.com/',
+      Accept: 'application/json,text/plain,*/*'
+    },
+    signal: AbortSignal.timeout(8000)
+  });
+  if (!response.ok) throw new Error(`ETF 查询接口 HTTP ${response.status}`);
+  const body = await response.json();
+  const rows = body?.QuotationCodeTable?.Data;
+  const candidates = Array.isArray(rows) ? rows : rows ? [rows] : [];
+  const match = candidates.find((row) => (
+    row.Code === code &&
+    ['1', '0'].includes(String(row.MktNum)) &&
+    row.QuoteID
+  ));
+  if (!match) return null;
+  return {
+    code: match.Code,
+    name: match.Name,
+    market: Number(match.MktNum),
+    exchange: Number(match.MktNum) === 1 ? '上交所' : '深交所',
+    securityType: match.SecurityTypeName || '基金'
+  };
+}
+
 function parseKlines(etf, data) {
   return (data.klines || []).map((row) => {
     const [date, open, close, high, low, volume, amount, amplitude, pctChange, change, turnoverRate] =
@@ -139,6 +169,7 @@ module.exports = {
   fetchJson,
   parseQuote,
   fetchQuote,
+  lookupEtf,
   parseKlines,
   fetchKlines,
   parseTrends,

@@ -2,7 +2,11 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { shanghaiClock, isTradingSession } = require('../server/scheduler');
+const {
+  shanghaiClock,
+  isTradingSession,
+  createScheduler
+} = require('../server/scheduler');
 
 test('Shanghai clock and trading sessions use China market hours', () => {
   assert.equal(shanghaiClock(new Date('2026-11-20T01:31:00.000Z')).time, '09:31:00');
@@ -22,4 +26,29 @@ test('official closed days and unknown calendars are not trading sessions', () =
     known: false,
     isTradingDay: false
   }), false);
+});
+
+test('scheduler invokes official share recovery after the daily refresh', async () => {
+  const calls = [];
+  const service = {
+    ensureTradingCalendar: async () => {},
+    getTradingCalendarStatus: () => ({
+      known: true,
+      isTradingDay: true
+    }),
+    refreshQuotes: async () => calls.push('quotes'),
+    syncHistory: async () => calls.push('history'),
+    retryPendingOfficialShares: async () => {
+      calls.push('shares');
+      return { completedDates: ['2026-11-20'] };
+    }
+  };
+  const scheduler = createScheduler(service, {
+    now: () => new Date('2026-11-20T10:30:00.000Z'),
+    intervalMs: 60 * 60 * 1000,
+    log: () => {}
+  });
+  await scheduler.runCheck();
+  scheduler.stop();
+  assert.equal(calls.at(-1), 'shares');
 });

@@ -130,6 +130,36 @@ test('summary calculates ratio, returns, shares and a broad resonance candidate'
   db.close();
 });
 
+test('summary keeps the anomaly score and level after evaluation removal', () => {
+  const db = createDatabase(':memory:');
+  const bars = createConsecutiveBars(31);
+  bars.at(-1).amount = 300;
+  db.upsertBars('510300', bars);
+  db.saveSnapshot({
+    code: '510300', price: 4.2, previousClose: 4.1, change: 0.1,
+    changePercent: 2, open: 4.1, high: 4.2, low: 4, volume: 300,
+    amount: 300, turnoverRate: 3, shares: 1300, marketValue: 5460,
+    timestamp: 1795114800
+  }, bars.at(-1).date, '2026-11-20T07:00:00.000Z');
+  db.saveShareHistory(bars.map((bar, index) => ({
+    code: '510300',
+    tradeDate: bar.date,
+    shares: 100000 + index * 100,
+    source: '上交所'
+  })), '2026-11-20T08:00:00.000Z');
+  const service = new MarketService({
+    db,
+    now: () => new Date('2026-11-20T08:00:00.000Z')
+  });
+
+  const row = service.getSummary().etfs.find((etf) => etf.code === '510300');
+  assert.equal(row.scoreStatus, 'ready');
+  assert.ok(Number.isFinite(row.score));
+  assert.match(row.scoreLevel.label, /观察|活跃异动|高强度异动/);
+  assert.equal(row.scoreComponents.length, 4);
+  db.close();
+});
+
 test('summary excludes missing amounts from totals while preserving valid zero', () => {
   const db = createDatabase(':memory:');
   const quote = {
@@ -672,6 +702,175 @@ test('a later official share sync turns the same pending date ready without rest
   db.close();
 });
 
+test('manual refresh triggers official share gap recovery after quotes', async () => {
+  const db = createDatabase(':memory:');
+  const bars = createBarsEnding('2026-11-20', 2);
+  for (const etf of ETFS) db.upsertBars(etf.code, bars);
+  db.saveShareHistory([
+    { code: '510300', tradeDate: '2026-11-19', shares: 1000000, source: '上交所' }
+  ], '2026-11-20T00:00:00.000Z');
+  const sseEtfs = ETFS.filter((etf) => etf.code.startsWith('5'));
+  const szseEtfs = ETFS.filter((etf) => etf.code.startsWith('1'));
+  const shareCalls = [];
+  let quoteCalls = 0;
+  const service = new MarketService({
+    db,
+    quoteProvider: async (etf) => {
+      quoteCalls += 1;
+      return {
+        code: etf.code, price: 4.2, previousClose: 4.1, change: 0.1,
+        changePercent: 2, open: 4.1, high: 4.2, low: 4.0, volume: 100,
+        amount: 100, turnoverRate: 1, shares: 1000001, marketValue: 4000,
+        timestamp: Date.parse('2026-11-20T07:00:00.000Z') / 1000
+      };
+    },
+    sseShareProvider: async (date) => {
+      shareCalls.push(`SSE:${date}`);
+      return new Map(sseEtfs.map((etf) => [
+        etf.code,
+        etf.code === '510300' && date === '2026-11-20' ? 1200000 : 1000000
+      ]));
+    },
+    szseShareProvider: async (codes, date) => {
+      shareCalls.push(`SZSE:${date}`);
+      return new Map(codes.map((code) => [code, 1000000]));
+    },
+    officialIopvProvider: mockOfficialIopv,
+    supplementaryIopvProvider: mockSupplementaryIopv,
+    now: () => new Date('2026-11-20T10:00:00.000Z')
+  });
+
+  const summary = await service.refreshAllData();
+  const row = summary.etfs.find((etf) => etf.code === '510300');
+  assert.equal(quoteCalls, ETFS.length);
+  assert.ok(shareCalls.includes('SSE:2026-11-20'));
+  assert.ok(shareCalls.includes('SZSE:2026-11-20'));
+  assert.equal(row.shareMetricStatus, 'ready');
+  assert.equal(row.shares, 1200000);
+  db.close();
+});
+
+test('official share sync status distinguishes waiting, failure and history gaps', async () => {
+  const db = createDatabase(':memory:');
+  const bars = createBarsEnding('2026-11-20', 2);
+  for (const etf of ETFS) db.upsertBars(etf.code, bars);
+  db.saveSnapshot({
+    code: '510300', price: 4.2, previousClose: 4.1, change: 0.1,
+    changePercent: 2, open: 4.1, high: 4.2, low: 4.0, volume: 100,
+    amount: 100, turnoverRate: 1, shares: 1000001, marketValue: 4000,
+    timestamp: Date.parse('2026-11-20T07:00:00.000Z') / 1000
+  }, '2026-11-20', '2026-11-20T07:00:00.000Z');
+  let mode = 'empty';
+  const service = new MarketService({
+    db,
+    sseShareProvider: async () => {
+      if (mode === 'error') throw new Error('mock exchange timeout');
+      return new Map();
+    },
+    szseShareProvider: async () => new Map(),
+    now: () => new Date('2026-11-20T10:00:00.000Z')
+  });
+
+  await service.syncOfficialShareHistory('2026-11-20', { historyDays: 1 });
+  let status = service.getOfficialShareSyncStatus();
+  assert.equal(status.state, 'waiting');
+  assert.equal(status.targetDate, '2026-11-20');
+  assert.equal(status.exchanges.SSE.actualCount, 0);
+  assert.ok(status.lastAttemptAt);
+  assert.ok(status.nextRetryAt);
+  assert.match(status.message, /等待.*重试/);
+  assert.equal(db.getSyncTask('shares').status, 'pending');
+
+  mode = 'error';
+  await service.syncOfficialShareHistory('2026-11-20', { historyDays: 1 });
+  status = service.getOfficialShareSyncStatus();
+  assert.equal(status.state, 'failed');
+  assert.equal(status.exchanges.SSE.status, 'failed');
+  assert.match(status.exchanges.SSE.message, /timeout/);
+  assert.equal(db.getSyncTask('shares').status, 'error');
+
+  const sseCodes = ETFS.filter((etf) => etf.code.startsWith('5')).map((etf) => etf.code);
+  const szseCodes = ETFS.filter((etf) => etf.code.startsWith('1')).map((etf) => etf.code);
+  db.saveOfficialShareDay({
+    exchange: 'SSE',
+    tradeDate: '2026-11-20',
+    entries: sseCodes.map((code) => ({
+      code, tradeDate: '2026-11-20', shares: 1000, source: '上交所'
+    })),
+    expectedCodes: sseCodes,
+    fetchedAt: '2026-11-20T10:10:00.000Z'
+  });
+  db.saveOfficialShareDay({
+    exchange: 'SZSE',
+    tradeDate: '2026-11-20',
+    entries: szseCodes.map((code) => ({
+      code, tradeDate: '2026-11-20', shares: 1000, source: '深交所'
+    })),
+    expectedCodes: szseCodes,
+    fetchedAt: '2026-11-20T10:10:00.000Z'
+  });
+  status = service.getOfficialShareSyncStatus();
+  assert.equal(status.state, 'incomplete');
+  assert.equal(status.history.status, 'partial');
+  assert.ok(status.history.missingRecentDates.includes('2026-11-19'));
+  db.close();
+});
+
+test('weekend retry backfills the previous quote trading day', async () => {
+  const db = createDatabase(':memory:');
+  const bars = createBarsEnding('2026-11-20', 2);
+  for (const etf of ETFS) db.upsertBars(etf.code, bars);
+  db.saveSnapshot({
+    code: '510300', price: 4.2, previousClose: 4.1, change: 0.1,
+    changePercent: 2, open: 4.1, high: 4.2, low: 4.0, volume: 100,
+    amount: 100, turnoverRate: 1, shares: 1000001, marketValue: 4000,
+    timestamp: Date.parse('2026-11-20T07:00:00.000Z') / 1000
+  }, '2026-11-20', '2026-11-20T07:00:00.000Z');
+  db.startSyncTask('shares', {
+    targetDates: ['2026-11-20'],
+    attemptedAt: '2026-11-21T01:00:00.000Z'
+  });
+  db.finishSyncTask('shares', {
+    status: 'partial',
+    failedDates: ['2026-11-20'],
+    message: '周五晚发布',
+    attemptedAt: '2026-11-21T01:00:00.000Z'
+  });
+  const sseEtfs = ETFS.filter((etf) => etf.code.startsWith('5'));
+  const szseEtfs = ETFS.filter((etf) => etf.code.startsWith('1'));
+  const requested = [];
+  const service = new MarketService({
+    db,
+    sseShareProvider: async (date) => {
+      requested.push(date);
+      return new Map(sseEtfs.map((etf) => [etf.code, 1000]));
+    },
+    szseShareProvider: async (codes, date) => {
+      requested.push(date);
+      return new Map(codes.map((code) => [code, 1000]));
+    },
+    calendarProvider: async () => ({
+      month: '2026-11',
+      source: '深交所',
+      sourceUrl: 'https://www.szse.cn/aboutus/calendar/',
+      rows: [{
+        date: '2026-11-21',
+        isTrading: false,
+        exchangeStatus: '0',
+        name: '周末'
+      }]
+    }),
+    now: () => new Date('2026-11-21T02:00:00.000Z')
+  });
+  await service.ensureTradingCalendar({ force: true });
+
+  const result = await service.retryPendingOfficialShares();
+  assert.ok(result);
+  assert.ok(requested.includes('2026-11-20'));
+  assert.equal(service.getOfficialShareSyncStatus().state, 'ready');
+  db.close();
+});
+
 test('official history backfill covers the 250-day analytics window and stays idempotent', async () => {
   const db = createDatabase(':memory:');
   const bars = createConsecutiveBars(251);
@@ -830,51 +1029,5 @@ test('share history API model exposes 20/60/250 windows and real coverage', () =
   assert.equal(history.streak.days, 29);
   assert.ok(Number.isFinite(history.range.periodEstimatedSubscription));
   assert.ok(Number.isFinite(history.range.sharePercentile));
-  db.close();
-});
-
-test('signal backtest is deterministic and does not duplicate a matching dataset run', async () => {
-  const db = createDatabase(':memory:');
-  const bars = createConsecutiveBars(90);
-  for (const etf of ETFS) {
-    db.upsertBars(etf.code, bars);
-    db.saveShareHistory(bars.map((bar, index) => ({
-      code: etf.code,
-      tradeDate: bar.date,
-      shares: 100000 + index * 100,
-      source: etf.code.startsWith('1') ? '深交所' : '上交所'
-    })));
-  }
-  const service = new MarketService({
-    db,
-    now: () => new Date('2026-11-20T08:00:00.000Z')
-  });
-
-  const first = await service.runSignalBacktest();
-  const firstEventCount = db.countSignalEvents(first.id);
-  const second = await service.runSignalBacktest();
-  assert.equal(second.id, first.id);
-  assert.equal(db.countSignalEvents(second.id), firstEventCount);
-  assert.ok(firstEventCount > 0);
-  assert.equal(db.raw.prepare('SELECT COUNT(*) AS count FROM backtest_runs').get().count, 1);
-  assert.equal(
-    db.raw.prepare('SELECT COUNT(*) AS count FROM signal_events').get().count,
-    firstEventCount
-  );
-  db.close();
-});
-
-test('signal backtest reports insufficient official share history per ETF', async () => {
-  const db = createDatabase(':memory:');
-  const service = new MarketService({
-    db,
-    now: () => new Date('2026-11-20T08:00:00.000Z')
-  });
-  const run = await service.runSignalBacktest();
-  const summary = await service.getBacktestSummary();
-  assert.equal(run.id, summary.run.id);
-  assert.equal(summary.etfStatus.length, ETFS.length);
-  assert.ok(summary.etfStatus.every((etf) => etf.status === 'insufficient'));
-  assert.ok(summary.etfStatus.every((etf) => etf.reason));
   db.close();
 });

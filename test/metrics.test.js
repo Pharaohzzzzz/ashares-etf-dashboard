@@ -8,6 +8,7 @@ const {
   volumeRatio,
   percentile,
   periodReturn,
+  annualizedVolatility,
   calculateShareStreak,
   calculateShareWindow,
   calculateSignals
@@ -42,6 +43,13 @@ test('period return uses the last prior close', () => {
 test('period return can use a multi-day lookback', () => {
   assert.ok(Math.abs(periodReturn(120, [80, 90, 100], 3) - 0.5) < 1e-12);
   assert.equal(periodReturn(120, [80, 90], 3), null);
+});
+
+test('annualized volatility requires a complete return window', () => {
+  const closes = [100, 101, 100, 102, 101, 103, 102, 104, 103, 105, 104, 106, 105, 107, 106, 108, 107, 109, 108, 110, 109];
+  assert.ok(annualizedVolatility(closes, 20) > 0);
+  assert.equal(annualizedVolatility(closes.slice(-20), 20), null);
+  assert.equal(annualizedVolatility(closes, 0), null);
 });
 
 test('share streak counts consecutive subscriptions and redemptions', () => {

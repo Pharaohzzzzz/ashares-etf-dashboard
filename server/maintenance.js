@@ -131,8 +131,6 @@ function cleanupDatabase({
       'daily_bars',
       'share_history',
       'daily_metrics',
-      'signal_events',
-      'backtest_runs',
       'iopv_samples'
     ]
   };

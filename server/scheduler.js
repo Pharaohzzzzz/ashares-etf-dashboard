@@ -5,31 +5,37 @@ const {
   isTradingSession
 } = require('./trading-calendar');
 
-function createScheduler(service, { log = console.log } = {}) {
+function createScheduler(service, {
+  log = console.log,
+  now = () => new Date(),
+  intervalMs = 5000
+} = {}) {
   let stopped = false;
   let running = false;
   let lastQuoteTick = 0;
   let lastDailySlot = null;
+  let lastRetryCheck = 0;
 
-  const timer = setInterval(async () => {
+  async function runCheck() {
     if (stopped || running) return;
     running = true;
     try {
-      const now = new Date();
-      if (service.ensureTradingCalendar) await service.ensureTradingCalendar({ date: now });
-      const clock = shanghaiClock(now);
+      const currentTime = now();
+      if (service.ensureTradingCalendar) {
+        await service.ensureTradingCalendar({ date: currentTime });
+      }
+      const clock = shanghaiClock(currentTime);
       const calendar = service.getTradingCalendarStatus
-        ? service.getTradingCalendarStatus(now)
+        ? service.getTradingCalendarStatus(currentTime)
         : null;
       const tradingDay = Boolean(calendar?.isTradingDay);
-      const shouldQuote = isTradingSession(now, calendar) &&
-        now.getTime() - lastQuoteTick >= 30000;
+      const shouldQuote = isTradingSession(currentTime, calendar) &&
+        currentTime.getTime() - lastQuoteTick >= 30000;
       const dailySlot = tradingDay && (clock.minute === '15:30' || clock.minute === '18:00')
         ? `${clock.date}-${clock.minute}`
         : null;
-      if (!shouldQuote && (!dailySlot || dailySlot === lastDailySlot)) return;
       if (shouldQuote) {
-        lastQuoteTick = now.getTime();
+        lastQuoteTick = currentTime.getTime();
         await service.refreshQuotes();
       }
       if (dailySlot && dailySlot !== lastDailySlot) {
@@ -38,14 +44,25 @@ function createScheduler(service, { log = console.log } = {}) {
         else await service.refreshQuotes();
         log(`[scheduler] 完成 ${dailySlot} 数据更新`);
       }
+      if (
+        service.retryPendingOfficialShares &&
+        currentTime.getTime() - lastRetryCheck >= 30000
+      ) {
+        lastRetryCheck = currentTime.getTime();
+        const retry = await service.retryPendingOfficialShares();
+        if (retry) log('[scheduler] 已重试官方份额缺口');
+      }
     } catch (error) {
       log(`[scheduler] 更新失败: ${error.message}`);
     } finally {
       running = false;
     }
-  }, 5000);
+  }
+
+  const timer = setInterval(runCheck, intervalMs);
   timer.unref();
   return {
+    runCheck,
     stop() {
       stopped = true;
       clearInterval(timer);

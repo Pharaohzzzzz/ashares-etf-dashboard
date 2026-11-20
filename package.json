@@ -2,7 +2,7 @@
   "name": "ashares-etf-dashboard",
   "version": "1.0.0",
   "private": true,
-  "description": "14只重点ETF每日行情、份额变化与候选资金信号监测站",
+  "description": "可管理监控池的 A 股 ETF 行情、份额变化与资金信号监测站",
   "type": "commonjs",
   "scripts": {
     "start": "node server/index.js",

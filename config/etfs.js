@@ -17,6 +17,20 @@ const ETFS = [
   { code: '513180', name: '恒生科技ETF华夏', category: '港股科技', tone: 'hk' }
 ];
 
+const ETF_CAPACITY = 30;
+const ETF_TONES = Object.freeze({
+  broad: '宽基蓝',
+  growth: '成长紫',
+  tech: '科技青',
+  finance: '金融金',
+  health: '医药粉',
+  hk: '港股橙'
+});
+const INITIAL_FOCUS = Object.freeze([
+  { code: '159915', sortOrder: 10 },
+  { code: '159516', sortOrder: 20 }
+]);
+
 function getEtf(code) {
   return ETFS.find((etf) => etf.code === code);
 }
@@ -25,5 +39,12 @@ function getMarket(code) {
   return code.startsWith('5') || code.startsWith('6') || code.startsWith('9') ? 1 : 0;
 }
 
-module.exports = { ETFS, getEtf, getMarket };
+module.exports = {
+  ETFS,
+  ETF_CAPACITY,
+  ETF_TONES,
+  INITIAL_FOCUS,
+  getEtf,
+  getMarket
+};
 

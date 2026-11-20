@@ -31,6 +31,23 @@ function periodReturn(close, closesAscending, periods = 1) {
   return close / prior - 1;
 }
 
+function annualizedVolatility(closesAscending, periods = 20) {
+  if (!Number.isInteger(periods) || periods < 1) return null;
+  if (!Array.isArray(closesAscending) || closesAscending.length < periods + 1) return null;
+  const window = closesAscending.slice(-(periods + 1));
+  if (window.some((close) => !Number.isFinite(close) || close <= 0)) return null;
+  const returns = [];
+  for (let index = 1; index < window.length; index += 1) {
+    returns.push(window[index] / window[index - 1] - 1);
+  }
+  const mean = returns.reduce((sum, value) => sum + value, 0) / returns.length;
+  const variance = returns.reduce(
+    (sum, value) => sum + (value - mean) ** 2,
+    0
+  ) / Math.max(returns.length - 1, 1);
+  return Math.sqrt(variance) * Math.sqrt(252);
+}
+
 function calculateShareStreak(history, tradeDates) {
   const latest = history.at(-1);
   if (!latest || !tradeDates.length || tradeDates.at(-1) !== latest.tradeDate) {
@@ -171,6 +188,7 @@ module.exports = {
   volumeRatio,
   percentile,
   periodReturn,
+  annualizedVolatility,
   calculateShareStreak,
   calculateShareWindow,
   calculateSignals

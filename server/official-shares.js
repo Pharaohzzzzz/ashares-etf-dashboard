@@ -30,7 +30,9 @@ function parseSseShares(data) {
   const result = new Map();
   for (const row of data.result || []) {
     const shares = Math.round(Number(row.TOT_VOL) * 10000);
-    if (row.SEC_CODE && Number.isFinite(shares)) result.set(String(row.SEC_CODE), shares);
+    if (row.SEC_CODE && Number.isFinite(shares) && shares > 0) {
+      result.set(String(row.SEC_CODE), shares);
+    }
   }
   return result;
 }
@@ -101,7 +103,7 @@ function extractSzseShare(rows, code, tradeDate) {
   const match = rows.find((row) => row[0] === tradeDate && row[1]?.trim() === code);
   if (!match) return null;
   const shares = Number(String(match[3]).replaceAll(',', ''));
-  return Number.isFinite(shares) ? shares : null;
+  return Number.isFinite(shares) && shares > 0 ? shares : null;
 }
 
 function splitDateRange(startDate, endDate, maxDays = SZSE_RANGE_DAYS) {
@@ -146,7 +148,7 @@ function extractSzseShareRange(rows, codes, startDate, endDate) {
       return [];
     }
     const shares = Number(String(row[3]).replaceAll(',', ''));
-    return Number.isFinite(shares)
+    return Number.isFinite(shares) && shares > 0
       ? [{ code, tradeDate, shares, source: '深交所' }]
       : [];
   });

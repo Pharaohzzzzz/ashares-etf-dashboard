@@ -4,6 +4,8 @@ data/*.db-*
 data/*.log
 data/backups/
 data/logs/
+data/*.png
+artifacts/
 *.log
 .DS_Store
 

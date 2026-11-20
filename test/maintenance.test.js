@@ -81,22 +81,6 @@ function createFixture(filePath) {
     signals: [],
     updatedAt: '2026-11-20T00:00:00.000Z'
   });
-  db.raw.prepare(`
-    INSERT INTO backtest_runs(
-      parameter_version, dataset_fingerprint, parameters_json,
-      train_start, train_end, validation_start, validation_end,
-      status, result_json, generated_at
-    ) VALUES ('test', 'fingerprint', '{}', '2026-01-01', '2026-06-01',
-      '2026-06-02', '2026-11-19', 'complete', '{}', '2026-11-20T00:00:00.000Z')
-  `).run();
-  db.raw.prepare(`
-    INSERT INTO signal_events(
-      run_id, code, signal_date, split_name, score, level_key, level_label,
-      components_json, reasons_json, outcomes_json, future_path_json,
-      legacy_composite, legacy_signals_json
-    ) VALUES (1, '510300', '2026-11-19', 'validation', 50, 'observe', '观察',
-      '[]', '[]', '{}', '{}', 0, '[]')
-  `).run();
   db.close();
 }
 
@@ -130,8 +114,6 @@ test('backup, cleanup, restore and log rotation work on temporary databases', as
   assert.equal(cleaned.raw.prepare('SELECT COUNT(*) AS n FROM share_history').get().n, 1);
   assert.equal(cleaned.raw.prepare('SELECT COUNT(*) AS n FROM daily_metrics').get().n, 1);
   assert.equal(cleaned.raw.prepare('SELECT COUNT(*) AS n FROM iopv_samples').get().n, 1);
-  assert.equal(cleaned.raw.prepare('SELECT COUNT(*) AS n FROM signal_events').get().n, 1);
-  assert.equal(cleaned.raw.prepare('SELECT COUNT(*) AS n FROM backtest_runs').get().n, 1);
   cleaned.raw.prepare("UPDATE etfs SET name = 'modified' WHERE code = '510300'").run();
   cleaned.close();
 

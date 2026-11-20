@@ -3,14 +3,20 @@
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
-const { ETFS } = require('../config/etfs');
+const { API_VERSION, getBuildId } = require('./runtime-version');
 
-const ETF_CODES = new Set(ETFS.map((etf) => etf.code));
-const CATEGORIES = new Set(ETFS.map((etf) => etf.category));
-const LEVELS = new Set(['observe', 'active', 'high']);
-const SPLITS = new Set(['train', 'validation']);
-const HORIZONS = new Set([1, 3, 5, 10]);
-const CSV_TYPES = new Set(['summary', 'daily', 'shares', 'iopv', 'backtest']);
+const CSV_TYPES = new Set(['summary', 'daily', 'shares', 'iopv']);
+const CATALOG_ERRORS = new Set([
+  'INVALID_CODE',
+  'ETF_NOT_FOUND',
+  'ETF_ALREADY_EXISTS',
+  'ETF_CAPACITY_REACHED',
+  'NOT_ETF',
+  'UNSUPPORTED_MARKET',
+  'INVALID_CATEGORY',
+  'INVALID_NAME',
+  'INVALID_TONE'
+]);
 
 const CONTENT_TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -36,13 +42,6 @@ function sendError(response, status, code, message) {
   return sendJson(response, status, { error: { code, message } });
 }
 
-function isValidDate(value) {
-  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
-  const parsed = new Date(`${value}T00:00:00Z`);
-  return Number.isFinite(parsed.getTime()) &&
-    parsed.toISOString().slice(0, 10) === value;
-}
-
 function csvCell(value) {
   if (value === null || value === undefined) return '';
   const text = String(value);
@@ -60,51 +59,58 @@ function csvNumberOrMissing(value) {
   return Number.isFinite(value) ? value : '数据不足';
 }
 
-function parseBacktestFilters(url) {
-  return {
-    from: url.searchParams.get('from') || null,
-    to: url.searchParams.get('to') || null,
-    code: url.searchParams.get('code') || null,
-    category: url.searchParams.get('category') || null,
-    level: url.searchParams.get('level') || null,
-    split: url.searchParams.get('split') || null,
-    horizon: Number(url.searchParams.get('horizon') || 5)
-  };
+function clientError(code, message, statusCode = 400) {
+  const error = new Error(message);
+  error.code = code;
+  error.statusCode = statusCode;
+  return error;
 }
 
-function validateBacktestFilters(url) {
-  const filters = parseBacktestFilters(url);
-  if (!HORIZONS.has(filters.horizon)) {
-    return { error: ['INVALID_HORIZON', '回测周期仅支持 1、3、5 或 10 日'] };
+async function readJsonBody(request, limit = 100_000) {
+  let body = '';
+  for await (const chunk of request) {
+    body += chunk;
+    if (body.length > limit) throw clientError('PAYLOAD_TOO_LARGE', '请求体过大', 413);
   }
-  if (filters.code && !ETF_CODES.has(filters.code)) {
-    return { error: ['INVALID_CODE', 'ETF 代码不在监测清单内'] };
-  }
-  if (filters.category && !CATEGORIES.has(filters.category)) {
-    return { error: ['INVALID_CATEGORY', 'ETF 分类不在白名单内'] };
-  }
-  if (filters.level && !LEVELS.has(filters.level)) {
-    return { error: ['INVALID_LEVEL', '评分等级不在白名单内'] };
-  }
-  if (filters.split && !SPLITS.has(filters.split)) {
-    return { error: ['INVALID_SPLIT', '数据切分仅支持 train 或 validation'] };
-  }
-  for (const key of ['from', 'to']) {
-    if (filters[key] && !isValidDate(filters[key])) {
-      return { error: ['INVALID_DATE', '日期必须为有效的 YYYY-MM-DD'] };
+  if (!body) return {};
+  try {
+    const parsed = JSON.parse(body);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('not object');
     }
+    return parsed;
+  } catch {
+    throw clientError('INVALID_JSON', '请求体必须为 JSON 对象');
   }
-  if (filters.from && filters.to && filters.from > filters.to) {
-    return { error: ['INVALID_DATE_RANGE', '开始日期不得晚于结束日期'] };
-  }
-  return { filters };
 }
 
 function createApp({
   service,
   publicDir = path.join(__dirname, '..', 'public'),
-  logger = console
+  logger = console,
+  runtimeVersion = {
+    apiVersion: API_VERSION,
+    buildId: getBuildId()
+  }
 }) {
+  const withRuntime = (data) => ({
+    ...data,
+    apiVersion: runtimeVersion.apiVersion,
+    buildId: runtimeVersion.buildId
+  });
+  const isEnabledEtf = (code) => {
+    if (typeof service.getEtfConfig === 'function') {
+      return Boolean(service.getEtfConfig(code));
+    }
+    return service.getSummary().etfs.some((row) => row.code === code);
+  };
+  const catalogResponse = (etf) => withRuntime({
+    etf,
+    summary: service.getSummary(),
+    catalog: typeof service.getCatalogState === 'function'
+      ? service.getCatalogState()
+      : null
+  });
   const server = http.createServer(async (request, response) => {
     const url = new URL(request.url, 'http://127.0.0.1');
     try {
@@ -115,7 +121,7 @@ function createApp({
           : summary.quoteStatus === 'ok'
             ? 'ok'
             : 'degraded';
-        return sendJson(response, 200, {
+        return sendJson(response, 200, withRuntime({
           status,
           initializedAt: service.initializedAt,
           dataTime: summary.dataTime,
@@ -124,21 +130,101 @@ function createApp({
           quoteStatus: summary.quoteStatus || null,
           staleCount: summary.staleCount ?? null,
           oldestDataTime: summary.oldestDataTime || null,
-          latestDataTime: summary.latestDataTime || null
-        });
+          latestDataTime: summary.latestDataTime || null,
+          shareSyncStatus: summary.shareSyncStatus || null
+        }));
       }
 
       if (url.pathname === '/api/summary' && request.method === 'GET') {
-        return sendJson(response, 200, service.getSummary());
+        return sendJson(response, 200, withRuntime(service.getSummary()));
       }
 
       if (url.pathname === '/api/refresh' && request.method === 'POST') {
-        const summary = await service.refreshQuotes();
-        return sendJson(response, 200, summary);
+        const summary = service.refreshAllData
+          ? await service.refreshAllData()
+          : await service.refreshQuotes();
+        return sendJson(response, 200, withRuntime(summary));
+      }
+
+      if (url.pathname === '/api/shares/sync' && request.method === 'POST') {
+        await service.syncOfficialShareHistory();
+        return sendJson(response, 200, withRuntime(service.getSummary()));
+      }
+
+      if (url.pathname === '/api/etfs/manage' && request.method === 'GET') {
+        if (typeof service.getCatalogState !== 'function') {
+          return sendError(response, 501, 'CATALOG_UNAVAILABLE', '当前后台未提供 ETF 管理能力');
+        }
+        return sendJson(response, 200, withRuntime({
+          ...service.getCatalogState(),
+          summary: service.getSummary()
+        }));
+      }
+
+      if (url.pathname === '/api/etfs/lookup' && request.method === 'GET') {
+        const candidate = await service.lookupEtfCandidate(url.searchParams.get('code'));
+        return sendJson(response, 200, withRuntime({ candidate }));
+      }
+
+      if (url.pathname === '/api/etfs' && request.method === 'POST') {
+        const payload = await readJsonBody(request);
+        const etf = await service.addEtf(payload);
+        if (typeof service.backfillEtf === 'function') {
+          setImmediate(() => {
+            Promise.resolve(service.backfillEtf(etf.code)).catch((error) => {
+              logger.error?.(error?.stack || error);
+            });
+          });
+        }
+        return sendJson(response, 201, catalogResponse(etf));
+      }
+
+      if (url.pathname === '/api/etfs/order' && request.method === 'PUT') {
+        const payload = await readJsonBody(request);
+        service.saveEtfOrder(payload);
+        return sendJson(response, 200, withRuntime({
+          catalog: service.getCatalogState(),
+          summary: service.getSummary()
+        }));
+      }
+
+      if (url.pathname === '/api/etfs/order/restore' && request.method === 'POST') {
+        service.restoreEtfOrder();
+        return sendJson(response, 200, withRuntime({
+          catalog: service.getCatalogState(),
+          summary: service.getSummary()
+        }));
+      }
+
+      const restoreEtfMatch = url.pathname.match(/^\/api\/etfs\/(\d{6})\/restore$/);
+      if (restoreEtfMatch && request.method === 'POST') {
+        const etf = service.restoreEtf(restoreEtfMatch[1]);
+        return sendJson(response, 200, catalogResponse(etf));
+      }
+
+      const editEtfMatch = url.pathname.match(/^\/api\/etfs\/(\d{6})$/);
+      if (editEtfMatch && request.method === 'PATCH') {
+        const payload = await readJsonBody(request);
+        const etf = service.updateEtf(editEtfMatch[1], payload);
+        return sendJson(response, 200, catalogResponse(etf));
+      }
+
+      if (editEtfMatch && request.method === 'DELETE') {
+        const payload = await readJsonBody(request);
+        if (payload.confirm !== true) {
+          return sendError(
+            response,
+            400,
+            'CONFIRMATION_REQUIRED',
+            '移出监控需要二次确认'
+          );
+        }
+        const etf = service.removeEtf(editEtfMatch[1]);
+        return sendJson(response, 200, catalogResponse(etf));
       }
 
       const etfPathMatch = url.pathname.match(/^\/api\/etfs\/([^/]+)/);
-      if (etfPathMatch && !ETF_CODES.has(etfPathMatch[1])) {
+      if (etfPathMatch && !isEnabledEtf(etfPathMatch[1])) {
         return sendError(response, 400, 'INVALID_CODE', 'ETF 代码不在监测清单内');
       }
 
@@ -174,25 +260,6 @@ function createApp({
           : sendError(response, 404, 'ETF_NOT_FOUND', 'ETF 不存在');
       }
 
-      if (url.pathname === '/api/backtests/summary' && request.method === 'GET') {
-        return sendJson(response, 200, await service.getBacktestSummary());
-      }
-
-      if (url.pathname === '/api/backtests/events' && request.method === 'GET') {
-        const validated = validateBacktestFilters(url);
-        if (validated.error) return sendError(response, 400, ...validated.error);
-        const { filters } = validated;
-        return sendJson(response, 200, await service.getBacktestEvents(filters));
-      }
-
-      const signalEventMatch = url.pathname.match(/^\/api\/backtests\/events\/(\d+)$/);
-      if (signalEventMatch && request.method === 'GET') {
-        const event = await service.getBacktestEvent(signalEventMatch[1]);
-        return event
-          ? sendJson(response, 200, event)
-          : sendError(response, 404, 'SIGNAL_EVENT_NOT_FOUND', '信号事件不存在');
-      }
-
       const detailMatch = url.pathname.match(/^\/api\/etfs\/(\d{6})$/);
       if (detailMatch && request.method === 'GET') {
         const detail = service.getDetail(detailMatch[1]);
@@ -207,7 +274,7 @@ function createApp({
         if (!CSV_TYPES.has(requestedType)) {
           return sendError(response, 400, 'INVALID_CSV_TYPE', 'CSV type 不在白名单内');
         }
-        if (code && !ETF_CODES.has(code)) {
+        if (code && !isEnabledEtf(code)) {
           return sendError(response, 400, 'INVALID_CODE', 'ETF 代码不在监测清单内');
         }
         if (['shares', 'iopv', 'daily'].includes(requestedType) && !code) {
@@ -215,69 +282,7 @@ function createApp({
         }
         let csv;
         let filename;
-        if (requestedType === 'backtest') {
-          const validated = validateBacktestFilters(url);
-          if (validated.error) return sendError(response, 400, ...validated.error);
-          const { filters } = validated;
-          const { events } = await service.getBacktestEvents(filters);
-          csv = toCsv([
-            { key: 'code', label: '代码' },
-            { key: 'name', label: '名称' },
-            { key: 'category', label: '分类' },
-            { key: 'signalDate', label: '信号日期' },
-            { key: 'signalAvailableAt', label: '信号可用时间' },
-            { key: 'earliestEntryDate', label: '最早入场日' },
-            { key: 'entryPriceMode', label: '入场价格口径' },
-            { key: 'entryPrice', label: '入场价' },
-            { key: 'exitDate', label: '退出日' },
-            { key: 'split', label: '数据切分' },
-            { key: 'score', label: '评分' },
-            { key: 'level', label: '等级' },
-            { key: 'horizon', label: '预测周期' },
-            { key: 'futureReturn', label: '未来收益' },
-            { key: 'zeroCostReturn', label: '零成本未来收益' },
-            { key: 'costDrag', label: '成本拖累' },
-            { key: 'drawdown', label: '入场后盘中低点回撤' },
-            { key: 'maxDrawdownMethod', label: '回撤口径' },
-            { key: 'maxFavorable', label: '最大有利波动' },
-            { key: 'benchmarkReturn', label: '同期基准收益' },
-            { key: 'hit', label: '跑赢同期基准' },
-            { key: 'baselineHitRate', label: '同ETF无条件命中率' },
-            { key: 'returnVsUnconditional', label: '相对无条件收益' },
-            { key: 'legacyComposite', label: '旧规则对照' }
-          ], events.map((event) => {
-            const outcome = event.outcomes?.[filters.horizon] || {};
-            return {
-              code: event.code,
-              name: event.name,
-              category: event.category,
-              signalDate: event.date,
-              signalAvailableAt: event.signalAvailableAt,
-              earliestEntryDate: event.earliestEntryDate,
-              entryPriceMode: event.entryPriceMode,
-              entryPrice: csvNumberOrMissing(outcome.entryPrice),
-              exitDate: outcome.exitDate,
-              split: event.split === 'train' ? '训练期' : '验证期',
-              score: event.score,
-              level: event.level.label,
-              horizon: `${filters.horizon}日`,
-              futureReturn: csvNumberOrMissing(outcome.futureReturn),
-              zeroCostReturn: csvNumberOrMissing(outcome.zeroCostReturn),
-              costDrag: csvNumberOrMissing(outcome.costDrag),
-              drawdown: csvNumberOrMissing(outcome.drawdown),
-              maxDrawdownMethod: outcome.maxDrawdownMethod || '',
-              maxFavorable: csvNumberOrMissing(outcome.maxFavorable),
-              benchmarkReturn: csvNumberOrMissing(outcome.benchmarkReturn),
-              hit: typeof outcome.outperformedBenchmark === 'boolean'
-                ? (outcome.outperformedBenchmark ? '是' : '否')
-                : '数据不足',
-              baselineHitRate: csvNumberOrMissing(outcome.baselineHitRate),
-              returnVsUnconditional: csvNumberOrMissing(outcome.returnVsUnconditional),
-              legacyComposite: event.legacyComposite ? '命中旧候选' : '未命中'
-            };
-          }));
-          filename = 'etf-signal-backtest.csv';
-        } else if (code) {
+        if (code) {
           const detail = service.getDetail(code);
           if (!detail) return sendError(response, 404, 'ETF_NOT_FOUND', 'ETF 不存在');
           if (requestedType === 'shares') {
@@ -373,8 +378,15 @@ function createApp({
             { key: 'latestOfficialEstimatedSubscription', label: '最近官方日估算净申赎' },
             { key: 'latestOfficialMetricStatus', label: '最近官方日指标状态' },
             { key: 'scoreDate', label: '评分日期' },
+            { key: 'estimatedSubscription5d', label: '近5日累计估算净申赎' },
+            { key: 'estimatedSubscription5dStatus', label: '近5日累计状态' },
+            { key: 'estimatedSubscription20d', label: '近20日累计估算净申赎' },
+            { key: 'estimatedSubscription20dStatus', label: '近20日累计状态' },
             { key: 'shareStreak', label: '连续净申赎' },
             { key: 'sharePercentile', label: '份额历史分位' },
+            { key: 'estimatedFundSize', label: '估算基金规模' },
+            { key: 'volatility20d', label: '20日波动率' },
+            { key: 'amountPercentile', label: '成交额历史分位' },
             { key: 'tradeDate', label: '交易日' },
             { key: 'dataTime', label: '行情时间' },
             { key: 'capturedAt', label: '抓取时间' },
@@ -394,12 +406,26 @@ function createApp({
             latestOfficialEstimatedSubscription: csvNumberOrMissing(
               row.latestOfficialEstimatedSubscription
             ),
+            estimatedSubscription5d: csvNumberOrMissing(row.estimatedSubscription5d),
+            estimatedSubscription5dStatus: row.estimatedSubscription5dStatus === 'ready'
+              ? '已就绪'
+              : '历史积累中',
+            estimatedSubscription20d: csvNumberOrMissing(row.estimatedSubscription20d),
+            estimatedSubscription20dStatus: row.estimatedSubscription20dStatus === 'ready'
+              ? '已就绪'
+              : '历史积累中',
             shareStreak: row.shareStreak?.days
               ? `${row.shareStreak.label} ${row.shareStreak.days}日`
               : '无连续序列',
             sharePercentile: Number.isFinite(row.sharePercentile)
               ? `${(row.sharePercentile * 100).toFixed(1)}%`
               : '数据不足',
+            volatility20d: Number.isFinite(row.volatility20d)
+              ? `${(row.volatility20d * 100).toFixed(2)}%`
+              : '历史积累中',
+            amountPercentile: Number.isFinite(row.amountPercentile)
+              ? `${(row.amountPercentile * 100).toFixed(1)}%`
+              : '待数据',
             quoteStatus: row.quoteStatusLabel || row.quoteStatus,
             signals: row.signals.map((signal) => signal.label).join('、')
           })));
@@ -432,6 +458,14 @@ function createApp({
 
       return sendError(response, 404, 'NOT_FOUND', '接口不存在');
     } catch (error) {
+      if (CATALOG_ERRORS.has(error?.code) || error?.statusCode) {
+        return sendError(
+          response,
+          error.statusCode || 400,
+          error.code || 'INVALID_REQUEST',
+          error.message
+        );
+      }
       logger.error(error?.stack || error);
       return sendError(response, 500, 'INTERNAL_ERROR', '服务内部错误');
     }
@@ -455,8 +489,6 @@ function serveFile(response, filePath, cacheControl = 'no-cache') {
 
 module.exports = {
   createApp,
-  toCsv,
-  isValidDate,
-  validateBacktestFilters
+  toCsv
 };
 

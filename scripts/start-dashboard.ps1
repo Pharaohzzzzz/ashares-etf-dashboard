@@ -8,17 +8,50 @@ $dashboardUrl = 'http://127.0.0.1:37821'
 
 New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
 
+$nodePath = (Get-Command node -ErrorAction Stop).Source
+$currentBuildId = (& $nodePath 'server/runtime-version.js' 2>$null).Trim()
+if (-not $currentBuildId) {
+  throw 'Unable to calculate the dashboard build fingerprint.'
+}
+$expectedApiVersion = [int](& $nodePath -e "process.stdout.write(String(require('./server/runtime-version').API_VERSION))").Trim()
+
+$needsRestart = $false
 try {
   $health = Invoke-RestMethod -Uri "$dashboardUrl/api/health" -TimeoutSec 2
   if ($health.status -in @('ok', 'starting', 'degraded')) {
-    Write-Output ('ETF dashboard is already running: ' + $dashboardUrl)
-    exit 0
+    if ($health.buildId -eq $currentBuildId -and $health.apiVersion -eq $expectedApiVersion) {
+      Write-Output ('ETF dashboard is already running with current code: ' + $dashboardUrl)
+      exit 0
+    }
+    $needsRestart = $true
+    $runningBuild = if ($health.buildId) { $health.buildId } else { 'missing buildId' }
+    Write-Output (
+      'ETF dashboard code is outdated; restarting. Running: ' +
+      $runningBuild +
+      '; current: ' + $currentBuildId
+    )
   }
 } catch {
   # The health endpoint being unavailable means the local service should be started.
 }
 
-$nodePath = (Get-Command node -ErrorAction Stop).Source
+if ($needsRestart) {
+  & (Join-Path $PSScriptRoot 'stop-dashboard.ps1')
+  $stopped = $false
+  for ($attempt = 0; $attempt -lt 20; $attempt++) {
+    try {
+      $null = Invoke-RestMethod -Uri "$dashboardUrl/api/health" -TimeoutSec 1
+      Start-Sleep -Milliseconds 250
+    } catch {
+      $stopped = $true
+      break
+    }
+  }
+  if (-not $stopped) {
+    throw 'The outdated ETF dashboard did not stop before the restart window ended.'
+  }
+}
+
 Start-Process `
   -FilePath $nodePath `
   -ArgumentList 'server/index.js' `
@@ -32,7 +65,11 @@ for ($attempt = 0; $attempt -lt 30; $attempt++) {
   Start-Sleep -Milliseconds 500
   try {
     $health = Invoke-RestMethod -Uri "$dashboardUrl/api/health" -TimeoutSec 2
-    if ($health.status -in @('ok', 'starting', 'degraded')) {
+    if (
+      $health.status -in @('ok', 'starting', 'degraded') -and
+      $health.buildId -eq $currentBuildId -and
+      $health.apiVersion -eq $expectedApiVersion
+    ) {
       $started = $true
       break
     }

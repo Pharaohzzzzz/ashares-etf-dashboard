@@ -43,6 +43,17 @@ test('parseSseShares converts ten-thousand share units', () => {
   assert.equal(shares.get('510300'), 49684087700);
 });
 
+test('zero and invalid official share values are not treated as records', () => {
+  const shares = parseSseShares({
+    result: [
+      { SEC_CODE: '510300', TOT_VOL: '0' },
+      { SEC_CODE: '510050', TOT_VOL: '-' }
+    ]
+  });
+  assert.equal(shares.has('510300'), false);
+  assert.equal(shares.has('510050'), false);
+});
+
 test('parseWorksheetRows reads inline string cells', () => {
   const rows = parseWorksheetRows(worksheet);
   assert.deepEqual(rows[1], ['2026-11-19', '159919', '沪深300ETF嘉实', '16186716676.00']);
@@ -78,4 +89,16 @@ test('extractSzseShareRange filters selected ETFs and dates', () => {
     { code: '159919', tradeDate: '2026-11-19', shares: 16186716676, source: '深交所' },
     { code: '159919', tradeDate: '2026-11-18', shares: 14191416676, source: '深交所' }
   ]);
+});
+
+test('zero SZSE share values remain missing instead of being written', () => {
+  const rows = parseWorksheetRows(worksheet);
+  rows.push(['2026-11-20', '159919', '沪深300ETF嘉实', '0']);
+  assert.equal(extractSzseShare(rows, '159919', '2026-11-20'), null);
+  assert.deepEqual(extractSzseShareRange(
+    rows,
+    ['159919'],
+    '2026-11-20',
+    '2026-11-20'
+  ), []);
 });

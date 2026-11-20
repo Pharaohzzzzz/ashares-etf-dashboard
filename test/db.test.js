@@ -11,6 +11,11 @@ const { createDatabase } = require('../server/db');
 test('database seeds all configured ETFs and stores bars idempotently', () => {
   const db = createDatabase(':memory:');
   assert.equal(db.raw.prepare('SELECT COUNT(*) AS count FROM etfs').get().count, 14);
+  const removedTables = db.raw.prepare(`
+    SELECT name FROM sqlite_master
+    WHERE type = 'table' AND name IN ('backtest_runs', 'signal_events')
+  `).all();
+  assert.deepEqual(removedTables, []);
   const bar = {
     date: '2026-11-19', open: 4, close: 4.06, high: 4.07, low: 3.99,
     volume: 100, amount: 400, amplitude: 2, changePercent: 0.5,
@@ -113,6 +118,28 @@ test('share provenance migration backfills old official and snapshot timestamps'
   `).get();
   assert.equal(row.official_fetched_at, '2026-11-19T00:00:00.000Z');
   assert.equal(row.snapshot_fetched_at, null);
+  migrated.close();
+  fs.rmSync(directory, { recursive: true, force: true });
+});
+
+test('database initialization removes legacy signal evaluation tables', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'etf-backtest-removal-'));
+  const filePath = path.join(directory, 'dashboard.db');
+  const legacy = new DatabaseSync(filePath);
+  legacy.exec(`
+    CREATE TABLE backtest_runs (id INTEGER PRIMARY KEY, generated_at TEXT);
+    CREATE TABLE signal_events (id INTEGER PRIMARY KEY, run_id INTEGER, signal_date TEXT);
+    INSERT INTO backtest_runs(id, generated_at) VALUES (1, '2026-11-19T00:00:00.000Z');
+    INSERT INTO signal_events(id, run_id, signal_date) VALUES (1, 1, '2026-11-19');
+  `);
+  legacy.close();
+
+  const migrated = createDatabase(filePath);
+  const removedTables = migrated.raw.prepare(`
+    SELECT name FROM sqlite_master
+    WHERE type = 'table' AND name IN ('backtest_runs', 'signal_events')
+  `).all();
+  assert.deepEqual(removedTables, []);
   migrated.close();
   fs.rmSync(directory, { recursive: true, force: true });
 });
@@ -227,5 +254,25 @@ test('official share day writes and completion status share one transaction', ()
   assert.equal(recovery.status, 'success');
   assert.deepEqual(recovery.writtenCodes, expectedCodes);
   assert.equal(db.getOfficialShareSyncRecord('SSE', '2026-11-19').actualCount, 2);
+  db.close();
+});
+
+test('zero official shares remain a missing value', () => {
+  const db = createDatabase(':memory:');
+  const result = db.saveOfficialShareDay({
+    exchange: 'SSE',
+    tradeDate: '2026-11-20',
+    entries: [{
+      code: '510300',
+      tradeDate: '2026-11-20',
+      shares: 0,
+      source: '上交所'
+    }],
+    expectedCodes: ['510300'],
+    fetchedAt: '2026-11-20T10:00:00.000Z'
+  });
+  assert.equal(result.status, 'pending');
+  assert.equal(db.countOfficialShareHistory('510300'), 0);
+  assert.equal(db.getShareRecord('510300', '2026-11-20'), null);
   db.close();
 });

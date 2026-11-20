@@ -6,114 +6,131 @@
   <meta name="theme-color" content="#080b11">
   <title>ETF资金雷达</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='15' fill='%230b1421'/%3E%3Cpath d='M15 45V31h7v14zm13 0V20h7v25zm13 0V26h7v19z' fill='%234d8dff'/%3E%3C/svg%3E">
-  <link rel="stylesheet" href="/styles.css?v=20261120-25">
+  <link rel="stylesheet" href="/styles.css?v=20261121-30">
   <script src="/vendor/echarts.min.js?v=6.1.0" defer></script>
-  <script src="/app.js?v=20261120-25" defer></script>
+  <script src="/app.js?v=20261121-30" defer></script>
 </head>
 <body>
-  <div class="ambient ambient-a"></div>
-  <div class="ambient ambient-b"></div>
-
   <header class="site-header">
     <div class="brand-block">
       <div class="brand-mark" aria-hidden="true">
         <span></span><span></span><span></span>
       </div>
       <div>
-        <p class="eyebrow">A-SHARE ETF MONITOR</p>
         <h1>ETF 资金雷达</h1>
+        <p class="brand-subtitle">A 股 ETF 资金监测终端</p>
       </div>
     </div>
-    <div class="header-actions">
-      <div id="marketStatus" class="status-pill status-loading">
-        <span class="status-dot"></span>
-        <span id="marketStatusText">连接数据源</span>
+    <div class="header-tools">
+      <div class="header-market">
+        <div id="marketStatus" class="status-pill status-loading">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span id="marketStatusText">连接数据源</span>
+        </div>
+        <div class="header-time">
+          <span>行情</span>
+          <strong id="dataTime">等待数据</strong>
+          <small id="generatedTime">尚未刷新</small>
+        </div>
       </div>
-      <button id="refreshButton" class="button button-primary" type="button">
-        <span class="button-icon" aria-hidden="true">↻</span>
-        刷新数据
-      </button>
+      <div class="header-actions">
+        <button id="manageEtfButton" class="button button-quiet" type="button">管理 ETF</button>
+        <button id="refreshButton" class="button button-primary" type="button">
+          <span class="button-icon" aria-hidden="true">↻</span>
+          刷新数据
+        </button>
+      </div>
     </div>
   </header>
 
   <main class="page-shell">
-    <section class="hero-row">
-      <div>
-        <p class="eyebrow">14 只重点 ETF · 公开行情监测</p>
-        <h2 id="heroTitle">观察资金痕迹，不猜测账户身份</h2>
-        <p id="heroCopy" class="hero-copy">把成交放量、份额变化与宽基共振放在同一张图里。信号用于发现异常，不代表已确认的“国家队”成交。</p>
+    <section class="workspace-intro" aria-labelledby="heroTitle">
+      <div class="workspace-title">
+        <p id="monitorEyebrow" class="eyebrow">当前监控 ETF · 公开行情监测</p>
+        <div class="workspace-title-line">
+          <h2 id="heroTitle">ETF 资金监控</h2>
+          <span id="heroCopy" class="workspace-note">观察资金痕迹，不猜测账户身份</span>
+        </div>
       </div>
-      <div class="time-card">
-        <span>最近行情</span>
-        <strong id="dataTime">等待数据</strong>
-        <small id="generatedTime">尚未刷新</small>
-      </div>
+      <p class="workspace-caption">成交放量、官方份额变化与宽基共振并列呈现；信号用于发现异常，不代表交易账户身份确认。</p>
     </section>
 
     <div id="errorBanner" class="error-banner" role="alert" hidden></div>
 
-    <nav class="view-tabs" role="tablist" aria-label="页面视图">
-      <button class="view-tab active" type="button" role="tab" aria-selected="true" data-view="overview">行情概览</button>
-      <button class="view-tab" type="button" role="tab" aria-selected="false" data-view="evaluation">信号评估</button>
-    </nav>
-
-    <div id="overviewView" class="view-panel">
+    <div class="view-panel">
     <section class="summary-grid" aria-label="市场摘要">
-      <article class="summary-card accent-blue">
+      <article class="summary-card summary-primary">
+        <span class="summary-index" aria-hidden="true">01</span>
         <div class="summary-label">监测池成交额</div>
         <strong id="totalAmount">--</strong>
-        <span class="summary-foot">14 只 ETF 合计</span>
+        <span id="monitorCountFoot" class="summary-foot">当前监控 ETF 合计</span>
       </article>
-      <article class="summary-card accent-red">
+      <article class="summary-card">
+        <span class="summary-index" aria-hidden="true">02</span>
         <div class="summary-label">20日显著放量</div>
         <strong id="volumeUpCount">--</strong>
         <span class="summary-foot">成交额达到均值 2 倍</span>
       </article>
-      <article class="summary-card accent-amber">
+      <article class="summary-card summary-official">
+        <span class="summary-index" aria-hidden="true">03</span>
         <div class="summary-label">今日官方净申购</div>
         <strong id="shareUpCount">--</strong>
         <span class="summary-foot" id="shareUpFoot">等待当日官方份额发布</span>
       </article>
-      <article class="summary-card accent-cyan">
+      <article class="summary-card">
+        <span class="summary-index" aria-hidden="true">04</span>
         <div class="summary-label">评分 ≥ 40</div>
         <strong id="compositeCount">--</strong>
         <span class="summary-foot" id="resonanceHint">等待异常资金评分</span>
       </article>
     </section>
 
-    <section class="signal-panel">
-      <div class="section-heading">
+    <section id="tablePanel" class="table-panel">
+      <div class="table-heading">
         <div>
-          <p class="eyebrow">SIGNAL BOARD</p>
-          <h3>最近完整评分日异动线索</h3>
-        </div>
-          <span id="scoreBoardAsOf" class="muted-note">评分基于 --</span>
-      </div>
-      <div id="signalBoard" class="signal-board">
-        <div class="skeleton-card"></div>
-        <div class="skeleton-card"></div>
-        <div class="skeleton-card"></div>
-      </div>
-    </section>
-
-    <section class="table-panel">
-      <div class="section-heading table-heading">
-        <div>
-          <p class="eyebrow">MARKET MATRIX</p>
+          <p class="eyebrow">MARKET MATRIX · LIVE WORKSPACE</p>
           <h3>ETF 全景表</h3>
+          <p class="section-subtitle">固定名称列与表头 · 置顶优先 · 自定义顺序与列显示</p>
         </div>
         <div class="table-actions">
           <label class="search-box">
-            <span aria-hidden="true">⌕</span>
+            <span class="search-icon" aria-hidden="true">⌕</span>
+            <span class="visually-hidden">搜索 ETF</span>
             <input id="searchInput" type="search" placeholder="搜索代码或名称" autocomplete="off">
           </label>
+          <button id="densityToggle" class="button button-quiet" type="button" aria-pressed="false">舒适</button>
+          <details class="column-settings">
+            <summary class="button button-quiet">列设置</summary>
+            <div class="column-settings-panel">
+              <div class="column-settings-head">
+                <strong>显示指标列</strong>
+                <button id="columnSettingsReset" class="text-button" type="button">恢复默认</button>
+              </div>
+              <div class="column-settings-extra">
+                <span>1024px 及以下默认收起短期收益列</span>
+                <button id="showNarrowColumns" class="text-button" type="button" aria-pressed="false">展开</button>
+              </div>
+              <label><input type="checkbox" data-column-toggle="estimatedSubscription5d"> 5日累计估算净申赎</label>
+              <label><input type="checkbox" data-column-toggle="estimatedSubscription20d"> 20日累计估算净申赎</label>
+              <label><input type="checkbox" data-column-toggle="shareStreakDays"> 连续净申赎天数</label>
+              <label><input type="checkbox" data-column-toggle="officialShareDate"> 官方份额日期与状态</label>
+              <label><input type="checkbox" data-column-toggle="amountPercentile"> 成交额历史分位</label>
+              <label><input type="checkbox" data-column-toggle="turnoverRate"> 换手率</label>
+              <label><input type="checkbox" data-column-toggle="sharePercentile"> 250日份额分位</label>
+              <label><input type="checkbox" data-column-toggle="marketValue"> 估算基金规模</label>
+              <label><input type="checkbox" data-column-toggle="volatility20d"> 20日波动率</label>
+            </div>
+          </details>
           <a class="button button-quiet" href="/api/export.csv">导出 CSV</a>
         </div>
       </div>
 
       <div class="toolbar">
         <div id="categoryTabs" class="category-tabs" role="tablist" aria-label="ETF分类"></div>
-        <div id="resultCount" class="result-count">正在加载</div>
+        <div class="toolbar-meta">
+          <div id="resultCount" class="result-count">正在加载</div>
+          <button id="clearSortButton" class="text-button" type="button">清除指标排序</button>
+        </div>
       </div>
 
       <div class="table-scroll">
@@ -131,12 +148,42 @@
               <th data-sort="shareDelta" aria-sort="none"><button class="sort-button" type="button">当前日份额变化</button></th>
               <th data-sort="estimatedSubscription" aria-sort="none"><button class="sort-button" type="button">当前日估算净申赎</button></th>
               <th>异常资金评分</th>
+              <th data-column-key="estimatedSubscription5d" data-sort="estimatedSubscription5d" aria-sort="none" hidden><button class="sort-button" type="button">5日累计估算净申赎</button></th>
+              <th data-column-key="estimatedSubscription20d" data-sort="estimatedSubscription20d" aria-sort="none" hidden><button class="sort-button" type="button">20日累计估算净申赎</button></th>
+              <th data-column-key="shareStreakDays" data-sort="shareStreakDays" aria-sort="none" hidden><button class="sort-button" type="button">连续净申赎</button></th>
+              <th data-column-key="officialShareDate" data-sort="officialShareDate" aria-sort="none" hidden><button class="sort-button" type="button">官方份额日期 / 状态</button></th>
+              <th data-column-key="amountPercentile" data-sort="amountPercentile" aria-sort="none" hidden><button class="sort-button" type="button">成交额历史分位</button></th>
+              <th data-column-key="turnoverRate" data-sort="turnoverRate" aria-sort="none" hidden><button class="sort-button" type="button">换手率</button></th>
+              <th data-column-key="sharePercentile" data-sort="sharePercentile" aria-sort="none" hidden><button class="sort-button" type="button">250日份额分位</button></th>
+              <th data-column-key="marketValue" data-sort="marketValue" aria-sort="none" hidden><button class="sort-button" type="button">估算基金规模</button></th>
+              <th data-column-key="volatility20d" data-sort="volatility20d" aria-sort="none" hidden><button class="sort-button" type="button">20日波动率</button></th>
             </tr>
           </thead>
           <tbody id="etfRows">
-            <tr><td colspan="11"><div class="table-loading">正在读取 14 只 ETF 的行情、IOPV 与历史数据...</div></td></tr>
+            <tr><td colspan="17"><div id="tableLoadingText" class="table-loading">正在读取 ETF 的行情、IOPV 与历史数据...</div></td></tr>
           </tbody>
         </table>
+      </div>
+      <div id="etfCards" class="etf-card-list" aria-label="ETF 移动端列表">
+        <div class="etf-card-state">
+          <strong>正在加载 ETF 数据</strong>
+          <span>行情、官方份额与评分将同步呈现</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="signal-panel">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">SIGNAL BOARD</p>
+          <h3>最近完整评分日异动线索</h3>
+        </div>
+        <span id="scoreBoardAsOf" class="muted-note">评分基于 --</span>
+      </div>
+      <div id="signalBoard" class="signal-board">
+        <div class="skeleton-card"></div>
+        <div class="skeleton-card"></div>
+        <div class="skeleton-card"></div>
       </div>
     </section>
 
@@ -160,214 +207,6 @@
     </section>
     </div>
 
-    <div id="evaluationView" class="view-panel" hidden>
-      <section class="evaluation-intro">
-        <div>
-          <p class="eyebrow">SIGNAL EVALUATION</p>
-          <h3>历史回测与评分解释</h3>
-          <p>用信号日及以前的数据评分，只用后续价格检验表现。基准为监测池同期等权收益；命中率必须与同 ETF 无条件命中率及样本数一起阅读。</p>
-        </div>
-        <div id="backtestRunMeta" class="run-meta">正在读取回测运行...</div>
-      </section>
-
-      <section class="summary-grid evaluation-summary" aria-label="信号评估摘要">
-        <article class="summary-card accent-blue">
-          <div class="summary-label">有效信号数</div>
-          <strong id="evalSignalCount">--</strong>
-          <span class="summary-foot" id="evalSignalFoot">仅统计所选切分与筛选</span>
-        </article>
-        <article class="summary-card accent-cyan">
-          <div class="summary-label">基准命中率</div>
-          <strong id="evalBaselineHit">--</strong>
-          <span class="summary-foot">同 ETF 同期间无条件表现</span>
-        </article>
-        <article class="summary-card accent-amber">
-          <div class="summary-label">信号命中率</div>
-          <strong id="evalSignalHit">--</strong>
-          <span class="summary-foot" id="evalHitSamples">样本数 --</span>
-        </article>
-        <article class="summary-card accent-red">
-          <div class="summary-label">相对提升</div>
-          <strong id="evalLift">--</strong>
-          <span class="summary-foot">信号命中率 − 无条件命中率</span>
-        </article>
-        <article class="summary-card accent-blue">
-          <div class="summary-label">中位未来收益</div>
-          <strong id="evalMedianReturn">--</strong>
-          <span class="summary-foot" id="evalHorizonFoot">未来 5 日</span>
-        </article>
-        <article class="summary-card accent-red">
-          <div class="summary-label">最差未来回撤</div>
-          <strong id="evalWorstDrawdown">--</strong>
-          <span class="summary-foot">次日开盘入场后，持有期最低价回撤</span>
-        </article>
-      </section>
-
-      <section class="table-panel evaluation-controls">
-        <div class="section-heading">
-          <div>
-            <p class="eyebrow">FILTERS</p>
-            <h3>回测筛选</h3>
-          </div>
-          <a id="backtestExport" class="button button-quiet" href="/api/export.csv?type=backtest&horizon=5">导出回测明细 CSV</a>
-        </div>
-        <form id="backtestFilters" class="filter-grid">
-          <label>
-            <span>数据切分</span>
-            <select id="backtestSplit" name="split">
-              <option value="validation">留出验证期</option>
-              <option value="train">训练期</option>
-            </select>
-          </label>
-          <label>
-            <span>预测周期</span>
-            <select id="backtestHorizon" name="horizon">
-              <option value="1">未来 1 日</option>
-              <option value="3">未来 3 日</option>
-              <option value="5" selected>未来 5 日</option>
-              <option value="10">未来 10 日</option>
-            </select>
-          </label>
-          <label>
-            <span>ETF</span>
-            <select id="backtestCode" name="code"><option value="">全部 ETF</option></select>
-          </label>
-          <label>
-            <span>分类</span>
-            <select id="backtestCategory" name="category"><option value="">全部分类</option></select>
-          </label>
-          <label>
-            <span>评分等级</span>
-            <select id="backtestLevel" name="level">
-              <option value="">全部等级</option>
-              <option value="observe">观察</option>
-              <option value="active">活跃异动</option>
-              <option value="high">高强度异动</option>
-            </select>
-          </label>
-          <label>
-            <span>开始日期</span>
-            <input id="backtestFrom" name="from" type="date">
-          </label>
-          <label>
-            <span>结束日期</span>
-            <input id="backtestTo" name="to" type="date">
-          </label>
-          <button id="backtestReset" class="button button-quiet" type="button">重置筛选</button>
-        </form>
-        <p id="backtestDataNote" class="data-note">正在加载回测...</p>
-      </section>
-
-      <section class="table-panel">
-        <div class="section-heading">
-          <div>
-            <p class="eyebrow">TRAIN / VALIDATION</p>
-            <h3>训练期与留出验证期</h3>
-          </div>
-          <span class="muted-note">全池时间顺序切分，验证期不参与调参</span>
-        </div>
-        <div class="table-scroll compact-table">
-          <table id="splitComparisonTable">
-            <thead>
-              <tr>
-                <th>周期</th>
-                <th>训练样本</th><th>训练命中率</th><th>训练相对提升</th>
-                <th>验证样本</th><th>验证命中率</th><th>验证相对提升</th>
-                <th>旧规则训练样本</th><th>旧规则训练命中率</th>
-                <th>旧规则验证样本</th><th>旧规则验证命中率</th>
-              </tr>
-            </thead>
-            <tbody><tr><td colspan="11"><div class="table-loading">正在计算...</div></td></tr></tbody>
-          </table>
-        </div>
-      </section>
-
-      <section class="table-panel">
-        <div class="section-heading">
-          <div>
-            <p class="eyebrow">ROBUSTNESS</p>
-            <h3>重叠样本与不确定性</h3>
-          </div>
-          <span class="muted-note">日期分块 bootstrap · 固定随机种子</span>
-        </div>
-        <p id="robustnessNote" class="data-note">正在计算有效独立样本与置信区间...</p>
-        <div class="table-scroll compact-table">
-          <table>
-            <thead>
-              <tr>
-                <th>周期</th>
-                <th>原始信号样本</th>
-                <th>有效独立样本</th>
-                <th>重叠剔除</th>
-                <th>平均收益 95% 区间</th>
-                <th>命中率 95% 区间</th>
-              </tr>
-            </thead>
-            <tbody id="robustnessRows">
-              <tr><td colspan="6"><div class="table-loading">正在计算...</div></td></tr>
-            </tbody>
-          </table>
-        </div>
-        <div id="rollingSubsamples" class="etf-status-grid rolling-grid"></div>
-      </section>
-
-      <section class="table-panel">
-        <div class="section-heading">
-          <div>
-            <p class="eyebrow">HIT-RATE LIFT</p>
-            <h3>分类区分度热力图</h3>
-          </div>
-          <span id="heatmapNote" class="muted-note">颜色为相对无条件命中率提升，单位为百分点</span>
-        </div>
-        <div id="backtestHeatmap" class="chart heatmap-chart"></div>
-      </section>
-
-      <section class="table-panel">
-        <div class="section-heading">
-          <div>
-            <p class="eyebrow">BY ETF</p>
-            <h3>分 ETF 表现</h3>
-          </div>
-          <span class="muted-note">所有百分比均附带样本数</span>
-        </div>
-        <div class="table-scroll">
-          <table class="backtest-table">
-            <thead>
-              <tr>
-                <th>ETF</th><th>样本数</th><th>命中率</th><th>无条件命中率</th><th>相对提升</th>
-                <th>平均收益</th><th>中位收益</th><th>最差回撤</th><th>平均有利波动</th><th>样本状态</th>
-              </tr>
-            </thead>
-            <tbody id="backtestEtfRows"><tr><td colspan="10"><div class="table-loading">正在加载...</div></td></tr></tbody>
-          </table>
-        </div>
-      </section>
-
-      <section class="table-panel">
-        <div class="section-heading">
-          <div>
-            <p class="eyebrow">EVENT TIMELINE</p>
-            <h3>信号时间线</h3>
-          </div>
-          <span id="eventCount" class="muted-note">正在统计事件</span>
-        </div>
-        <div id="signalTimeline" class="signal-timeline">
-          <div class="table-loading">正在加载信号事件...</div>
-        </div>
-      </section>
-
-      <section class="table-panel methodology-panel">
-        <div class="section-heading">
-          <div>
-            <p class="eyebrow">FIXED PARAMETERS</p>
-            <h3>固定参数与数据状态</h3>
-          </div>
-          <span id="parameterVersion" class="muted-note">--</span>
-        </div>
-        <div id="backtestMethodology" class="methodology-copy"></div>
-        <div id="backtestEtfStatus" class="etf-status-grid"></div>
-      </section>
-    </div>
   </main>
 
   <div id="drawerBackdrop" class="drawer-backdrop" hidden></div>
@@ -383,6 +222,82 @@
       <div class="table-loading">选择一只 ETF 查看详情</div>
     </div>
   </aside>
+
+  <div id="manageBackdrop" class="drawer-backdrop" hidden></div>
+  <section id="manageDialog" class="manage-dialog" role="dialog" aria-modal="true" aria-hidden="true" aria-labelledby="manageTitle" tabindex="-1">
+    <div class="drawer-head">
+      <div>
+        <p class="eyebrow">ETF CATALOG</p>
+        <h2 id="manageTitle">管理 ETF</h2>
+        <p id="manageCapacity" class="muted-note">正在读取监控目录...</p>
+      </div>
+      <button id="manageClose" class="icon-button" type="button" aria-label="关闭 ETF 管理">×</button>
+    </div>
+    <div class="manage-body">
+      <section class="manage-section">
+        <div class="manage-section-head">
+          <div>
+            <h3>新增 ETF</h3>
+            <p>输入 6 位代码后自动查询名称和市场；只接受沪深交易所 ETF。</p>
+          </div>
+          <button id="restoreDefaultOrder" class="button button-quiet" type="button">恢复默认排序</button>
+        </div>
+        <form id="addEtfForm" class="catalog-form">
+          <label>
+            <span>ETF 代码</span>
+            <input id="newEtfCode" name="code" inputmode="numeric" maxlength="6" pattern="\d{6}" placeholder="例如 510300" required>
+          </label>
+          <label>
+            <span>名称</span>
+            <input id="newEtfName" name="name" readonly placeholder="自动查询">
+          </label>
+          <label>
+            <span>分类</span>
+            <input id="newEtfCategory" name="category" maxlength="24" placeholder="例如 宽基核心" required>
+          </label>
+          <label>
+            <span>颜色</span>
+            <select id="newEtfTone" name="tone">
+              <option value="broad">宽基蓝</option>
+              <option value="growth">成长紫</option>
+              <option value="tech">科技青</option>
+              <option value="finance">金融金</option>
+              <option value="health">医药粉</option>
+              <option value="hk">港股橙</option>
+            </select>
+          </label>
+          <label class="check-label"><input id="newEtfPinned" name="isPinned" type="checkbox"> 置顶</label>
+          <label class="check-label"><input id="newEtfHighlighted" name="isHighlighted" type="checkbox"> 重点标记</label>
+          <button id="addEtfButton" class="button button-primary" type="submit" disabled>加入监控</button>
+        </form>
+        <div id="etfLookupStatus" class="catalog-status" role="status" aria-live="polite">输入代码后自动校验。</div>
+      </section>
+
+      <section class="manage-section">
+        <div class="manage-section-head">
+          <div>
+            <h3>当前监控</h3>
+            <p>表格内可拖动或使用上下按钮调整；管理面板可编辑分类、颜色、置顶和重点状态。</p>
+          </div>
+        </div>
+        <div id="manageEtfList" class="manage-etf-list">
+          <div class="table-loading">正在加载目录...</div>
+        </div>
+      </section>
+
+      <section class="manage-section">
+        <div class="manage-section-head">
+          <div>
+            <h3>已移出监控</h3>
+            <p>历史数据库完整保留；恢复后沿用已有行情与份额历史。</p>
+          </div>
+        </div>
+        <div id="removedEtfList" class="manage-etf-list">
+          <div class="manage-empty">暂无已移出的 ETF</div>
+        </div>
+      </section>
+    </div>
+  </section>
 
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 </body>
