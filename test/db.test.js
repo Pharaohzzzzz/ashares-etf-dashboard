@@ -64,6 +64,27 @@ test('official share history takes precedence over quote snapshots', () => {
   db.close();
 });
 
+test('same-day quote snapshots remain separate and never replace official shares', () => {
+  const db = createDatabase(':memory:');
+  db.saveShareHistory([
+    { code: '510300', tradeDate: '2026-11-19', shares: 1000000, source: '上交所' }
+  ], '2026-11-20T00:00:00.000Z');
+  db.saveShareHistory([
+    { code: '510300', tradeDate: '2026-11-19', shares: 1000004, source: '行情快照' }
+  ], '2026-11-20T05:48:00.000Z');
+
+  const official = db.getOfficialShareHistory('510300');
+  const current = db.getShareRecord('510300', '2026-11-19');
+  assert.equal(official.length, 1);
+  assert.equal(official[0].shares, 1000000);
+  assert.equal(official[0].source, '上交所');
+  assert.equal(current.shares, 1000000);
+  assert.equal(current.source, '上交所');
+  assert.equal(current.officialFetchedAt, '2026-11-20T00:00:00.000Z');
+  assert.equal(current.snapshotFetchedAt, '2026-11-20T05:48:00.000Z');
+  db.close();
+});
+
 test('share provenance migration backfills old official and snapshot timestamps', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'etf-provenance-'));
   const filePath = path.join(directory, 'dashboard.db');

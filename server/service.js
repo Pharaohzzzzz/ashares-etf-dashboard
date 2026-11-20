@@ -40,6 +40,7 @@ const OFFICIAL_HISTORY_DAYS = 250;
 const OFFICIAL_FETCH_DAYS = OFFICIAL_HISTORY_DAYS + 1;
 const OFFICIAL_RANGES = [20, 60, 250];
 const SSE_FETCH_CONCURRENCY = 4;
+const OFFICIAL_SHARE_SOURCES = new Set(['上交所', '深交所', 'SSE', 'SZSE']);
 
 const shanghaiDateFormatter = new Intl.DateTimeFormat('en-CA', {
   timeZone: 'Asia/Shanghai',
@@ -73,6 +74,49 @@ function snapshotToQuote(row) {
     dataTime: row.data_time,
     capturedAt: row.captured_at,
     tradeDate: row.trade_date
+  };
+}
+
+function isOfficialShareSource(source) {
+  return OFFICIAL_SHARE_SOURCES.has(source);
+}
+
+function calculateOfficialShareMetric({
+  current,
+  previous,
+  expectedPreviousDate,
+  price,
+  priceSource
+}) {
+  const base = {
+    status: 'pending',
+    currentShares: current?.shares ?? null,
+    currentDate: current?.tradeDate ?? null,
+    previousShares: previous?.shares ?? null,
+    previousDate: previous?.tradeDate ?? null,
+    shareDelta: null,
+    estimatedSubscription: null,
+    price: Number.isFinite(price) ? price : null,
+    priceSource: Number.isFinite(price) ? priceSource : null
+  };
+  if (!current) return base;
+  if (
+    !Number.isFinite(current.shares) ||
+    !isOfficialShareSource(current.source) ||
+    !previous ||
+    !Number.isFinite(previous.shares) ||
+    !isOfficialShareSource(previous.source) ||
+    !expectedPreviousDate ||
+    previous.tradeDate !== expectedPreviousDate
+  ) {
+    return { ...base, status: 'insufficient' };
+  }
+  const shareDelta = current.shares - previous.shares;
+  return {
+    ...base,
+    status: 'ready',
+    shareDelta,
+    estimatedSubscription: Number.isFinite(price) ? shareDelta * price : null
   };
 }
 
@@ -857,23 +901,64 @@ class MarketService {
       const previousRatio = priorDayBar
         ? volumeRatio(priorDayBar.amount, priorBars.slice(-21, -1).map((bar) => bar.amount))
         : null;
-      const currentShareRecord = this.db.getShareRecord(quote.code, quote.tradeDate);
-      const shares = currentShareRecord?.shares ?? quote.shares;
-      const sharesSource = currentShareRecord?.source || '行情快照';
-      const previousShareRecord = this.db.getPreviousShareRecord(quote.code, quote.tradeDate);
-      const previousShares = previousShareRecord?.shares ?? null;
-      const shareDelta = shares !== null && previousShares !== null
-        ? shares - previousShares
-        : null;
+      const currentOfficialShare = this.db.getOfficialShareRecord(quote.code, quote.tradeDate);
+      const previousOfficialShare = this.db.getPreviousOfficialShareRecord(
+        quote.code,
+        quote.tradeDate
+      );
+      const closeByDate = new Map(bars.map((bar) => [bar.date, bar.close]));
+      const currentClose = closeByDate.get(quote.tradeDate);
+      const currentMetric = calculateOfficialShareMetric({
+        current: currentOfficialShare,
+        previous: previousOfficialShare,
+        expectedPreviousDate: this.db.getPreviousTradingDate(quote.tradeDate),
+        price: Number.isFinite(currentClose) ? currentClose : quote.price,
+        priceSource: Number.isFinite(currentClose) ? '官方日收盘价' : '行情快照'
+      });
       const latestOfficial = officialHistory.at(-1) || null;
+      const latestPreviousOfficial = latestOfficial
+        ? this.db.getPreviousOfficialShareRecord(quote.code, latestOfficial.tradeDate)
+        : null;
+      const latestClose = latestOfficial ? closeByDate.get(latestOfficial.tradeDate) : null;
+      const latestMetricPrice = Number.isFinite(latestClose)
+        ? latestClose
+        : latestOfficial?.tradeDate === quote.tradeDate
+          ? quote.price
+          : null;
+      const latestMetric = calculateOfficialShareMetric({
+        current: latestOfficial,
+        previous: latestPreviousOfficial,
+        expectedPreviousDate: latestOfficial
+          ? this.db.getPreviousTradingDate(latestOfficial.tradeDate)
+          : null,
+        price: latestMetricPrice,
+        priceSource: Number.isFinite(latestClose) ? '官方日收盘价' : '行情快照'
+      });
       const officialTradeDates = latestOfficial
         ? this.db.getRecentTradeDates(officialHistory.length, latestOfficial.tradeDate)
         : [];
       const iopv = this.getCurrentIopv(quote.code, bars.at(-1)?.date || null);
       return {
         ...quote,
-        shares,
-        sharesSource,
+        quoteShares: quote.shares,
+        quoteShareDate: quote.tradeDate,
+        quoteShareSource: '行情快照',
+        shares: currentMetric.currentShares,
+        sharesSource: currentOfficialShare?.source || null,
+        currentOfficialShares: currentMetric.currentShares,
+        officialShares: latestOfficial?.shares ?? null,
+        currentDayShareMetrics: {
+          tradeDate: quote.tradeDate,
+          status: currentMetric.status,
+          shareDelta: currentMetric.shareDelta,
+          estimatedSubscription: currentMetric.estimatedSubscription,
+          officialShares: currentMetric.currentShares,
+          officialShareDate: currentMetric.currentDate,
+          previousOfficialShares: currentMetric.previousShares,
+          previousOfficialShareDate: currentMetric.previousDate,
+          price: currentMetric.price,
+          priceSource: currentMetric.priceSource
+        },
         volumeRatio: ratio,
         previousVolumeRatio: previousRatio,
         return5d: periodReturn(quote.price, priorBars.map((bar) => bar.close), 5),
@@ -882,19 +967,37 @@ class MarketService {
           quote.amount,
           priorBars.slice(-250).map((bar) => bar.amount)
         ),
-        previousShares,
-        previousShareDate: previousShareRecord?.tradeDate || null,
-        previousShareSource: previousShareRecord?.source || null,
-        shareDelta,
-        estimatedSubscription: shareDelta !== null && quote.price !== null
-          ? shareDelta * quote.price
-          : null,
+        previousShares: previousOfficialShare?.shares ?? null,
+        previousShareDate: previousOfficialShare?.tradeDate || null,
+        previousShareSource: previousOfficialShare?.source || null,
+        previousOfficialShares: previousOfficialShare?.shares ?? null,
+        previousOfficialShareDate: previousOfficialShare?.tradeDate || null,
+        previousOfficialShareSource: previousOfficialShare?.source || null,
+        shareDelta: currentMetric.shareDelta,
+        estimatedSubscription: currentMetric.estimatedSubscription,
+        shareMetricStatus: currentMetric.status,
+        shareMetricPrice: currentMetric.price,
+        shareMetricPriceSource: currentMetric.priceSource,
         officialShareDate: latestOfficial?.tradeDate || null,
         officialShareSource: latestOfficial?.source || null,
         officialShareFetchedAt: latestOfficial?.officialFetchedAt || latestOfficial?.fetchedAt || null,
-        snapshotFetchedAt: currentShareRecord?.snapshotFetchedAt || null,
+        currentOfficialShareFetchedAt: currentOfficialShare?.officialFetchedAt ||
+          currentOfficialShare?.fetchedAt || null,
+        snapshotFetchedAt: quote.capturedAt,
+        latestOfficialShareDelta: latestMetric.shareDelta,
+        latestOfficialShareDeltaDate: latestMetric.currentDate,
+        latestOfficialShares: latestMetric.currentShares,
+        latestOfficialShareSource: latestOfficial?.source || null,
+        latestOfficialPreviousShares: latestMetric.previousShares,
+        latestOfficialPreviousDate: latestMetric.previousDate,
+        latestOfficialPreviousSource: latestPreviousOfficial?.source || null,
+        latestOfficialEstimatedSubscription: latestMetric.estimatedSubscription,
+        latestOfficialMetricStatus: latestMetric.status,
+        latestOfficialMetricPrice: latestMetric.price,
+        latestOfficialMetricPriceSource: latestMetric.priceSource,
         officialShareDays: officialHistory.length,
         shareStreak: calculateShareStreak(officialHistory, officialTradeDates),
+        shareStreakDate: latestOfficial?.tradeDate || null,
         sharePercentile: latestOfficial
           ? percentile(
             latestOfficial.shares,
@@ -966,6 +1069,15 @@ class MarketService {
       });
       return { ...row, ...freshness };
     });
+    const shareMetricStatusCounts = {
+      ready: freshnessRows.filter((row) => row.shareMetricStatus === 'ready').length,
+      pending: freshnessRows.filter((row) => row.shareMetricStatus === 'pending').length,
+      insufficient: freshnessRows.filter((row) => row.shareMetricStatus === 'insufficient').length
+    };
+    const readyShareRows = freshnessRows.filter((row) => row.shareMetricStatus === 'ready');
+    const latestOfficialReadyRows = freshnessRows.filter(
+      (row) => row.latestOfficialMetricStatus === 'ready'
+    );
     const staleRows = freshnessRows.filter((row) => row.isStale);
     const freshRows = freshnessRows.filter((row) => !row.isStale);
     const oldestDataTime = freshnessRows
@@ -1002,7 +1114,18 @@ class MarketService {
         total: rows.length
       },
       volumeUpCount: rows.filter((row) => row.volumeRatio !== null && row.volumeRatio >= 2).length,
-      shareUpCount: rows.filter((row) => row.shareDelta !== null && row.shareDelta > 0).length,
+      shareUpCount: readyShareRows.filter((row) => row.shareDelta > 0).length,
+      shareUpAsOfDate: readyShareRows.map((row) => row.quoteShareDate).filter(Boolean).sort().at(-1) ||
+        null,
+      shareMetricStatusCounts,
+      latestOfficialShareUpCount: latestOfficialReadyRows.filter(
+        (row) => row.latestOfficialShareDelta > 0
+      ).length,
+      latestOfficialShareUpAsOfDate: latestOfficialReadyRows
+        .map((row) => row.latestOfficialShareDeltaDate)
+        .filter(Boolean)
+        .sort()
+        .at(-1) || null,
       compositeCount: rows.filter((row) => row.composite).length,
       scoreSignalCount: rows.filter((row) => row.scoreSignal).length,
       highScoreCount: rows.filter((row) => row.score >= SIGNAL_PARAMETERS.levels.high).length,

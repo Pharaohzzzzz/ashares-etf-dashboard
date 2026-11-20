@@ -109,6 +109,10 @@ test('summary calculates ratio, returns, shares and a broad resonance candidate'
     amount: 100, turnoverRate: 1, shares: 1000, marketValue: 4000,
     timestamp: 1795028400
   }, '2026-10-25', '2026-10-25T07:00:00.000Z');
+  db.saveShareHistory([
+    { code: '510300', tradeDate: '2026-10-25', shares: 1000, source: '上交所' },
+    { code: '510300', tradeDate: '2026-10-26', shares: 1200, source: '上交所' }
+  ], '2026-10-26T08:00:00.000Z');
   const service = new MarketService({
     db,
     now: () => new Date('2026-10-26T08:00:00.000Z')
@@ -116,6 +120,9 @@ test('summary calculates ratio, returns, shares and a broad resonance candidate'
   const summary = service.getSummary();
   const row = summary.etfs.find((etf) => etf.code === '510300');
   assert.equal(row.volumeRatio, 3);
+  assert.equal(row.quoteShares, 1200);
+  assert.equal(row.shares, 1200);
+  assert.equal(row.sharesSource, '上交所');
   assert.equal(row.shareDelta, 200);
   assert.equal(row.signals.some((signal) => signal.key === 'volume'), true);
   assert.equal(summary.totalAmount, 300);
@@ -434,6 +441,234 @@ test('official previous-day shares populate ETF share delta immediately', async 
   assert.equal(row.previousShareSource, '上交所');
   assert.equal(row.shareDelta, 200);
   assert.equal(row.estimatedSubscription, 840);
+  db.close();
+});
+
+test('pending current official shares never mix quote snapshot with prior official shares', () => {
+  const db = createDatabase(':memory:');
+  const bars = createBarsEnding('2026-11-20', 25);
+  db.upsertBars('510300', bars);
+  db.saveSnapshot({
+    code: '510300', price: 4.2, previousClose: 4.1, change: 0.1,
+    changePercent: 2, open: 4.1, high: 4.2, low: 4.0, volume: 100,
+    amount: 100, turnoverRate: 1, shares: 1000001, marketValue: 4000,
+    timestamp: 1795114800
+  }, '2026-11-20', '2026-11-20T05:48:00.000Z');
+  db.saveShareHistory([
+    { code: '510300', tradeDate: '2026-11-18', shares: 900000, source: '上交所' },
+    { code: '510300', tradeDate: '2026-11-19', shares: 1000000, source: '上交所' }
+  ], '2026-11-20T00:00:00.000Z');
+  const service = new MarketService({
+    db,
+    now: () => new Date('2026-11-20T05:48:00.000Z')
+  });
+
+  const summary = service.getSummary();
+  const row = summary.etfs.find((etf) => etf.code === '510300');
+  const previousClose = bars.find((bar) => bar.date === '2026-11-19').close;
+
+  assert.equal(row.tradeDate, '2026-11-20');
+  assert.equal(row.quoteShares, 1000001);
+  assert.equal(row.shares, null);
+  assert.equal(row.sharesSource, null);
+  assert.equal(row.officialShares, 1000000);
+  assert.equal(row.officialShareDate, '2026-11-19');
+  assert.equal(row.officialShareSource, '上交所');
+  assert.equal(row.previousOfficialShares, 1000000);
+  assert.equal(row.previousOfficialShareDate, '2026-11-19');
+  assert.equal(row.shareDelta, null);
+  assert.equal(row.estimatedSubscription, null);
+  assert.equal(row.shareMetricStatus, 'pending');
+  assert.equal(row.latestOfficialShareDelta, 100000);
+  assert.equal(row.latestOfficialShareDeltaDate, '2026-11-19');
+  assert.equal(row.latestOfficialPreviousShares, 900000);
+  assert.equal(row.latestOfficialPreviousDate, '2026-11-18');
+  assert.equal(row.latestOfficialEstimatedSubscription, 100000 * previousClose);
+  assert.equal(row.latestOfficialMetricStatus, 'ready');
+  assert.equal(row.signals.some((signal) => signal.key === 'share-up'), false);
+  assert.equal(summary.shareUpCount, 0);
+  assert.equal(summary.shareMetricStatusCounts.pending >= 1, true);
+  db.close();
+});
+
+test('current official shares become ready only from two continuous official records', () => {
+  const db = createDatabase(':memory:');
+  const bars = createBarsEnding('2026-11-20', 25);
+  db.upsertBars('510300', bars);
+  db.saveSnapshot({
+    code: '510300', price: 4.2, previousClose: 4.1, change: 0.1,
+    changePercent: 2, open: 4.1, high: 4.2, low: 4.0, volume: 100,
+    amount: 100, turnoverRate: 1, shares: 1200001, marketValue: 4000,
+    timestamp: 1795114800
+  }, '2026-11-20', '2026-11-20T05:48:00.000Z');
+  db.saveShareHistory([
+    { code: '510300', tradeDate: '2026-11-19', shares: 1000000, source: '上交所' },
+    { code: '510300', tradeDate: '2026-11-20', shares: 1200000, source: '上交所' }
+  ], '2026-11-20T10:00:00.000Z');
+  const service = new MarketService({
+    db,
+    now: () => new Date('2026-11-20T10:00:00.000Z')
+  });
+
+  const summary = service.getSummary();
+  const row = summary.etfs.find((etf) => etf.code === '510300');
+  const close = bars.find((bar) => bar.date === '2026-11-20').close;
+
+  assert.equal(row.quoteShares, 1200001);
+  assert.equal(row.shares, 1200000);
+  assert.equal(row.sharesSource, '上交所');
+  assert.equal(row.previousOfficialShares, 1000000);
+  assert.equal(row.previousOfficialShareDate, '2026-11-19');
+  assert.equal(row.shareDelta, 200000);
+  assert.equal(row.estimatedSubscription, 200000 * close);
+  assert.equal(row.shareMetricStatus, 'ready');
+  assert.equal(row.latestOfficialShareDelta, 200000);
+  assert.equal(row.latestOfficialMetricStatus, 'ready');
+  assert.equal(summary.shareUpCount, 1);
+  assert.equal(summary.shareUpAsOfDate, '2026-11-20');
+  db.close();
+});
+
+test('quote refresh preserves a same-day official share record and ready status', async () => {
+  const db = createDatabase(':memory:');
+  const bars = createBarsEnding('2026-11-20', 25);
+  db.upsertBars('510300', bars);
+  db.saveShareHistory([
+    { code: '510300', tradeDate: '2026-11-19', shares: 1000000, source: '上交所' },
+    { code: '510300', tradeDate: '2026-11-20', shares: 1200000, source: '上交所' }
+  ], '2026-11-20T10:00:00.000Z');
+  const service = new MarketService({
+    db,
+    quoteProvider: async (etf) => ({
+      code: etf.code, price: 4.2, previousClose: 4.1, change: 0.1,
+      changePercent: 2, open: 4.1, high: 4.2, low: 4.0, volume: 100,
+      amount: 100, turnoverRate: 1,
+      shares: etf.code === '510300' ? 1200001 : 1000,
+      marketValue: 4000, timestamp: 1795114800
+    }),
+    officialIopvProvider: mockOfficialIopv,
+    supplementaryIopvProvider: mockSupplementaryIopv,
+    now: () => new Date('2026-11-20T05:48:00.000Z')
+  });
+
+  const summary = await service.refreshQuotes();
+  const row = summary.etfs.find((etf) => etf.code === '510300');
+  const record = db.getShareRecord('510300', '2026-11-20');
+
+  assert.equal(record.shares, 1200000);
+  assert.equal(record.source, '上交所');
+  assert.equal(row.quoteShares, 1200001);
+  assert.equal(row.shares, 1200000);
+  assert.equal(row.shareDelta, 200000);
+  assert.equal(row.shareMetricStatus, 'ready');
+  db.close();
+});
+
+test('quote refresh keeps pending official metrics null and does not persist a pseudo delta', async () => {
+  const db = createDatabase(':memory:');
+  const bars = createBarsEnding('2026-11-20', 25);
+  db.upsertBars('510300', bars);
+  db.saveShareHistory([
+    { code: '510300', tradeDate: '2026-11-18', shares: 900000, source: '上交所' },
+    { code: '510300', tradeDate: '2026-11-19', shares: 1000000, source: '上交所' }
+  ], '2026-11-20T00:00:00.000Z');
+  const service = new MarketService({
+    db,
+    quoteProvider: async (etf) => ({
+      code: etf.code, price: 4.2, previousClose: 4.1, change: 0.1,
+      changePercent: 2, open: 4.1, high: 4.2, low: 4.0, volume: 100,
+      amount: 100, turnoverRate: 1,
+      shares: etf.code === '510300' ? 1000004 : 1000,
+      marketValue: 4000, timestamp: 1795114800
+    }),
+    officialIopvProvider: mockOfficialIopv,
+    supplementaryIopvProvider: mockSupplementaryIopv,
+    now: () => new Date('2026-11-20T05:48:00.000Z')
+  });
+
+  const summary = await service.refreshQuotes();
+  const row = summary.etfs.find((etf) => etf.code === '510300');
+  const metric = db.raw.prepare(`
+    SELECT shares, share_delta, estimated_subscription
+    FROM daily_metrics
+    WHERE code = '510300' AND trade_date = '2026-11-20'
+  `).get();
+
+  assert.equal(row.quoteShares, 1000004);
+  assert.equal(row.shareMetricStatus, 'pending');
+  assert.equal(row.shareDelta, null);
+  assert.equal(row.estimatedSubscription, null);
+  assert.equal(row.signals.some((signal) => signal.key === 'share-up'), false);
+  assert.deepEqual({ ...metric }, {
+    shares: null,
+    share_delta: null,
+    estimated_subscription: null
+  });
+  db.close();
+});
+
+test('a missing official trading day makes current share metrics insufficient', () => {
+  const db = createDatabase(':memory:');
+  const bars = createBarsEnding('2026-11-20', 25);
+  db.upsertBars('510300', bars);
+  db.saveSnapshot({
+    code: '510300', price: 4.2, previousClose: 4.1, change: 0.1,
+    changePercent: 2, open: 4.1, high: 4.2, low: 4.0, volume: 100,
+    amount: 100, turnoverRate: 1, shares: 1000001, marketValue: 4000,
+    timestamp: 1795114800
+  }, '2026-11-20', '2026-11-20T05:48:00.000Z');
+  db.saveShareHistory([
+    { code: '510300', tradeDate: '2026-11-18', shares: 900000, source: '上交所' },
+    { code: '510300', tradeDate: '2026-11-20', shares: 1200000, source: '上交所' }
+  ], '2026-11-20T10:00:00.000Z');
+  const service = new MarketService({
+    db,
+    now: () => new Date('2026-11-20T10:00:00.000Z')
+  });
+
+  const row = service.getSummary().etfs.find((etf) => etf.code === '510300');
+  assert.equal(row.shareMetricStatus, 'insufficient');
+  assert.equal(row.shareDelta, null);
+  assert.equal(row.estimatedSubscription, null);
+  assert.equal(row.signals.some((signal) => signal.key === 'share-up'), false);
+  db.close();
+});
+
+test('a later official share sync turns the same pending date ready without restart', async () => {
+  const db = createDatabase(':memory:');
+  const bars = createBarsEnding('2026-11-20', 25);
+  db.upsertBars('510300', bars);
+  db.saveSnapshot({
+    code: '510300', price: 4.2, previousClose: 4.1, change: 0.1,
+    changePercent: 2, open: 4.1, high: 4.2, low: 4.0, volume: 100,
+    amount: 100, turnoverRate: 1, shares: 1000001, marketValue: 4000,
+    timestamp: 1795114800
+  }, '2026-11-20', '2026-11-20T05:48:00.000Z');
+  db.saveShareHistory([
+    { code: '510300', tradeDate: '2026-11-18', shares: 900000, source: '上交所' },
+    { code: '510300', tradeDate: '2026-11-19', shares: 1000000, source: '上交所' }
+  ], '2026-11-20T00:00:00.000Z');
+  const sseEtfs = ETFS.filter((etf) => etf.code.startsWith('5'));
+  const szseEtfs = ETFS.filter((etf) => etf.code.startsWith('1'));
+  const service = new MarketService({
+    db,
+    sseShareProvider: async (date) => new Map(sseEtfs.map((etf) => [
+      etf.code,
+      etf.code === '510300' && date === '2026-11-20' ? 1200000 : 1000000
+    ])),
+    szseShareProvider: async (codes) => new Map(codes.map((code) => [code, 1000000])),
+    now: () => new Date('2026-11-20T10:00:00.000Z')
+  });
+
+  const before = service.getSummary().etfs.find((etf) => etf.code === '510300');
+  assert.equal(before.shareMetricStatus, 'pending');
+  await service.syncOfficialShareHistory('2026-11-20', { historyDays: 2 });
+  const after = service.getSummary().etfs.find((etf) => etf.code === '510300');
+
+  assert.equal(after.shareMetricStatus, 'ready');
+  assert.equal(after.shares, 1200000);
+  assert.equal(after.shareDelta, 200000);
+  assert.equal(after.estimatedSubscription, 200000 * bars.at(-1).close);
   db.close();
 });
 

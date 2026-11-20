@@ -2,6 +2,8 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 const { createApp } = require('../server/app');
 
 const summary = {
@@ -27,9 +29,21 @@ const summary = {
     isStale: false,
     officialShareDate: '2026-11-19',
     officialShareSource: '上交所',
+    officialShares: 1000,
+    quoteShares: 1001,
+    previousOfficialShares: 990,
+    previousOfficialShareDate: '2026-11-18',
     officialShareFetchedAt: '2026-11-20T00:00:00.000Z',
     volumeRatio: 2.1, shares: 1000, shareDelta: null,
     estimatedSubscription: null, tradeDate: '2026-11-19',
+    shareMetricStatus: 'pending',
+    latestOfficialShareDelta: 10,
+    latestOfficialShareDeltaDate: '2026-11-19',
+    latestOfficialPreviousShares: 990,
+    latestOfficialPreviousDate: '2026-11-18',
+    latestOfficialEstimatedSubscription: 40,
+    latestOfficialMetricStatus: 'ready',
+    scoreDate: '2026-11-19',
     shareStreak: { direction: 'subscription', label: '连续净申购', days: 3 },
     sharePercentile: 0.82,
     signals: [{ key: 'volume', label: '显著放量', level: 'high' }]
@@ -199,6 +213,13 @@ test('summary, health, detail and CSV APIs respond', async (context) => {
   assert.match(csv, /连续净申赎/);
   assert.match(csv, /行情状态/);
   assert.match(csv, /官方份额抓取时间/);
+  assert.match(csv, /行情快照份额/);
+  assert.match(csv, /当前官方份额/);
+  assert.match(csv, /当前日份额状态/);
+  assert.match(csv, /最近官方日份额变化日期/);
+  assert.match(csv, /pending/);
+  assert.match(csv, /数据不足/);
+  assert.match(csv, /2026-11-19/);
   const shareCsv = await fetch(`${base}/api/export.csv?code=510300&type=shares`)
     .then((response) => response.text());
   assert.match(shareCsv, /官方总份额/);
@@ -254,6 +275,22 @@ test('summary, health, detail and CSV APIs respond', async (context) => {
   const invalidCsvDate = await fetch(`${base}/api/export.csv?type=backtest&from=bad-date`);
   assert.equal(invalidCsvDate.status, 400);
   assert.equal((await invalidCsvDate.json()).error.code, 'INVALID_DATE');
+});
+
+test('overview copy distinguishes pending current shares from the latest official day', () => {
+  const root = path.join(__dirname, '..');
+  const html = fs.readFileSync(path.join(root, 'public', 'index.html'), 'utf8');
+  const client = fs.readFileSync(path.join(root, 'public', 'app.js'), 'utf8');
+
+  assert.match(html, /今日官方净申购/);
+  assert.match(html, /最近完整评分日异动线索/);
+  assert.match(html, /评分基于/);
+  assert.match(html, /交易所官方份额通常不是盘中逐秒数据/);
+  assert.match(client, /待官方发布/);
+  assert.match(client, /评分基于/);
+  assert.match(client, /行情快照份额/);
+  assert.match(client, /当前官方份额/);
+  assert.match(client, /最近官方日/);
 });
 
 test('local application assets are served without stale caching', async (context) => {

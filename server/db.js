@@ -604,6 +604,45 @@ function createDatabase(filePath) {
       `).get(code, tradeDate);
       return official || null;
     },
+    getOfficialShareRecord(code, tradeDate) {
+      if (!tradeDate) return null;
+      return db.prepare(`
+        SELECT trade_date AS tradeDate, shares, source, fetched_at AS fetchedAt,
+               official_fetched_at AS officialFetchedAt,
+               snapshot_fetched_at AS snapshotFetchedAt
+        FROM share_history
+        WHERE code = ? AND trade_date = ?
+          AND source IN ('上交所', '深交所', 'SSE', 'SZSE')
+        LIMIT 1
+      `).get(code, tradeDate) || null;
+    },
+    getPreviousOfficialShareRecord(code, tradeDate) {
+      if (!tradeDate) return null;
+      return db.prepare(`
+        SELECT trade_date AS tradeDate, shares, source, fetched_at AS fetchedAt,
+               official_fetched_at AS officialFetchedAt,
+               snapshot_fetched_at AS snapshotFetchedAt
+        FROM share_history
+        WHERE code = ? AND trade_date < ?
+          AND source IN ('上交所', '深交所', 'SSE', 'SZSE')
+        ORDER BY trade_date DESC
+        LIMIT 1
+      `).get(code, tradeDate) || null;
+    },
+    getPreviousTradingDate(tradeDate) {
+      if (!tradeDate) return null;
+      const calendarDate = db.prepare(`
+        SELECT trade_date AS date
+        FROM trading_calendar
+        WHERE trade_date < ? AND is_trading = 1
+        ORDER BY trade_date DESC
+        LIMIT 1
+      `).get(tradeDate)?.date;
+      if (calendarDate) return calendarDate;
+      return db.prepare(
+        'SELECT MAX(date) AS date FROM daily_bars WHERE date < ?'
+      ).get(tradeDate)?.date || null;
+    },
     getOfficialShareHistory(code, limit = 251) {
       if (!Number.isInteger(limit) || limit < 1) return [];
       return db.prepare(`

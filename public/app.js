@@ -48,9 +48,11 @@ const elements = {
   totalAmount: document.querySelector('#totalAmount'),
   volumeUpCount: document.querySelector('#volumeUpCount'),
   shareUpCount: document.querySelector('#shareUpCount'),
+  shareUpFoot: document.querySelector('#shareUpFoot'),
   compositeCount: document.querySelector('#compositeCount'),
   resonanceHint: document.querySelector('#resonanceHint'),
   signalBoard: document.querySelector('#signalBoard'),
+  scoreBoardAsOf: document.querySelector('#scoreBoardAsOf'),
   categoryTabs: document.querySelector('#categoryTabs'),
   resultCount: document.querySelector('#resultCount'),
   searchInput: document.querySelector('#searchInput'),
@@ -190,6 +192,29 @@ function directionClass(value) {
   return 'neutral';
 }
 
+function shareMetricStatusLabel(status) {
+  if (status === 'ready') return '官方日终';
+  if (status === 'pending') return '待官方发布';
+  return '数据不足';
+}
+
+function latestOfficialMetricNote(row) {
+  if (row.latestOfficialMetricStatus !== 'ready' || !row.latestOfficialShareDeltaDate) {
+    return '最近官方日数据不足';
+  }
+  return `最近官方日，截至 ${row.latestOfficialShareDeltaDate} · 官方日终 ${formatter.signedShares(row.latestOfficialShareDelta)}`;
+}
+
+function latestOfficialSubscriptionNote(row) {
+  if (row.latestOfficialMetricStatus !== 'ready' || !row.latestOfficialShareDeltaDate) {
+    return '最近官方日数据不足';
+  }
+  if (!Number.isFinite(row.latestOfficialEstimatedSubscription)) {
+    return `最近官方日，截至 ${row.latestOfficialShareDeltaDate} · 缺少同日价格`;
+  }
+  return `最近官方日，截至 ${row.latestOfficialShareDeltaDate} · ${formatter.signedAmount(row.latestOfficialEstimatedSubscription)}`;
+}
+
 function createElement(tag, className, text) {
   const node = document.createElement(tag);
   if (className) node.className = className;
@@ -281,11 +306,34 @@ function renderSummary() {
   if (!summary) return;
   elements.totalAmount.textContent = formatter.amount(summary.totalAmount);
   elements.volumeUpCount.textContent = summary.volumeUpCount ?? 0;
-  elements.shareUpCount.textContent = summary.shareUpCount ?? 0;
   elements.compositeCount.textContent = summary.scoreSignalCount ?? 0;
+  const shareCounts = summary.shareMetricStatusCounts || {};
+  const readyShareCount = shareCounts.ready || 0;
+  const pendingShareCount = shareCounts.pending || 0;
+  elements.shareUpCount.classList.toggle('is-status', readyShareCount === 0);
+  if (readyShareCount > 0) {
+    elements.shareUpCount.textContent = summary.shareUpCount ?? 0;
+    const pendingNote = pendingShareCount > 0 ? ` · ${pendingShareCount} 只待发布` : '';
+    elements.shareUpFoot.textContent = `${summary.shareUpAsOfDate || '--'} 官方日终 · ${readyShareCount}/${state.rows.length} 只已发布${pendingNote}`;
+  } else if (pendingShareCount > 0) {
+    elements.shareUpCount.textContent = '待官方发布';
+    elements.shareUpFoot.textContent = summary.latestOfficialShareUpAsOfDate
+      ? `最近官方日，截至 ${summary.latestOfficialShareUpAsOfDate} · ${summary.latestOfficialShareUpCount || 0} 只净申购`
+      : '交易所官方份额尚未发布';
+  } else {
+    elements.shareUpCount.textContent = '数据不足';
+    elements.shareUpFoot.textContent = '缺少连续官方份额记录';
+  }
+  const scoreDates = state.rows.map((row) => row.scoreDate).filter(Boolean).sort();
+  const latestScoreDate = scoreDates.at(-1) || null;
+  elements.scoreBoardAsOf.textContent = latestScoreDate
+    ? `评分基于 ${latestScoreDate} · 非实时`
+    : '评分暂不可用';
   const highCount = state.rows.filter((row) => row.scoreLevel?.key === 'high').length;
   const activeCount = state.rows.filter((row) => row.scoreLevel?.key === 'active').length;
-  elements.resonanceHint.textContent = `${activeCount} 只活跃 · ${highCount} 只高强度`;
+  elements.resonanceHint.textContent = latestScoreDate
+    ? `评分日 ${latestScoreDate} · ${activeCount} 只活跃 · ${highCount} 只高强度`
+    : '等待最近完整评分日';
   elements.dataTime.textContent = formatter.time(summary.dataTime);
   elements.generatedTime.textContent = `抓取于 ${formatter.fullTime(summary.generatedAt)}`;
   updateMarketStatus();
@@ -459,16 +507,8 @@ function renderTable() {
     tr.append(ratioCell);
     tr.append(createElement('td', directionClass(row.return5d), formatter.percent(row.return5d)));
     tr.append(createElement('td', directionClass(row.return20d), formatter.percent(row.return20d)));
-    tr.append(createElement(
-      'td',
-      directionClass(row.shareDelta),
-      row.shareDelta === null ? '待积累' : formatter.signedShares(row.shareDelta)
-    ));
-    tr.append(createElement(
-      'td',
-      directionClass(row.estimatedSubscription),
-      row.estimatedSubscription === null ? '--' : formatter.signedAmount(row.estimatedSubscription)
-    ));
+    tr.append(createShareMetricCell(row, 'shareDelta'));
+    tr.append(createShareMetricCell(row, 'estimatedSubscription'));
     tr.append(createSignalCell(row));
     tr.addEventListener('click', () => openDetail(row.code));
     tr.addEventListener('keydown', (event) => {
@@ -479,6 +519,30 @@ function renderTable() {
     });
     elements.etfRows.append(tr);
   }
+}
+
+function createShareMetricCell(row, field) {
+  const td = document.createElement('td');
+  const wrapper = createElement('div', 'share-metric-cell');
+  const ready = row.shareMetricStatus === 'ready';
+  const value = row[field];
+  const primary = ready
+    ? field === 'shareDelta'
+      ? formatter.signedShares(value)
+      : formatter.signedAmount(value)
+    : shareMetricStatusLabel(row.shareMetricStatus);
+  const note = field === 'shareDelta'
+    ? latestOfficialMetricNote(row)
+    : latestOfficialSubscriptionNote(row);
+  wrapper.append(
+    createElement('strong', ready ? directionClass(value) : 'status-note', primary),
+    createElement('small', '', note)
+  );
+  td.append(wrapper);
+  td.title = ready
+    ? `当前行情日 ${row.tradeDate || '--'} 官方日终指标`
+    : `${primary}；${note}`;
+  return td;
 }
 
 function createPremiumCell(row) {
@@ -615,6 +679,9 @@ function renderDetail(detail, intraday) {
   const metrics = createElement('div', 'detail-metrics');
   const iopv = detail.iopvHistory;
   const currentIopv = iopv?.current || {};
+  const currentShareMetric = row.currentDayShareMetrics || {};
+  const currentShareStatus = shareMetricStatusLabel(row.shareMetricStatus);
+  const latestOfficialStatus = shareMetricStatusLabel(row.latestOfficialMetricStatus);
   const premiumUnavailableLabel = currentIopv.label || (row.premiumStatus === 'valid' ? '暂无' : '数据异常');
   const items = [
     ['最新价', formatter.price(row.price), ''],
@@ -634,15 +701,38 @@ function renderDetail(detail, intraday) {
     ['20日量比', formatter.ratio(row.volumeRatio), row.volumeRatio >= 2 ? 'positive' : ''],
     ['近5日', formatter.percent(row.return5d), directionClass(row.return5d)],
     ['近20日', formatter.percent(row.return20d), directionClass(row.return20d)],
-    ['当前份额', formatter.shares(row.shares), ''],
-    ['上一期份额', formatter.shares(row.previousShares), ''],
-    ['份额基准', row.previousShareDate ? `${row.previousShareDate} · ${row.previousShareSource}` : '--', 'neutral'],
-    ['份额变化', row.shareDelta === null ? '待积累' : formatter.signedShares(row.shareDelta), directionClass(row.shareDelta)],
-    ['估算净申赎', row.estimatedSubscription === null ? '--' : formatter.signedAmount(row.estimatedSubscription), directionClass(row.estimatedSubscription)],
+    ['行情快照份额', formatter.shares(row.quoteShares), 'neutral'],
+    ['行情快照日期', row.quoteShareDate ? `${row.quoteShareDate} · 行情快照` : '--', 'neutral'],
+    ['当前官方份额', Number.isFinite(row.shares) ? formatter.shares(row.shares) : '待官方发布', row.shareMetricStatus === 'ready' ? '' : 'status-warning'],
+    ['当前官方份额日期', currentShareMetric.officialShareDate || '待官方发布', 'neutral'],
+    ['当前日指标状态', currentShareStatus, row.shareMetricStatus === 'ready' ? '' : 'status-warning'],
+    ['当前日上一官方份额', row.previousOfficialShareDate
+      ? `${row.previousOfficialShareDate} · ${formatter.shares(row.previousOfficialShares)} · ${row.previousOfficialShareSource}`
+      : '暂无', 'neutral'],
+    ['当前日官方份额变化', row.shareMetricStatus === 'ready'
+      ? formatter.signedShares(row.shareDelta)
+      : currentShareStatus, directionClass(row.shareDelta)],
+    ['当前日估算净申赎', row.shareMetricStatus === 'ready'
+      ? formatter.signedAmount(row.estimatedSubscription)
+      : currentShareStatus, directionClass(row.estimatedSubscription)],
+    ['最近官方总份额', row.officialShareDate
+      ? `${row.officialShareDate} · ${formatter.shares(row.officialShares)}`
+      : '暂无', 'neutral'],
+    ['最近官方日份额变化', row.latestOfficialMetricStatus === 'ready'
+      ? `${row.latestOfficialShareDeltaDate} 官方日终 · ${formatter.signedShares(row.latestOfficialShareDelta)}`
+      : latestOfficialStatus, directionClass(row.latestOfficialShareDelta)],
+    ['最近官方日上一份额', row.latestOfficialPreviousDate
+      ? `${row.latestOfficialPreviousDate} · ${formatter.shares(row.latestOfficialPreviousShares)}`
+      : '暂无', 'neutral'],
+    ['最近官方日估算净申赎', row.latestOfficialMetricStatus === 'ready'
+      ? `${row.latestOfficialShareDeltaDate} · ${formatter.signedAmount(row.latestOfficialEstimatedSubscription)}`
+      : latestOfficialStatus, directionClass(row.latestOfficialEstimatedSubscription)],
     ['成交额分位', formatter.plainPercent(row.amountPercentile === null ? null : row.amountPercentile * 100, 1), ''],
-    ['连续净申赎', row.shareStreak?.days ? `${row.shareStreak.label} ${row.shareStreak.days}日` : '无连续序列', directionClass(row.shareStreak?.direction === 'subscription' ? 1 : row.shareStreak?.direction === 'redemption' ? -1 : 0)],
+    ['连续净申赎', row.shareStreak?.days
+      ? `${row.shareStreak.label} ${row.shareStreak.days}日 · 截至 ${row.shareStreakDate}`
+      : '无连续序列', directionClass(row.shareStreak?.direction === 'subscription' ? 1 : row.shareStreak?.direction === 'redemption' ? -1 : 0)],
     ['250日份额分位', formatter.plainPercent(row.sharePercentile === null ? null : row.sharePercentile * 100, 1), ''],
-    ['官方份额截至', row.officialShareDate ? `${row.officialShareDate} · ${row.officialShareSource}` : '暂无官方记录', 'neutral'],
+    ['最新官方来源', row.officialShareDate ? `${row.officialShareDate} · ${row.officialShareSource}` : '暂无官方记录', 'neutral'],
     ['尾盘成交占比', formatter.plainPercent(intraday.tailVolumeShare === null ? null : intraday.tailVolumeShare * 100), '']
   ];
   for (const [label, value, className] of items) {
@@ -690,7 +780,7 @@ function renderDetail(detail, intraday) {
   elements.drawerBody.append(scoreNote);
 
   const disclaimer = createElement('div', 'detail-note');
-  disclaimer.textContent = '折溢价率统一为“市场价 ÷ IOPV − 1”。IOPV 优先使用交易所官方数据，来源时间无法对齐时不做跨源合并；缺失、为零、过期或来源冲突时只显示异常状态，不用 0 或推算值代替。历史曲线只使用上交所、深交所官方份额，缺失日期不补齐。候选信号不代表已确认的国家队成交。';
+  disclaimer.textContent = '折溢价率统一为“市场价 ÷ IOPV − 1”。IOPV 优先使用交易所官方数据，来源时间无法对齐时不做跨源合并；缺失、为零、过期或来源冲突时只显示异常状态。交易所官方份额通常不是盘中逐秒数据：行情快照份额仅作展示和校验，当前日官方份额未发布时不计算份额变化或估算净申赎。历史曲线只使用上交所、深交所官方份额，缺失日期不补齐。份额只能作为一级市场净申赎代理，不能确认交易账户或国家队身份。';
   elements.drawerBody.append(disclaimer);
 
   const signalNote = createElement('section', 'signal-note');

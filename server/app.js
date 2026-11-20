@@ -356,17 +356,29 @@ function createApp({
             { key: 'amount', label: '成交额' },
             { key: 'turnoverRate', label: '换手率' },
             { key: 'volumeRatio', label: '20日量比' },
-            { key: 'shares', label: '份额' },
-            { key: 'shareDelta', label: '份额变化' },
-            { key: 'estimatedSubscription', label: '估算净申赎' },
+            { key: 'quoteShares', label: '行情快照份额' },
+            { key: 'shares', label: '当前官方份额' },
+            { key: 'officialShares', label: '最新官方总份额' },
+            { key: 'officialShareDate', label: '官方份额日期' },
+            { key: 'officialShareSource', label: '官方份额来源' },
+            { key: 'previousOfficialShares', label: '当前日上一官方份额' },
+            { key: 'previousOfficialShareDate', label: '当前日上一官方份额日期' },
+            { key: 'shareMetricStatus', label: '当前日份额状态' },
+            { key: 'shareDelta', label: '当前日官方份额变化' },
+            { key: 'estimatedSubscription', label: '当前日估算净申赎' },
+            { key: 'latestOfficialShareDelta', label: '最近官方日份额变化' },
+            { key: 'latestOfficialShareDeltaDate', label: '最近官方日份额变化日期' },
+            { key: 'latestOfficialPreviousShares', label: '最近官方日上一份额' },
+            { key: 'latestOfficialPreviousDate', label: '最近官方日上一份额日期' },
+            { key: 'latestOfficialEstimatedSubscription', label: '最近官方日估算净申赎' },
+            { key: 'latestOfficialMetricStatus', label: '最近官方日指标状态' },
+            { key: 'scoreDate', label: '评分日期' },
             { key: 'shareStreak', label: '连续净申赎' },
             { key: 'sharePercentile', label: '份额历史分位' },
             { key: 'tradeDate', label: '交易日' },
             { key: 'dataTime', label: '行情时间' },
             { key: 'capturedAt', label: '抓取时间' },
             { key: 'quoteStatus', label: '行情状态' },
-            { key: 'officialShareDate', label: '官方份额日期' },
-            { key: 'officialShareSource', label: '官方份额来源' },
             { key: 'officialShareFetchedAt', label: '官方份额抓取时间' },
             { key: 'signals', label: '候选信号' }
           ];
@@ -375,6 +387,13 @@ function createApp({
             premiumRate: Number.isFinite(row.premiumRate)
               ? `${(row.premiumRate * 100).toFixed(4)}%`
               : (row.premiumStatusLabel || '暂无'),
+            shares: Number.isFinite(row.shares) ? row.shares : '数据不足',
+            shareDelta: csvNumberOrMissing(row.shareDelta),
+            estimatedSubscription: csvNumberOrMissing(row.estimatedSubscription),
+            latestOfficialShareDelta: csvNumberOrMissing(row.latestOfficialShareDelta),
+            latestOfficialEstimatedSubscription: csvNumberOrMissing(
+              row.latestOfficialEstimatedSubscription
+            ),
             shareStreak: row.shareStreak?.days
               ? `${row.shareStreak.label} ${row.shareStreak.days}日`
               : '无连续序列',

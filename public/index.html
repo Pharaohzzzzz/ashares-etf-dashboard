@@ -6,9 +6,9 @@
   <meta name="theme-color" content="#080b11">
   <title>ETF资金雷达</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='15' fill='%230b1421'/%3E%3Cpath d='M15 45V31h7v14zm13 0V20h7v25zm13 0V26h7v19z' fill='%234d8dff'/%3E%3C/svg%3E">
-  <link rel="stylesheet" href="/styles.css?v=20261120-24">
+  <link rel="stylesheet" href="/styles.css?v=20261120-25">
   <script src="/vendor/echarts.min.js?v=6.1.0" defer></script>
-  <script src="/app.js?v=20261120-24" defer></script>
+  <script src="/app.js?v=20261120-25" defer></script>
 </head>
 <body>
   <div class="ambient ambient-a"></div>
@@ -70,9 +70,9 @@
         <span class="summary-foot">成交额达到均值 2 倍</span>
       </article>
       <article class="summary-card accent-amber">
-        <div class="summary-label">份额增加</div>
+        <div class="summary-label">今日官方净申购</div>
         <strong id="shareUpCount">--</strong>
-        <span class="summary-foot">相对上一已记录交易日</span>
+        <span class="summary-foot" id="shareUpFoot">等待当日官方份额发布</span>
       </article>
       <article class="summary-card accent-cyan">
         <div class="summary-label">评分 ≥ 40</div>
@@ -85,9 +85,9 @@
       <div class="section-heading">
         <div>
           <p class="eyebrow">SIGNAL BOARD</p>
-          <h3>今日异动线索</h3>
+          <h3>最近完整评分日异动线索</h3>
         </div>
-          <span class="muted-note">评分解读 · 非身份判断</span>
+          <span id="scoreBoardAsOf" class="muted-note">评分基于 --</span>
       </div>
       <div id="signalBoard" class="signal-board">
         <div class="skeleton-card"></div>
@@ -128,8 +128,8 @@
               <th data-sort="volumeRatio" aria-sort="none"><button class="sort-button" type="button">20日量比</button></th>
               <th data-sort="return5d" aria-sort="none"><button class="sort-button" type="button">近5日</button></th>
               <th data-sort="return20d" aria-sort="none"><button class="sort-button" type="button">近20日</button></th>
-              <th data-sort="shareDelta" aria-sort="none"><button class="sort-button" type="button">份额变化</button></th>
-              <th data-sort="estimatedSubscription" aria-sort="none"><button class="sort-button" type="button">估算净申赎</button></th>
+              <th data-sort="shareDelta" aria-sort="none"><button class="sort-button" type="button">当前日份额变化</button></th>
+              <th data-sort="estimatedSubscription" aria-sort="none"><button class="sort-button" type="button">当前日估算净申赎</button></th>
               <th>异常资金评分</th>
             </tr>
           </thead>
@@ -145,8 +145,8 @@
         <p class="eyebrow">METHODOLOGY</p>
         <h3>数据口径</h3>
         <p>折溢价率统一使用“市场价 ÷ IOPV − 1”。IOPV 优先采用上交所、深交所官方实时参考净值；交易所不可用时才降级到明确标注的东方财富公开报价字段。来源时间无法可靠对齐时不合并，冲突或过期时不展示当前折溢价。</p>
-        <p>20日量比使用当前成交额与前 20 个完整交易日成交额均值计算。份额变化优先采用上交所、深交所上一交易日官方份额；详情页可按 20/60/250 日查看官方份额、累计估算净申赎、连续净申赎天数和份额历史分位。缺失日期保留为空，不伪造数据。</p>
-        <p>ETF 二级市场买入不改变基金总份额，因此份额变化只能作为一级市场净申赎代理，不能识别交易账户。累计净申赎使用相邻官方份额变化 × 当日收盘价估算。</p>
+        <p>20日量比使用当前成交额与前 20 个完整交易日成交额均值计算。交易所官方份额通常不是盘中逐秒数据；当前行情日期尚未发布官方份额时，页面显示“待官方发布”，不会把行情快照份额与上一官方份额相减。详情页可按 20/60/250 日查看官方份额、累计估算净申赎、连续净申赎天数和份额历史分位。</p>
+        <p>行情快照份额仅用于展示和校验；官方份额变化、估算净申赎与净申购标签只使用同日及前一实际交易日的交易所官方记录。ETF 二级市场买入不改变基金总份额，因此份额变化只能作为一级市场净申赎代理，不能确认交易账户或国家队身份。</p>
         <p>新版评分把成交额量比、官方份额变化分位、连续净申赎与宽基/同分类共振拆成可追溯贡献分。40–59 为观察，60–79 为活跃异动，80 以上为高强度异动；评分不构成国家队身份确认或投资建议。</p>
       </article>
       <article class="info-panel">
