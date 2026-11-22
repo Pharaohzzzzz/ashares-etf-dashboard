@@ -21,9 +21,11 @@ const {
 const {
   fetchQuote,
   fetchKlines,
+  fetchRawCloses,
   fetchTrends,
   lookupEtf
 } = require('./provider');
+const { ExtendedShareHistory, isExtendedShareRange, calculateExtendedRange } = require('./extended-share-history');
 const {
   IOPV_ALERT_THRESHOLD,
   calculatePremiumRate,
@@ -166,6 +168,7 @@ class MarketService {
     db,
     quoteProvider = fetchQuote,
     klineProvider = fetchKlines,
+    rawCloseProvider = fetchRawCloses,
     trendProvider = fetchTrends,
     sseShareProvider = fetchSseEtfShares,
     szseShareProvider = fetchSzseEtfShares,
@@ -190,6 +193,7 @@ class MarketService {
     this.etfLookupProvider = etfLookupProvider;
     this.calendarMaxAgeMs = calendarMaxAgeMs;
     this.now = now;
+    this.extendedShareHistory = new ExtendedShareHistory({ db, now, rawCloseProvider, sseShareProvider, szseRangeProvider });
     this.refreshPromise = null;
     this.shareSyncPromise = null;
     this.iopvRefreshPromise = null;
@@ -1769,6 +1773,7 @@ class MarketService {
   getShareHistory(code, selectedDays = OFFICIAL_HISTORY_DAYS) {
     const etf = this.getEtfConfig(code);
     if (!etf) return null;
+    if (isExtendedShareRange(selectedDays)) return this.extendedShareHistory.getHistory(code, selectedDays);
     const history = this.db.getOfficialShareHistory(
       code,
       Math.max(...OFFICIAL_RANGES) + 1
@@ -1779,12 +1784,17 @@ class MarketService {
       ? this.db.getRecentTradeDates(OFFICIAL_FETCH_DAYS, latestOfficial.tradeDate)
       : [];
     const ranges = Object.fromEntries(OFFICIAL_RANGES.map((days) => {
-      const analysis = calculateShareWindow(history, bars, days, officialTradeDates);
+      const analysis = calculateExtendedRange({
+        code, selectedDays: days, shares: history, closes: bars,
+        dates: officialTradeDates.slice(-(days + 1)), calendarComplete: true
+      });
       const missingDates = analysis.points.filter((point) => point.shares === null).map((point) => point.tradeDate);
       const availableDays = analysis.points.length - missingDates.length;
       const missingDays = days - availableDays;
       return [days, {
         ...analysis,
+        periodShareDelta: analysis.shareDeltaDays === days ? analysis.periodShareDelta : null,
+        periodEstimatedSubscription: analysis.estimatedDays === days ? analysis.periodEstimatedSubscription : null,
         coverage: {
           requestedDays: days,
           availableDays,
@@ -1804,6 +1814,7 @@ class MarketService {
     return {
       code,
       selectedDays,
+      extendedRanges: [750, 1250, 'all'],
       generatedAt: this.now().toISOString(),
       latestOfficialDate: latestOfficial?.tradeDate || null,
       firstOfficialDate: history[0]?.tradeDate || null,
@@ -1820,6 +1831,11 @@ class MarketService {
       range: ranges[selectedDays] || ranges[OFFICIAL_HISTORY_DAYS],
       ranges
     };
+  }
+
+  startExtendedShareHistory(code, days) {
+    if (!this.getEtfConfig(code) || !isExtendedShareRange(days)) return null;
+    return this.extendedShareHistory.start(code, days);
   }
 
   getIopvHistory(code, selectedDays = OFFICIAL_HISTORY_DAYS, { includeCloseHistory = true } = {}) {

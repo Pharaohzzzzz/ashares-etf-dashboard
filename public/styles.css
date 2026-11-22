@@ -1866,6 +1866,7 @@ th[aria-sort="descending"] .sort-button::after {
 
 .range-tabs {
   display: inline-flex;
+  flex-wrap: wrap;
   gap: 2px;
   padding: 2px;
   border: 1px solid var(--line);
@@ -1883,6 +1884,7 @@ th[aria-sort="descending"] .sort-button::after {
   background: transparent;
   cursor: pointer;
   font-size: 11px;
+  white-space: nowrap;
 }
 
 .range-tab:hover {
@@ -1953,6 +1955,24 @@ th[aria-sort="descending"] .sort-button::after {
   margin-top: var(--space-2);
   padding: 0 9px;
   font-size: 11px;
+}
+
+.share-history-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.share-history-actions .button {
+  min-height: 30px;
+  margin-top: 0;
+  font-size: 11px;
+}
+
+.share-action-links {
+  margin-top: var(--space-2);
 }
 
 .chart {

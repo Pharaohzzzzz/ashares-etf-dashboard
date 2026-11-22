@@ -26,9 +26,10 @@ async function fetchWithRetry(url, options, retries = 2) {
   throw lastError;
 }
 
-function parseSseShares(data) {
+function parseSseShares(data, tradeDate = null) {
   const result = new Map();
   for (const row of data.result || []) {
+    if (tradeDate && row.STAT_DATE !== tradeDate) continue;
     const shares = Math.round(Number(row.TOT_VOL) * 10000);
     if (row.SEC_CODE && Number.isFinite(shares) && shares > 0) {
       result.set(String(row.SEC_CODE), shares);
@@ -57,7 +58,12 @@ async function fetchSseEtfShares(tradeDate) {
     },
     body
   });
-  return parseSseShares(await response.json());
+  const data = await response.json();
+  if (!Array.isArray(data.result)) throw new Error('上交所份额响应缺少数据列表');
+  if (data.result.length && !data.result.every((row) => row.STAT_DATE === tradeDate)) {
+    throw new Error('上交所返回的份额日期与请求不一致');
+  }
+  return parseSseShares(data, tradeDate);
 }
 
 function decodeXml(value) {

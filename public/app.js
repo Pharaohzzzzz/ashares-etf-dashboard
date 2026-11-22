@@ -8,6 +8,14 @@ const TASK_STATUS_LABELS = {
 };
 const COLUMN_STORAGE_KEY = 'etf-dashboard-columns-v1';
 const DENSITY_STORAGE_KEY = 'etf-dashboard-density-v1';
+const SHARE_RANGES = [[20, '20日'], [60, '60日'], [250, '250日'], [750, '约3年'], [1250, '约5年'], ['all', '全部可得']];
+const SHARE_ESTIMATE_GAPS = {
+  baseline: '首个官方份额作为期初基准',
+  missing_share: '缺少当日官方份额',
+  missing_previous_share: '缺少前一交易日官方份额',
+  missing_price: '缺少同日不复权收盘价',
+  share_split: '公告确认份额拆分或折算，当日估算留空'
+};
 const COLUMN_DEFAULTS = {
   estimatedSubscription5d: false,
   estimatedSubscription20d: false,
@@ -51,6 +59,10 @@ const state = {
   detailRequest: null,
   detailData: null,
   shareRange: 250,
+  shareHistoryRequest: null,
+  shareHistoryTimer: null,
+  extendedShareHistory: null,
+  shareHistoryMessage: '',
   shareChart: null,
   charts: [],
   drawerTrigger: null,
@@ -1548,6 +1560,7 @@ async function restoreDefaultOrder() {
 async function openDetail(code) {
   rememberDrawerTrigger(`[data-etf-code="${code}"]`);
   state.detailRequest?.abort();
+  stopShareHistoryRequest();
   const request = new AbortController();
   state.detailRequest = request;
   state.detailData = null;
@@ -1814,11 +1827,12 @@ function renderDetail(detail, intradayResult) {
   const rangeTabs = createElement('div', 'range-tabs');
   rangeTabs.setAttribute('role', 'tablist');
   rangeTabs.setAttribute('aria-label', '份额历史视角');
-  for (const days of [20, 60, 250]) {
+  const supportedRanges = SHARE_RANGES.filter(([days]) => days <= 250 || detail.shareHistory?.extendedRanges?.includes(days));
+  for (const [days, label] of supportedRanges) {
     const button = createElement(
       'button',
       `range-tab ${state.shareRange === days ? 'active' : ''}`,
-      `${days}日`
+      label
     );
     button.type = 'button';
     button.dataset.range = String(days);
@@ -1834,9 +1848,25 @@ function renderDetail(detail, intradayResult) {
   shareChart.id = 'shareHistoryChart';
   const coverageNote = createElement('div', 'share-coverage-note');
   coverageNote.id = 'shareCoverageNote';
+  const shareSyncNote = createElement('div', 'share-coverage-note');
+  shareSyncNote.id = 'shareHistorySyncNote';
+  shareSyncNote.setAttribute('role', 'status');
+  shareSyncNote.hidden = true;
+  const shareActionLinks = createElement('div', 'source-links share-action-links');
+  shareActionLinks.id = 'shareHistoryActionLinks';
+  shareActionLinks.hidden = true;
+  const shareActions = createElement('div', 'share-history-actions');
   const shareExport = createElement('a', 'button button-quiet share-export', '导出官方份额 CSV');
-  shareExport.href = `/api/export.csv?code=${row.code}&type=shares`;
-  shareCard.append(shareHeading, rangeSummary, shareChart, coverageNote, shareExport);
+  shareExport.id = 'shareHistoryExport';
+  const shareRetry = createElement('button', 'button button-quiet', '继续补抓');
+  shareRetry.type = 'button';
+  shareRetry.id = 'shareHistoryRetry';
+  shareRetry.hidden = true;
+  shareRetry.addEventListener('click', () => {
+    if (state.shareHistoryRequest) loadExtendedShareHistory(state.shareHistoryRequest, { method: 'POST' });
+  });
+  shareActions.append(shareExport, shareRetry);
+  shareCard.append(shareHeading, rangeSummary, shareChart, coverageNote, shareSyncNote, shareActionLinks, shareActions);
   elements.drawerBody.append(shareCard);
 
   const intradayCard = createElement('section', 'chart-card');
@@ -1894,34 +1924,118 @@ function renderDetail(detail, intradayResult) {
 }
 
 function selectShareRange(days) {
+  if (state.shareRange === days) return;
+  stopShareHistoryRequest();
   state.shareRange = days;
   document.querySelectorAll('.range-tab').forEach((button) => {
-    const active = Number(button.dataset.range) === days;
+    const active = button.dataset.range === String(days);
     button.classList.toggle('active', active);
     button.setAttribute('aria-selected', String(active));
   });
+  if (days === 'all' || days > 250) {
+    state.shareHistoryRequest = new AbortController();
+    loadExtendedShareHistory(state.shareHistoryRequest, { startIfIdle: true });
+    return;
+  }
   renderShareRange();
 }
 
-function renderShareRange() {
-  const history = state.detailData?.shareHistory;
+function stopShareHistoryRequest() {
+  state.shareHistoryRequest?.abort();
+  clearTimeout(state.shareHistoryTimer);
+  state.shareHistoryRequest = null;
+  state.shareHistoryTimer = null;
+  state.extendedShareHistory = null;
+  state.shareHistoryMessage = '';
+}
+
+async function loadExtendedShareHistory(request, { method = 'GET', startIfIdle = false } = {}) {
+  const path = `/api/etfs/${state.detailData.quote.code}/share-history?days=${state.shareRange}`;
+  const options = { method, signal: request.signal };
+  const polling = Boolean(state.extendedShareHistory);
+  if (!polling || method === 'POST') {
+    state.shareHistoryMessage = method === 'POST' ? '正在启动补抓…' : '正在读取长历史…';
+    renderShareRange({ preserveZoom: polling });
+  }
+
+  try {
+    let history = await fetchJson(path, options);
+    if (request.signal.aborted) return;
+    if (startIfIdle && history.backfill?.status === 'idle') {
+      state.extendedShareHistory = history;
+      state.shareHistoryMessage = '正在启动补抓…';
+      renderShareRange({ preserveZoom: true });
+      history = await fetchJson(path, { ...options, method: 'POST' });
+      if (request.signal.aborted) return;
+    }
+    state.extendedShareHistory = history;
+    state.shareHistoryMessage = '';
+    renderShareRange({ preserveZoom: polling });
+    if (history.backfill?.status === 'running') {
+      state.shareHistoryTimer = setTimeout(() => loadExtendedShareHistory(request), 12000);
+    }
+  } catch (error) {
+    if (request.signal.aborted) return;
+    state.shareHistoryMessage = `历史请求失败：${error.message}`;
+    renderShareRange({ preserveZoom: polling });
+  }
+}
+
+function renderShareRange({ preserveZoom = false } = {}) {
+  const longRange = state.shareRange === 'all' || state.shareRange > 250;
+  const history = longRange ? state.extendedShareHistory : state.detailData?.shareHistory;
   const summary = document.querySelector('#shareRangeSummary');
   const note = document.querySelector('#shareCoverageNote');
-  if (!summary || !note) return;
+  const syncNote = document.querySelector('#shareHistorySyncNote');
+  const retry = document.querySelector('#shareHistoryRetry');
+  const shareExport = document.querySelector('#shareHistoryExport');
+  const actionLinks = document.querySelector('#shareHistoryActionLinks');
+  if (!summary || !note || !syncNote || !retry || !shareExport || !actionLinks) return;
+  const range = history?.ranges?.[state.shareRange] || history?.range;
+  const backfill = history?.backfill;
+  const progress = backfill?.status === 'running' && backfill.requested > 0
+    ? ` · ${backfill.completed}/${backfill.requested} 日`
+    : '';
+  const message = state.shareHistoryMessage || (backfill?.message ? `${backfill.message}${progress}` : '');
+  const canRetry = longRange && (state.shareHistoryMessage.startsWith('历史请求失败') ||
+    (!state.shareHistoryMessage && ['partial', 'error'].includes(backfill?.status)));
+  retry.hidden = !canRetry;
+  syncNote.hidden = !longRange || !message;
+  if (syncNote.textContent !== message) syncNote.textContent = message;
+  shareExport.hidden = !range?.coverage?.availableDays;
+  if (shareExport.hidden) shareExport.removeAttribute('href');
+  else {
+    const rangeQuery = state.detailData.shareHistory?.extendedRanges ? `&days=${state.shareRange}` : '';
+    shareExport.href = `/api/export.csv?code=${state.detailData.quote.code}&type=shares${rangeQuery}`;
+  }
+  const actions = (range?.points || []).filter((point) => point.shareActionSourceUrl);
+  const actionKey = actions.map((point) => point.tradeDate).join(',');
+  if (actionLinks.dataset.dates !== actionKey) {
+    actionLinks.dataset.dates = actionKey;
+    actionLinks.replaceChildren(...actions.map((point) => {
+      const link = createElement('a', 'source-link', `${point.tradeDate} 份额折算依据 ↗`);
+      link.href = point.shareActionSourceUrl;
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      return link;
+    }));
+  }
+  actionLinks.hidden = !actions.length;
   summary.replaceChildren();
-  if (!history) {
-    summary.append(createElement('div', 'share-empty', '官方份额历史暂不可用'));
-    note.textContent = '尚未取得官方份额记录，不以模拟数据补齐。';
-    state.shareChart?.clear();
-    return;
-  }
-  const range = history.ranges?.[state.shareRange] || history.range;
   if (!range) {
-    summary.append(createElement('div', 'share-empty', '该视角暂无可用数据'));
-    note.textContent = '官方接口暂未返回该区间记录。';
-    state.shareChart?.clear();
+    summary.append(createElement('div', 'share-empty', longRange && state.shareHistoryMessage && !canRetry
+      ? '正在读取所选区间' : '该视角暂无可用数据'));
+    note.textContent = '';
+    state.shareChart?.setOption(emptyChartOption('所选区间暂无可绘制的官方份额'), true);
     return;
   }
+  const coverage = range.coverage;
+  const requestedDays = coverage?.requestedDays ?? range.days ?? 0;
+  const effectiveDays = coverage?.effectiveDays ?? requestedDays;
+  const expectedEstimateDays = coverage?.expectedEstimateDays ?? effectiveDays;
+  const shareRank = formatter.plainPercent(
+    Number.isFinite(range.sharePercentile) ? range.sharePercentile * 100 : null, 1
+  );
   const items = [
     ['区间累计净申赎', range.periodEstimatedSubscription === null
       ? '--'
@@ -1931,34 +2045,44 @@ function renderShareRange() {
       ? '--'
       : formatter.signedShares(range.periodShareDelta),
     directionClass(range.periodShareDelta)],
-    ['期末份额分位', formatter.plainPercent(
-      range.sharePercentile === null ? null : range.sharePercentile * 100,
-      1
-    ), ''],
-    ['官方可取得', `${range.coverage?.availableDays ?? 0} / ${state.shareRange} 日`, 'neutral']
+    ['官方份额覆盖', `${coverage?.availableDays ?? 0} / ${effectiveDays} 日`, 'neutral'],
+    longRange ? ['净申赎估算覆盖', `${coverage?.estimatedDays ?? 0} / ${expectedEstimateDays} 日`, 'neutral']
+      : ['期末份额分位', shareRank, '']
   ];
   for (const [label, value, className] of items) {
     const card = createElement('div', 'share-range-stat');
     card.append(createElement('span', '', label), createElement('strong', className, value));
     summary.append(card);
   }
-  const coverage = range.coverage;
-  const statusText = coverage?.status === 'complete'
-    ? '窗口完整'
-    : coverage?.status === 'partial'
-      ? `缺少 ${coverage.missingDays} 个交易日`
-      : '暂无官方记录';
+  const statusText = !coverage?.availableDays ? '暂无官方记录'
+    : coverage.missingDays > 0 ? `缺少 ${coverage.missingDays} 个交易日份额`
+      : coverage.calendarComplete === false ? '已显示本机官方份额' : '官方份额完整';
   const missingText = coverage?.missingRecentDates?.length
     ? `；近期缺口 ${coverage.missingRecentDates.join('、')}`
     : '';
-  const estimateText = Number.isInteger(coverage?.estimatedDays)
-    ? `；连续份额 ${coverage.shareDeltaDays}/${state.shareRange} 日，有效估算 ${coverage.estimatedDays}/${state.shareRange} 日`
-    : '';
-  note.textContent = `${statusText}${missingText}${estimateText}。数据来源：${history.sourceName || '交易所'}官方接口；${history.note}`;
-  state.shareChart?.setOption(buildShareOption(range, history), true);
+  const start = coverage?.targetStartDate || range.startDate;
+  const end = coverage?.targetEndDate || range.endDate;
+  const dates = start && end ? `${start} 至 ${end} · ` : '';
+  const firstAvailable = range.points?.find((point) => Number.isFinite(point.shares))?.tradeDate;
+  const obtained = firstAvailable && firstAvailable !== start ? `；首条已取得份额 ${firstAvailable}` : '';
+  const clipped = state.shareRange !== 'all' && effectiveDays < requestedDays && coverage?.calendarComplete
+    ? `；所选 ${requestedDays} 日，实际可核对区间 ${effectiveDays} 日` : '';
+  const details = longRange
+    ? `；期末份额分位 ${shareRank}${coverage?.calendarComplete === false ? '；历史范围核对中' : ''}`
+    : `；连续份额 ${coverage?.shareDeltaDays ?? 0}/${effectiveDays} 日，有效估算 ${coverage?.estimatedDays ?? 0}/${expectedEstimateDays} 日`;
+  note.textContent = `${dates}${statusText}${missingText}${obtained}${clipped}${details}。来源为${history.sourceName || '交易所'}官方接口。${history.note || ''}`;
+  if (state.shareChart) {
+    const chartOption = coverage?.availableDays ? buildShareOption(range, history, longRange)
+      : emptyChartOption('所选区间暂无可绘制的官方份额');
+    const zoom = preserveZoom ? state.shareChart.getOption()?.dataZoom?.[0] : null;
+    if (zoom && chartOption.dataZoom) {
+      chartOption.dataZoom.forEach((item) => Object.assign(item, { start: zoom.start, end: zoom.end }));
+    }
+    state.shareChart.setOption(chartOption, true);
+  }
 }
 
-function buildShareOption(range, history) {
+function buildShareOption(range, history, longRange) {
   const points = range.points || [];
   const dates = points.map((point) => point.tradeDate);
   const shares = points.map((point) => (
@@ -1969,6 +2093,8 @@ function buildShareOption(range, history) {
       ? point.cumulativeEstimatedSubscription / 1e8
       : null
   ));
+  const segmented = longRange || points.some((point) => point.estimateGapReason === 'share_split' || point.estimatedSegment > 1);
+  const cumulativeLabel = segmented ? '分段累计估算净申赎' : '累计估算净申赎';
   return {
     animation: false,
     backgroundColor: 'transparent',
@@ -1978,7 +2104,7 @@ function buildShareOption(range, history) {
       top: 0,
       left: 'center',
       textStyle: { color: CHART_COLORS.axisLabel, fontSize: 11 },
-      data: ['官方总份额', '累计估算净申赎']
+      data: ['官方总份额', cumulativeLabel]
     },
     tooltip: {
       trigger: 'axis',
@@ -1994,13 +2120,14 @@ function buildShareOption(range, history) {
           `官方总份额：${formatter.shares(point.shares)}`,
           `当日份额变化：${point.shareDelta === null ? '--' : formatter.signedShares(point.shareDelta)}`,
           `当日估算净申赎：${point.estimatedSubscription === null ? '--' : formatter.signedAmount(point.estimatedSubscription)}`,
-          `累计估算净申赎：${point.cumulativeEstimatedSubscription === null ? '--' : formatter.signedAmount(point.cumulativeEstimatedSubscription)}`,
+          `${cumulativeLabel}：${formatter.signedAmount(point.cumulativeEstimatedSubscription)}`,
+          SHARE_ESTIMATE_GAPS[point.estimateGapReason] || null,
           `来源：${point.source || history.sourceName}`
-        ].join('<br>');
+        ].filter(Boolean).join('<br>');
       }
     },
     axisPointer: { link: [{ xAxisIndex: 'all' }] },
-    grid: { left: 56, right: 58, top: 42, bottom: 54 },
+    grid: { left: 56, right: 58, top: 42, bottom: longRange ? 78 : 54 },
     xAxis: {
       type: 'category',
       data: dates,
@@ -2009,7 +2136,7 @@ function buildShareOption(range, history) {
       axisLabel: {
         color: CHART_COLORS.axisLabel,
         hideOverlap: true,
-        formatter: (value) => value.slice(5)
+        formatter: (value) => longRange ? value.slice(0, 7) : value.slice(5)
       },
       axisTick: { show: false }
     },
@@ -2042,7 +2169,10 @@ function buildShareOption(range, history) {
       xAxisIndex: [0],
       start: 0,
       end: 100
-    }],
+    }, ...(longRange ? [{
+      type: 'slider', xAxisIndex: [0], height: 20, bottom: 15, start: 0, end: 100,
+      showDetail: false, borderColor: CHART_COLORS.axisLine, textStyle: { color: CHART_COLORS.axisLabel }
+    }] : [])],
     series: [
       {
         name: '官方总份额',
@@ -2065,7 +2195,7 @@ function buildShareOption(range, history) {
         }
       },
       {
-        name: '累计估算净申赎',
+        name: cumulativeLabel,
         type: 'line',
         yAxisIndex: 1,
         data: cumulative,
@@ -2450,6 +2580,7 @@ function buildDailyOption(bars) {
 function closeDrawer() {
   state.detailRequest?.abort();
   state.detailRequest = null;
+  stopShareHistoryRequest();
   state.detailData = null;
   state.shareChart = null;
   state.charts.forEach((instance) => instance.dispose());

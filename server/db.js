@@ -151,6 +151,22 @@ function createDatabase(filePath) {
       PRIMARY KEY (code, trade_date)
     );
 
+    CREATE TABLE IF NOT EXISTS extended_share_values (
+      code TEXT NOT NULL,
+      trade_date TEXT NOT NULL,
+      shares REAL NOT NULL,
+      source TEXT NOT NULL,
+      fetched_at TEXT NOT NULL,
+      PRIMARY KEY (code, trade_date)
+    ) WITHOUT ROWID;
+
+    CREATE TABLE IF NOT EXISTS extended_share_closes (
+      code TEXT NOT NULL,
+      trade_date TEXT NOT NULL,
+      close REAL NOT NULL,
+      PRIMARY KEY (code, trade_date)
+    ) WITHOUT ROWID;
+
     CREATE TABLE IF NOT EXISTS official_share_sync_dates (
       exchange TEXT NOT NULL,
       trade_date TEXT NOT NULL,
@@ -850,6 +866,62 @@ function createDatabase(filePath) {
         )
         ORDER BY trade_date ASC
       `).all(code, limit);
+    },
+    readExtendedShares(code, from, through) {
+      const rows = db.prepare(`
+        SELECT trade_date AS tradeDate, shares, source, fetched_at AS officialFetchedAt
+        FROM extended_share_values WHERE code = ? AND trade_date BETWEEN ? AND ?
+        UNION ALL
+        SELECT trade_date AS tradeDate, shares, source, COALESCE(official_fetched_at, fetched_at) AS officialFetchedAt
+        FROM share_history WHERE code = ? AND trade_date BETWEEN ? AND ?
+          AND source IN ('上交所', '深交所', 'SSE', 'SZSE') AND shares > 0
+      `).all(code, from, through, code, from, through);
+      return [...new Map(rows.map((row) => [row.tradeDate, row])).values()]
+        .sort((left, right) => left.tradeDate.localeCompare(right.tradeDate));
+    },
+    saveExtendedShares(entries, fetchedAt) {
+      const statement = db.prepare(`
+        INSERT INTO extended_share_values(code, trade_date, shares, source, fetched_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(code, trade_date) DO UPDATE SET
+          shares = excluded.shares, source = excluded.source, fetched_at = excluded.fetched_at
+      `);
+      db.exec('BEGIN');
+      try {
+        for (const { code, tradeDate, shares, source } of entries) {
+          if (Number.isFinite(shares) && shares > 0) statement.run(code, tradeDate, shares, source, fetchedAt);
+        }
+        db.exec('COMMIT');
+      } catch (error) {
+        db.exec('ROLLBACK');
+        throw error;
+      }
+    },
+    saveExtendedCloses(code, rows) {
+      const statement = db.prepare(`
+        INSERT INTO extended_share_closes(code, trade_date, close) VALUES (?, ?, ?)
+        ON CONFLICT(code, trade_date) DO UPDATE SET close = excluded.close
+      `);
+      db.exec('BEGIN');
+      try {
+        for (const { date, rawClose } of rows) {
+          if (Number.isFinite(rawClose) && rawClose > 0) statement.run(code, date, rawClose);
+        }
+        db.exec('COMMIT');
+      } catch (error) {
+        db.exec('ROLLBACK');
+        throw error;
+      }
+    },
+    readExtendedCloses(code, from, through) {
+      const rows = db.prepare(`
+        SELECT trade_date AS date, close AS rawClose FROM extended_share_closes
+        WHERE code = ? AND trade_date BETWEEN ? AND ?
+        UNION ALL
+        SELECT date, raw_close AS rawClose FROM daily_bars
+        WHERE code = ? AND date BETWEEN ? AND ? AND raw_close > 0
+      `).all(code, from, through, code, from, through);
+      return [...new Map(rows.map((row) => [row.date, row])).values()];
     },
     countOfficialShareHistory(code) {
       return db.prepare(`

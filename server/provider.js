@@ -152,6 +152,20 @@ async function fetchKlines(etf, limit = 520) {
   return adjusted.filter((bar) => bar.close > 0).map((bar) => ({ ...bar, rawClose: rawCloses.get(bar.date) ?? null }));
 }
 
+async function fetchRawCloses(secid, startDate, endDate, { limit = 400 } = {}) {
+  const params = new URLSearchParams({
+    secid, klt: '101', fqt: '0', lmt: String(limit),
+    beg: startDate.replaceAll('-', ''), end: endDate.replaceAll('-', ''),
+    fields1: 'f1,f2,f3,f4,f5,f6', fields2: 'f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61'
+  });
+  const data = await fetchJson(`${HISTORY_HOST}/api/qt/stock/kline/get?${params}`);
+  const { date: today, minute } = shanghaiClock();
+  return parseKlines({ code: secid.split('.')[1] }, data)
+    .filter(({ date, close }) => close > 0 && date >= startDate && date <= endDate &&
+      (date < today || (date === today && minute >= '15:00')))
+    .map(({ date, close }) => ({ date, rawClose: close }));
+}
+
 function parseTrends(etf, data) {
   return (data.trends || []).map((row) => {
     const [time, price, average, volume, amount] = row.split(',');
@@ -180,6 +194,7 @@ module.exports = {
   lookupEtf,
   parseKlines,
   fetchKlines,
+  fetchRawCloses,
   parseTrends,
   fetchTrends
 };

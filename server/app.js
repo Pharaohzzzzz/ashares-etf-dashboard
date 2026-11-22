@@ -4,6 +4,7 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const { API_VERSION, getBuildId } = require('./runtime-version');
+const { isExtendedShareRange } = require('./extended-share-history');
 
 const CSV_TYPES = new Set(['summary', 'daily', 'shares', 'iopv']);
 const REFRESH_METHODS = {
@@ -63,6 +64,12 @@ function toCsv(headers, rows) {
 
 function csvNumberOrMissing(value) {
   return Number.isFinite(value) ? value : '数据不足';
+}
+
+function shareRangeParameter(value) {
+  if (value === 'all') return 'all';
+  const days = Number(value || 250);
+  return [20, 60, 250, 750, 1250].includes(days) ? days : null;
 }
 
 function clientError(code, message, statusCode = 400) {
@@ -253,14 +260,20 @@ function createApp({
       }
 
       const shareHistoryMatch = url.pathname.match(/^\/api\/etfs\/(\d{6})\/share-history$/);
-      if (shareHistoryMatch && request.method === 'GET') {
-        const days = Number(url.searchParams.get('days') || 250);
-        if (![20, 60, 250].includes(days)) {
-          return sendError(response, 400, 'INVALID_SHARE_DAYS', '历史视角仅支持 20、60 或 250 日');
+      if (shareHistoryMatch && ['GET', 'POST'].includes(request.method)) {
+        const days = shareRangeParameter(url.searchParams.get('days'));
+        const enqueue = request.method === 'POST';
+        if (days === null || (enqueue && !isExtendedShareRange(days))) {
+          return sendError(response, 400, 'INVALID_SHARE_DAYS', enqueue
+            ? '长历史补数仅支持 750、1250 日和全部'
+            : '历史视角仅支持 20、60、250、750、1250 日和全部');
         }
-        const shareHistory = service.getShareHistory(shareHistoryMatch[1], days);
+        const shareHistory = enqueue
+          ? service.startExtendedShareHistory(shareHistoryMatch[1], days)
+          : service.getShareHistory(shareHistoryMatch[1], days);
+        const status = enqueue && shareHistory?.backfill?.status === 'running' ? 202 : 200;
         return shareHistory
-          ? sendJson(response, 200, shareHistory)
+          ? sendJson(response, status, shareHistory)
           : sendError(response, 404, 'ETF_NOT_FOUND', 'ETF 不存在');
       }
 
@@ -302,7 +315,11 @@ function createApp({
           const detail = requestedType === 'iopv' ? null : service.getDetail(code);
           if (requestedType !== 'iopv' && !detail) return sendError(response, 404, 'ETF_NOT_FOUND', 'ETF 不存在');
           if (requestedType === 'shares') {
-            const shareHistory = detail.shareHistory || service.getShareHistory(code, 250);
+            const days = shareRangeParameter(url.searchParams.get('days'));
+            if (days === null) return sendError(response, 400, 'INVALID_SHARE_DAYS', '历史视角仅支持 20、60、250、750、1250 日和全部');
+            const shareHistory = days === 250 && detail.shareHistory
+              ? detail.shareHistory
+              : service.getShareHistory(code, days);
             csv = toCsv([
               { key: 'tradeDate', label: '日期' },
               { key: 'shares', label: '官方总份额' },
@@ -312,6 +329,9 @@ function createApp({
               { key: 'estimatedSubscription', label: '估算净申赎' },
               { key: 'cumulativeShareDelta', label: '累计份额变化' },
               { key: 'cumulativeEstimatedSubscription', label: '累计估算净申赎' },
+              { key: 'estimatedSegment', label: '估算累计区段' },
+              { key: 'estimateGapReason', label: '估算缺口原因' },
+              { key: 'shareActionSourceUrl', label: '份额折算公告' },
               { key: 'source', label: '来源' },
               { key: 'dataTime', label: '最新报价时间' },
               { key: 'capturedAt', label: '最新报价抓取时间' },
@@ -329,7 +349,7 @@ function createApp({
               officialShareSource: point.source,
               officialShareFetchedAt: point.officialFetchedAt || point.fetchedAt || null
             })));
-            filename = `${code}-official-shares.csv`;
+            filename = days === 250 ? `${code}-official-shares.csv` : `${code}-official-shares-${days}.csv`;
           } else if (requestedType === 'iopv') {
             const iopvHistory = service.getIopvHistory(code, 250);
             if (!iopvHistory) return sendError(response, 404, 'ETF_NOT_FOUND', 'ETF 不存在');
