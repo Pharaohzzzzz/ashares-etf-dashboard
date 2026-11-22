@@ -26,7 +26,9 @@ test('average ignores invalid values', () => {
 });
 
 test('volume ratio compares current amount with prior average', () => {
-  assert.equal(volumeRatio(300, [100, 100, 100]), 3);
+  assert.equal(volumeRatio(300, Array(20).fill(100)), 3);
+  assert.equal(volumeRatio(300, [100, 100, 100]), null);
+  assert.equal(volumeRatio(300, [...Array(19).fill(100), null]), null);
   assert.equal(volumeRatio(300, []), null);
 });
 
@@ -100,9 +102,9 @@ test('share window calculates cumulative net subscription and percentile', () =>
     { tradeDate: '2026-11-19', shares: 130, source: '上交所' }
   ];
   const bars = [
-    { date: '2026-11-17', close: 4 },
-    { date: '2026-11-18', close: 4 },
-    { date: '2026-11-19', close: 4 }
+    { date: '2026-11-17', close: 3, rawClose: 4 },
+    { date: '2026-11-18', close: 3, rawClose: 4 },
+    { date: '2026-11-19', close: 3, rawClose: 4 }
   ];
   const result = calculateShareWindow(history, bars, 2);
   assert.equal(result.periodShareDelta, 30);
@@ -111,6 +113,11 @@ test('share window calculates cumulative net subscription and percentile', () =>
   assert.equal(result.points.at(-1).cumulativeEstimatedSubscription, 120);
   assert.equal(result.startDate, '2026-11-18');
   assert.equal(result.endDate, '2026-11-19');
+
+  const withGap = calculateShareWindow([history[0], history[2]], bars, 2);
+  assert.deepEqual(withGap.points.map((point) => point.tradeDate), ['2026-11-18', '2026-11-19']);
+  assert.deepEqual(withGap.points.map((point) => point.shareDelta), [null, null]);
+  assert.equal(withGap.periodEstimatedSubscription, null);
 });
 
 test('signals flag broad resonance and composite candidate', () => {

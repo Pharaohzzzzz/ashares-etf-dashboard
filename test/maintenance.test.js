@@ -84,7 +84,7 @@ function createFixture(filePath) {
   db.close();
 }
 
-test('backup, cleanup, restore and log rotation work on temporary databases', async () => {
+test('backup, cleanup, restore and log rotation work on temporary databases', async (context) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'etf-maintenance-'));
   const dbPath = path.join(directory, 'dashboard.db');
   const targetPath = path.join(directory, 'restore-target.db');
@@ -130,7 +130,28 @@ test('backup, cleanup, restore and log rotation work on temporary databases', as
   assert.equal(target.raw.prepare(
     "SELECT name FROM etfs WHERE code = '510300'"
   ).get().name, '沪深300ETF华泰柏瑞');
+  target.raw.prepare("UPDATE etfs SET name = 'before failed restore' WHERE code = '510300'").run();
   target.close();
+
+  const rename = fs.renameSync;
+  const renameMock = context.mock.method(fs, 'renameSync', (source, destination) => {
+    if (destination === targetPath) throw new Error('simulated replace failure');
+    return rename(source, destination);
+  });
+  try {
+    await assert.rejects(restoreDatabase({
+      backupPath: backupResult.backupPath,
+      dbPath: targetPath,
+      safetyDir: backupDir,
+      now: new Date('2026-11-20T01:05:00.000Z')
+    }), /simulated replace failure/);
+  } finally {
+    renameMock.mock.restore();
+  }
+  assert.ok(verifyDatabase(targetPath).ok);
+  const retained = createDatabase(targetPath);
+  assert.equal(retained.getEtfConfig('510300').name, 'before failed restore');
+  retained.close();
 
   const rotated = path.join(directory, 'dashboard.log');
   fs.writeFileSync(rotated, 'x'.repeat(32));

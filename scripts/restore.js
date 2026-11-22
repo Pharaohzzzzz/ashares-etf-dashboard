@@ -1,5 +1,6 @@
 'use strict';
 
+const { createConnection } = require('node:net');
 const path = require('node:path');
 const { restoreDatabase } = require('../server/maintenance');
 
@@ -9,17 +10,22 @@ const dbPath = process.env.DB_PATH || path.join(root, 'data', 'dashboard.db');
 const safetyDir = process.env.BACKUP_DIR || path.join(root, 'data', 'backups');
 const port = Number(process.env.PORT || 37821);
 
-async function ensureServiceStopped() {
-  try {
-    const response = await fetch(`http://127.0.0.1:${port}/api/health`, {
-      signal: AbortSignal.timeout(1500)
+function ensureServiceStopped() {
+  return new Promise((resolve, reject) => {
+    const socket = createConnection({ host: '127.0.0.1', port });
+    socket.once('connect', () => {
+      socket.destroy();
+      reject(new Error('网站端口仍在监听，请先停止服务再恢复数据库'));
     });
-    if (response.ok) {
-      throw new Error('网站仍在运行，请先停止服务再恢复数据库');
-    }
-  } catch (error) {
-    if (error.message.includes('仍在运行')) throw error;
-  }
+    socket.once('error', (error) => {
+      if (error.code === 'ECONNREFUSED') resolve();
+      else reject(error);
+    });
+    socket.setTimeout(1500, () => {
+      socket.destroy();
+      reject(new Error('无法确认网站已停止，请检查服务端口后再恢复数据库'));
+    });
+  });
 }
 
 if (!backupPath) {

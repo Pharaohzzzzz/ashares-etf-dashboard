@@ -54,6 +54,7 @@ const summary = {
 };
 
 let refreshAllCalls = 0;
+let historySyncCalls = 0;
 
 const service = {
   initializedAt: '2026-11-20T07:00:00.000Z',
@@ -63,6 +64,7 @@ const service = {
     ? { quote: summary.etfs[0], bars: [{ date: '2026-11-19', open: 4, close: 4.06 }] }
     : null,
   refreshQuotes: async () => summary,
+  syncHistoricalBars: async () => { historySyncCalls += 1; },
   refreshAllData: async () => {
     refreshAllCalls += 1;
     return summary;
@@ -143,6 +145,10 @@ test('summary, health, detail and CSV APIs respond', async (context) => {
     .then((response) => response.json());
   assert.equal(refresh.apiVersion, 3);
   assert.equal(refreshAllCalls, 1);
+  const historyRefresh = await fetch(`${base}/api/refresh?kind=history`, { method: 'POST' });
+  assert.equal(historyRefresh.status, 200);
+  assert.equal(historySyncCalls, 1);
+  assert.equal(refreshAllCalls, 1);
   const detail = await fetch(`${base}/api/etfs/510300`).then((response) => response.json());
   assert.equal(detail.bars.length, 1);
   const shareHistory = await fetch(`${base}/api/etfs/510300/share-history?days=20`)
@@ -175,7 +181,8 @@ test('summary, health, detail and CSV APIs respond', async (context) => {
     .then((response) => response.text());
   assert.match(shareCsv, /官方总份额/);
   assert.match(shareCsv, /2026-11-19/);
-  assert.match(shareCsv, /行情时间/);
+  assert.match(shareCsv, /最新报价时间/);
+  assert.match(shareCsv, /不复权收盘价/);
   assert.match(shareCsv, /官方份额来源/);
   assert.match(shareCsv, /官方份额抓取时间/);
   const iopvCsv = await fetch(`${base}/api/export.csv?code=510300&type=iopv`)
@@ -205,7 +212,7 @@ test('overview copy distinguishes pending current shares from the latest officia
   const html = fs.readFileSync(path.join(root, 'public', 'index.html'), 'utf8');
   const client = fs.readFileSync(path.join(root, 'public', 'app.js'), 'utf8');
 
-  assert.match(html, /今日官方净申购/);
+  assert.match(html, /行情日官方净申购/);
   assert.match(html, /最近完整评分日异动线索/);
   assert.match(html, /评分基于/);
   assert.match(html, /异常资金评分/);
@@ -291,6 +298,7 @@ test('catalog management APIs drive summary, detail and CSV visibility', async (
   const db = createDatabase(':memory:');
   context.after(() => db.close());
   db.removeEtf('510050');
+  db.startSyncTask('backtest', { targetDates: ['2026-11-20'] });
   const marketService = new MarketService({
     db,
     etfLookupProvider: async (code) => ({
@@ -319,6 +327,10 @@ test('catalog management APIs drive summary, detail and CSV visibility', async (
   assert.equal(state.capacity, 30);
   assert.equal(state.enabledCount, 13);
   assert.equal(state.removed.some((etf) => etf.code === '510050'), true);
+  assert.equal(Object.hasOwn(state.summary.dataStatus.tasks, 'backtest'), false);
+  const catalogOnly = await fetch(`${base}/api/etfs/manage?includeSummary=false`).then((response) => response.json());
+  assert.equal(catalogOnly.enabledCount, 13);
+  assert.equal(Object.hasOwn(catalogOnly, 'summary'), false);
 
   const invalid = await fetch(`${base}/api/etfs`, {
     method: 'POST',

@@ -6,6 +6,12 @@ const path = require('node:path');
 const { API_VERSION, getBuildId } = require('./runtime-version');
 
 const CSV_TYPES = new Set(['summary', 'daily', 'shares', 'iopv']);
+const REFRESH_METHODS = {
+  quotes: 'refreshQuotes',
+  history: 'syncHistoricalBars',
+  shares: 'syncOfficialShareHistory',
+  iopv: 'refreshIopv'
+};
 const CATALOG_ERRORS = new Set([
   'INVALID_CODE',
   'ETF_NOT_FOUND',
@@ -115,6 +121,9 @@ function createApp({
     const url = new URL(request.url, 'http://127.0.0.1');
     try {
       if (url.pathname === '/api/health') {
+        if (typeof service.getQuoteHealth === 'function') {
+          return sendJson(response, 200, withRuntime(service.getQuoteHealth()));
+        }
         const summary = service.getSummary();
         const status = !summary.etfs.length
           ? 'starting'
@@ -140,6 +149,14 @@ function createApp({
       }
 
       if (url.pathname === '/api/refresh' && request.method === 'POST') {
+        const kind = url.searchParams.get('kind');
+        if (kind !== null) {
+          if (!Object.hasOwn(REFRESH_METHODS, kind)) {
+            return sendError(response, 400, 'INVALID_REFRESH_KIND', '数据类型无效');
+          }
+          const result = await service[REFRESH_METHODS[kind]]();
+          return sendJson(response, 200, withRuntime(kind === 'quotes' ? result : service.getSummary()));
+        }
         const summary = service.refreshAllData
           ? await service.refreshAllData()
           : await service.refreshQuotes();
@@ -155,10 +172,9 @@ function createApp({
         if (typeof service.getCatalogState !== 'function') {
           return sendError(response, 501, 'CATALOG_UNAVAILABLE', '当前后台未提供 ETF 管理能力');
         }
-        return sendJson(response, 200, withRuntime({
-          ...service.getCatalogState(),
-          summary: service.getSummary()
-        }));
+        const catalog = service.getCatalogState();
+        const includeSummary = url.searchParams.get('includeSummary') !== 'false';
+        return sendJson(response, 200, withRuntime(includeSummary ? { ...catalog, summary: service.getSummary() } : catalog));
       }
 
       if (url.pathname === '/api/etfs/lookup' && request.method === 'GET') {
@@ -262,7 +278,7 @@ function createApp({
 
       const detailMatch = url.pathname.match(/^\/api\/etfs\/(\d{6})$/);
       if (detailMatch && request.method === 'GET') {
-        const detail = service.getDetail(detailMatch[1]);
+        const detail = service.getDetail(detailMatch[1], { compact: url.searchParams.get('compact') === '1' });
         return detail
           ? sendJson(response, 200, detail)
           : sendError(response, 404, 'ETF_NOT_FOUND', 'ETF 不存在');
@@ -283,22 +299,23 @@ function createApp({
         let csv;
         let filename;
         if (code) {
-          const detail = service.getDetail(code);
-          if (!detail) return sendError(response, 404, 'ETF_NOT_FOUND', 'ETF 不存在');
+          const detail = requestedType === 'iopv' ? null : service.getDetail(code);
+          if (requestedType !== 'iopv' && !detail) return sendError(response, 404, 'ETF_NOT_FOUND', 'ETF 不存在');
           if (requestedType === 'shares') {
-            const shareHistory = service.getShareHistory(code, 250);
+            const shareHistory = detail.shareHistory || service.getShareHistory(code, 250);
             csv = toCsv([
               { key: 'tradeDate', label: '日期' },
               { key: 'shares', label: '官方总份额' },
               { key: 'shareDelta', label: '份额变化' },
-              { key: 'close', label: '收盘价' },
+              { key: 'close', label: '不复权收盘价' },
+              { key: 'closeSource', label: '收盘价来源' },
               { key: 'estimatedSubscription', label: '估算净申赎' },
               { key: 'cumulativeShareDelta', label: '累计份额变化' },
               { key: 'cumulativeEstimatedSubscription', label: '累计估算净申赎' },
               { key: 'source', label: '来源' },
-              { key: 'dataTime', label: '行情时间' },
-              { key: 'capturedAt', label: '抓取时间' },
-              { key: 'quoteStatus', label: '行情状态' },
+              { key: 'dataTime', label: '最新报价时间' },
+              { key: 'capturedAt', label: '最新报价抓取时间' },
+              { key: 'quoteStatus', label: '最新报价状态' },
               { key: 'officialShareDate', label: '官方份额日期' },
               { key: 'officialShareSource', label: '官方份额来源' },
               { key: 'officialShareFetchedAt', label: '官方份额抓取时间' }
@@ -307,13 +324,15 @@ function createApp({
               dataTime: detail.quote.dataTime,
               capturedAt: detail.quote.capturedAt,
               quoteStatus: detail.quote.quoteStatusLabel || detail.quote.quoteStatus,
-              officialShareDate: point.tradeDate,
+              closeSource: Number.isFinite(point.close) ? '东方财富不复权日线' : '',
+              officialShareDate: Number.isFinite(point.shares) ? point.tradeDate : null,
               officialShareSource: point.source,
               officialShareFetchedAt: point.officialFetchedAt || point.fetchedAt || null
             })));
             filename = `${code}-official-shares.csv`;
           } else if (requestedType === 'iopv') {
             const iopvHistory = service.getIopvHistory(code, 250);
+            if (!iopvHistory) return sendError(response, 404, 'ETF_NOT_FOUND', 'ETF 不存在');
             csv = toCsv([
               { key: 'tradeDate', label: '交易日' },
               { key: 'dataTime', label: 'IOPV数据时间' },

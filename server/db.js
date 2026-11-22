@@ -239,6 +239,7 @@ function createDatabase(filePath) {
     );
 
     CREATE INDEX IF NOT EXISTS idx_snapshots_latest ON snapshots(code, captured_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_snapshots_source_time ON snapshots(code, data_time DESC, captured_at DESC);
     CREATE INDEX IF NOT EXISTS idx_bars_code_date ON daily_bars(code, date);
     CREATE INDEX IF NOT EXISTS idx_share_history_code_date ON share_history(code, trade_date DESC);
     CREATE INDEX IF NOT EXISTS idx_share_sync_exchange_date
@@ -250,13 +251,9 @@ function createDatabase(filePath) {
     CREATE INDEX IF NOT EXISTS idx_trading_calendar_trading
       ON trading_calendar(is_trading, trade_date);
   `);
-  db.exec(`
-    DROP TABLE IF EXISTS signal_events;
-    DROP TABLE IF EXISTS backtest_runs;
-  `);
-
   ensureColumn(db, 'share_history', 'official_fetched_at', 'TEXT');
   ensureColumn(db, 'share_history', 'snapshot_fetched_at', 'TEXT');
+  ensureColumn(db, 'daily_bars', 'raw_close', 'REAL');
   ensureColumn(db, 'etfs', 'is_pinned', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn(db, 'etfs', 'is_highlighted', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn(db, 'etfs', 'sort_order', 'INTEGER NOT NULL DEFAULT 1000');
@@ -488,20 +485,21 @@ function createDatabase(filePath) {
       const statement = db.prepare(`
         INSERT INTO daily_bars(
           code, date, open, close, high, low, volume, amount,
-          amplitude, change_percent, change, turnover_rate
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          amplitude, change_percent, change, turnover_rate, raw_close
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(code, date) DO UPDATE SET
           open = excluded.open, close = excluded.close, high = excluded.high, low = excluded.low,
           volume = excluded.volume, amount = excluded.amount, amplitude = excluded.amplitude,
           change_percent = excluded.change_percent, change = excluded.change,
-          turnover_rate = excluded.turnover_rate
+          turnover_rate = excluded.turnover_rate,
+          raw_close = COALESCE(excluded.raw_close, daily_bars.raw_close)
       `);
       db.exec('BEGIN');
       try {
         for (const bar of bars) {
           statement.run(
             code, bar.date, bar.open, bar.close, bar.high, bar.low, bar.volume, bar.amount,
-            bar.amplitude, bar.changePercent, bar.change, bar.turnoverRate
+            bar.amplitude, bar.changePercent, bar.change, bar.turnoverRate, bar.rawClose ?? null
           );
         }
         db.exec('COMMIT');
@@ -512,7 +510,7 @@ function createDatabase(filePath) {
     },
     getBars(code, limit = 520) {
       return db.prepare(`
-        SELECT date, open, close, high, low, volume, amount, amplitude,
+        SELECT date, open, close, raw_close AS rawClose, high, low, volume, amount, amplitude,
                change_percent AS changePercent, change, turnover_rate AS turnoverRate
         FROM (
           SELECT * FROM daily_bars WHERE code = ? ORDER BY date DESC LIMIT ?
@@ -522,6 +520,16 @@ function createDatabase(filePath) {
     countBars(code) {
       return db.prepare('SELECT COUNT(*) AS count FROM daily_bars WHERE code = ?').get(code).count;
     },
+    getFirstEtfDate(code) {
+      return db.prepare(`
+        SELECT MIN(date) AS date FROM (
+          SELECT MIN(date) AS date FROM daily_bars WHERE code = ?
+          UNION ALL
+          SELECT MIN(trade_date) FROM share_history
+          WHERE code = ? AND source IN ('上交所', '深交所', 'SSE', 'SZSE')
+        )
+      `).get(code, code).date;
+    },
     getLatestBarDateBefore(tradeDate) {
       return db.prepare(
         'SELECT MAX(date) AS date FROM daily_bars WHERE date < ?'
@@ -530,13 +538,21 @@ function createDatabase(filePath) {
     getRecentTradeDates(limit = 250, endDate = null) {
       if (!Number.isInteger(limit) || limit < 1) return [];
       return db.prepare(`
-        SELECT date
-        FROM daily_bars
-        WHERE (? IS NULL OR date <= ?)
-        GROUP BY date
+        SELECT date FROM (
+          SELECT date FROM daily_bars
+          WHERE (? IS NULL OR date <= ?)
+            AND date NOT IN (SELECT trade_date FROM trading_calendar WHERE is_trading = 0)
+          UNION
+          SELECT trade_date FROM trading_calendar
+          WHERE is_trading = 1 AND (? IS NULL OR trade_date <= ?)
+          UNION
+          SELECT trade_date FROM share_history
+          WHERE (? IS NULL OR trade_date <= ?)
+            AND source IN ('上交所', '深交所', 'SSE', 'SZSE')
+        )
         ORDER BY date DESC
         LIMIT ?
-      `).all(endDate, endDate, limit)
+      `).all(endDate, endDate, endDate, endDate, endDate, endDate, limit)
         .map((row) => row.date)
         .reverse();
     },
@@ -544,11 +560,14 @@ function createDatabase(filePath) {
       const dataTime = quote.timestamp
         ? new Date(quote.timestamp * 1000).toISOString()
         : null;
-      db.prepare(`
+      const result = db.prepare(`
         INSERT INTO snapshots(
           code, captured_at, trade_date, data_time, price, previous_close, change,
           change_percent, open, high, low, volume, amount, turnover_rate, shares, market_value
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+          WHERE ? IS NULL OR NOT EXISTS (
+            SELECT 1 FROM snapshots WHERE code = ? AND data_time > ?
+          )
         ON CONFLICT(code, captured_at) DO UPDATE SET
           trade_date = excluded.trade_date, data_time = excluded.data_time,
           price = excluded.price, previous_close = excluded.previous_close,
@@ -560,20 +579,28 @@ function createDatabase(filePath) {
       `).run(
         quote.code, capturedAt, tradeDate, dataTime, quote.price, quote.previousClose,
         quote.change, quote.changePercent, quote.open, quote.high, quote.low,
-        quote.volume, quote.amount, quote.turnoverRate, quote.shares, quote.marketValue
+        quote.volume, quote.amount, quote.turnoverRate, quote.shares, quote.marketValue,
+        dataTime, quote.code, dataTime
       );
+      return result.changes > 0;
     },
     getLatestSnapshots() {
       return db.prepare(`
         SELECT s.*
-        FROM snapshots s
-        JOIN (
-          SELECT code, MAX(captured_at) AS captured_at
-          FROM snapshots
-          GROUP BY code
-        ) latest ON latest.code = s.code AND latest.captured_at = s.captured_at
+        FROM etfs e JOIN snapshots s ON s.id = (
+          SELECT id FROM snapshots WHERE code = e.code
+          ORDER BY data_time DESC, captured_at DESC LIMIT 1
+        )
         ORDER BY s.code
       `).all();
+    },
+    getClosingSnapshotCodes(tradeDate) {
+      return db.prepare(`
+        SELECT e.code FROM etfs e WHERE e.enabled = 1 AND EXISTS (
+          SELECT 1 FROM snapshots s WHERE s.code = e.code AND s.trade_date = ?
+            AND s.data_time >= ? AND s.price > 0
+        )
+      `).all(tradeDate, `${tradeDate}T07:00:00`).map((row) => row.code);
     },
     saveIopvLatest(state) {
       db.prepare(`
@@ -795,17 +822,17 @@ function createDatabase(filePath) {
     },
     getPreviousTradingDate(tradeDate) {
       if (!tradeDate) return null;
-      const calendarDate = db.prepare(`
-        SELECT trade_date AS date
-        FROM trading_calendar
-        WHERE trade_date < ? AND is_trading = 1
-        ORDER BY trade_date DESC
-        LIMIT 1
-      `).get(tradeDate)?.date;
-      if (calendarDate) return calendarDate;
-      return db.prepare(
-        'SELECT MAX(date) AS date FROM daily_bars WHERE date < ?'
-      ).get(tradeDate)?.date || null;
+      return db.prepare(`
+        SELECT MAX(date) AS date FROM (
+          SELECT MAX(date) AS date FROM daily_bars WHERE date < ?
+            AND date NOT IN (SELECT trade_date FROM trading_calendar WHERE is_trading = 0)
+          UNION ALL
+          SELECT MAX(trade_date) FROM trading_calendar WHERE is_trading = 1 AND trade_date < ?
+          UNION ALL
+          SELECT MAX(trade_date) FROM share_history WHERE trade_date < ?
+            AND source IN ('上交所', '深交所', 'SSE', 'SZSE')
+        )
+      `).get(tradeDate, tradeDate, tradeDate).date || null;
     },
     getOfficialShareHistory(code, limit = 251) {
       if (!Number.isInteger(limit) || limit < 1) return [];
@@ -1148,7 +1175,8 @@ function createDatabase(filePath) {
         ON CONFLICT(task_key) DO UPDATE SET
           status = 'running',
           target_dates_json = excluded.target_dates_json,
-          retry_count = sync_tasks.retry_count + 1,
+          retry_count = CASE WHEN sync_tasks.target_dates_json = excluded.target_dates_json
+            THEN sync_tasks.retry_count + 1 ELSE 0 END,
           last_attempt_at = excluded.last_attempt_at
       `).run(taskKey, JSON.stringify(targetDates), attemptedAt);
     },

@@ -122,8 +122,8 @@ test('share provenance migration backfills old official and snapshot timestamps'
   fs.rmSync(directory, { recursive: true, force: true });
 });
 
-test('database initialization removes legacy signal evaluation tables', () => {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'etf-backtest-removal-'));
+test('database initialization preserves existing legacy signal evaluation records', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'etf-legacy-backtest-'));
   const filePath = path.join(directory, 'dashboard.db');
   const legacy = new DatabaseSync(filePath);
   legacy.exec(`
@@ -135,11 +135,10 @@ test('database initialization removes legacy signal evaluation tables', () => {
   legacy.close();
 
   const migrated = createDatabase(filePath);
-  const removedTables = migrated.raw.prepare(`
-    SELECT name FROM sqlite_master
-    WHERE type = 'table' AND name IN ('backtest_runs', 'signal_events')
-  `).all();
-  assert.deepEqual(removedTables, []);
+  assert.equal(migrated.raw.prepare('SELECT generated_at FROM backtest_runs WHERE id = 1').get().generated_at,
+    '2026-11-19T00:00:00.000Z');
+  assert.equal(migrated.raw.prepare('SELECT signal_date FROM signal_events WHERE run_id = 1').get().signal_date,
+    '2026-11-19');
   migrated.close();
   fs.rmSync(directory, { recursive: true, force: true });
 });
@@ -204,15 +203,17 @@ test('sync task state persists failed dates and retry counts', () => {
     attemptedAt: '2026-11-20T01:01:00.000Z'
   });
   db.startSyncTask('history', {
-    targetDates: ['2026-11-20'],
+    targetDates: ['2026-11-19'],
     attemptedAt: '2026-11-20T02:00:00.000Z'
   });
   const task = db.getSyncTask('history');
   assert.equal(task.status, 'running');
   assert.equal(task.retryCount, 1);
-  assert.deepEqual(task.targetDates, ['2026-11-20']);
+  assert.deepEqual(task.targetDates, ['2026-11-19']);
   assert.equal(task.lastSuccessDate, '2026-11-19');
   assert.deepEqual(task.failedDates, ['2026-11-18', '2026-11-19']);
+  db.startSyncTask('history', { targetDates: ['2026-11-20'], attemptedAt: '2026-11-20T09:00:00.000Z' });
+  assert.equal(db.getSyncTask('history').retryCount, 0);
   db.close();
 });
 

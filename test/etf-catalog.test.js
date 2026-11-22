@@ -23,6 +23,7 @@ function createRecentBars(count = 25) {
     date: new Date(end - (count - index - 1) * 86400000).toISOString().slice(0, 10),
     open: 4,
     close: 4 + index * 0.001,
+    rawClose: 5 + index * 0.001,
     high: 4.1,
     low: 3.9,
     volume: 100,

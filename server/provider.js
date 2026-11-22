@@ -2,6 +2,7 @@
 
 const { getMarket } = require('../config/etfs');
 const { scale } = require('./metrics');
+const { shanghaiClock } = require('./trading-calendar');
 
 const QUOTE_HOSTS = [
   'https://push2.eastmoney.com',
@@ -140,8 +141,15 @@ async function fetchKlines(etf, limit = 520) {
   const secid = `${getMarket(etf.code)}.${etf.code}`;
   const fields1 = 'f1,f2,f3,f4,f5,f6';
   const fields2 = 'f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61';
-  const url = `${HISTORY_HOST}/api/qt/stock/kline/get?secid=${secid}&klt=101&fqt=1&lmt=${limit}&end=20500101&fields1=${fields1}&fields2=${fields2}`;
-  return parseKlines(etf, await fetchJson(url));
+  const url = `${HISTORY_HOST}/api/qt/stock/kline/get?secid=${secid}&klt=101&lmt=${limit}&end=20500101&fields1=${fields1}&fields2=${fields2}`;
+  const [adjusted, raw] = await Promise.all([
+    fetchJson(`${url}&fqt=1`).then((data) => parseKlines(etf, data)),
+    fetchJson(`${url}&fqt=0`).then((data) => parseKlines(etf, data)).catch(() => [])
+  ]);
+  const { date, minute } = shanghaiClock();
+  const rawCloses = new Map(raw.filter((bar) => bar.close > 0 &&
+    (bar.date < date || (bar.date === date && minute >= '15:00'))).map((bar) => [bar.date, bar.close]));
+  return adjusted.filter((bar) => bar.close > 0).map((bar) => ({ ...bar, rawClose: rawCloses.get(bar.date) ?? null }));
 }
 
 function parseTrends(etf, data) {

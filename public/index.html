@@ -63,17 +63,17 @@
         <span class="summary-index" aria-hidden="true">01</span>
         <div class="summary-label">监测池成交额</div>
         <strong id="totalAmount">--</strong>
-        <span id="monitorCountFoot" class="summary-foot">当前监控 ETF 合计</span>
+        <span id="monitorCountFoot" class="summary-foot">等待行情覆盖数据</span>
       </article>
       <article class="summary-card">
         <span class="summary-index" aria-hidden="true">02</span>
         <div class="summary-label">20日显著放量</div>
         <strong id="volumeUpCount">--</strong>
-        <span class="summary-foot">成交额达到均值 2 倍</span>
+        <span id="volumeUpFoot" class="summary-foot">成交额达到均值 2 倍</span>
       </article>
       <article class="summary-card summary-official">
         <span class="summary-index" aria-hidden="true">03</span>
-        <div class="summary-label">今日官方净申购</div>
+        <div class="summary-label">行情日官方净申购</div>
         <strong id="shareUpCount">--</strong>
         <span class="summary-foot" id="shareUpFoot">等待当日官方份额发布</span>
       </article>
@@ -180,6 +180,7 @@
         </div>
         <span id="scoreBoardAsOf" class="muted-note">评分基于 --</span>
       </div>
+      <p id="closingSummary" class="muted-note" hidden></p>
       <div id="signalBoard" class="signal-board">
         <div class="skeleton-card"></div>
         <div class="skeleton-card"></div>
@@ -188,13 +189,13 @@
     </section>
 
     <section class="footer-grid">
-      <article class="info-panel">
+      <article id="methodology" class="info-panel" tabindex="-1">
         <p class="eyebrow">METHODOLOGY</p>
         <h3>数据口径</h3>
         <p>折溢价率统一使用“市场价 ÷ IOPV − 1”。IOPV 优先采用上交所、深交所官方实时参考净值；交易所不可用时才降级到明确标注的东方财富公开报价字段。来源时间无法可靠对齐时不合并，冲突或过期时不展示当前折溢价。</p>
         <p>20日量比使用当前成交额与前 20 个完整交易日成交额均值计算。交易所官方份额通常不是盘中逐秒数据；当前行情日期尚未发布官方份额时，页面显示“待官方发布”，不会把行情快照份额与上一官方份额相减。详情页可按 20/60/250 日查看官方份额、累计估算净申赎、连续净申赎天数和份额历史分位。</p>
-        <p>行情快照份额仅用于展示和校验；官方份额变化、估算净申赎与净申购标签只使用同日及前一实际交易日的交易所官方记录。ETF 二级市场买入不改变基金总份额，因此份额变化只能作为一级市场净申赎代理，不能确认交易账户或国家队身份。</p>
-        <p>新版评分把成交额量比、官方份额变化分位、连续净申赎与宽基/同分类共振拆成可追溯贡献分。40–59 为观察，60–79 为活跃异动，80 以上为高强度异动；评分不构成国家队身份确认或投资建议。</p>
+        <p>份额变化使用相邻交易日的官方记录，乘同日不复权收盘价得到净申赎估算。缺少官方份额或同日收盘时保留缺口。份额变化仅用于估计一级市场申赎。</p>
+        <p>评分由成交额量比、份额变化分位、连续净申赎与同类放量构成。40–59 为观察，60–79 为活跃异动，80 以上为高强度异动。</p>
       </article>
       <article class="info-panel">
         <p class="eyebrow">UPDATE LOG</p>
@@ -203,6 +204,15 @@
           <div class="log-line">等待首次更新</div>
         </div>
         <div id="dataStatusPanel" class="data-status-panel"></div>
+        <details class="data-refresh-tools">
+          <summary>按数据类型补抓</summary>
+          <div class="data-refresh-actions">
+            <button class="button button-quiet" type="button" data-refresh-kind="quotes">刷新行情</button>
+            <button class="button button-quiet" type="button" data-refresh-kind="history">补日线</button>
+            <button class="button button-quiet" type="button" data-refresh-kind="shares">补官方份额</button>
+            <button class="button button-quiet" type="button" data-refresh-kind="iopv">刷新 IOPV</button>
+          </div>
+        </details>
       </article>
     </section>
     </div>

@@ -158,20 +158,39 @@ async function restoreDatabase({
   }
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
   const temporary = `${dbPath}.restore-${process.pid}.tmp`;
-  fs.copyFileSync(backupPath, temporary);
-  const temporaryCheck = verifyDatabase(temporary);
-  if (!temporaryCheck.ok) {
+  let replaced = false;
+  try {
+    fs.copyFileSync(backupPath, temporary);
+    if (!verifyDatabase(temporary).ok) throw new Error('恢复临时库未通过完整性检查');
+    if (safetyBackup) {
+      const original = new DatabaseSync(dbPath);
+      try {
+        const result = original.prepare('PRAGMA journal_mode = DELETE').get();
+        if (result.journal_mode !== 'delete') throw new Error('原数据库仍在使用，无法安全替换');
+      } finally {
+        original.close();
+      }
+    }
+    fs.renameSync(temporary, dbPath);
+    replaced = true;
+    const restored = verifyDatabase(dbPath);
+    if (!restored.ok) throw new Error('恢复后的数据库未通过完整性检查');
+    return { restored, safetyBackup };
+  } catch (error) {
+    if (replaced && safetyBackup) {
+      try {
+        fs.copyFileSync(safetyBackup, temporary);
+        fs.renameSync(temporary, dbPath);
+      } catch (rollbackError) {
+        throw new Error(`恢复和自动回滚均失败，原数据备份位于 ${safetyBackup}：${rollbackError.message}`, {
+          cause: error
+        });
+      }
+    }
+    throw error;
+  } finally {
     fs.rmSync(temporary, { force: true });
-    throw new Error('恢复临时库未通过完整性检查');
   }
-  for (const suffix of ['-wal', '-shm']) {
-    fs.rmSync(`${dbPath}${suffix}`, { force: true });
-  }
-  fs.rmSync(dbPath, { force: true });
-  fs.renameSync(temporary, dbPath);
-  const restored = verifyDatabase(dbPath);
-  if (!restored.ok) throw new Error('恢复后的数据库未通过完整性检查');
-  return { restored, safetyBackup };
 }
 
 module.exports = {

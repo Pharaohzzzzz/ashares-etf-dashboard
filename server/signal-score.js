@@ -1,9 +1,9 @@
 'use strict';
 
-const { percentile } = require('./metrics');
+const { volumeRatio: calculateVolumeRatio } = require('./metrics');
 
 const SIGNAL_PARAMETERS = Object.freeze({
-  version: 'signal-score-v2.0.0',
+  version: 'signal-score-v2.1.0',
   weights: Object.freeze({
     volume: 35,
     shareChange: 30,
@@ -38,9 +38,15 @@ function clamp(value, minimum = 0, maximum = 1) {
   return Math.min(maximum, Math.max(minimum, value));
 }
 
-function average(values) {
-  const valid = values.filter(finite);
-  return valid.length ? valid.reduce((sum, value) => sum + value, 0) / valid.length : null;
+function shareChangePercentile(value, history) {
+  if (history.length < 2) return 0.5;
+  let lower = 0;
+  let tied = 0;
+  for (const change of history) {
+    if (change < value) lower += 1;
+    if (change === value) tied += 1;
+  }
+  return (lower + (tied - 1) / 2) / (history.length - 1);
 }
 
 function levelForScore(score) {
@@ -80,9 +86,10 @@ function calculateSignalScore({
     (volumeRatio - SIGNAL_PARAMETERS.volumeNormalization.start) /
       (SIGNAL_PARAMETERS.volumeNormalization.cap - SIGNAL_PARAMETERS.volumeNormalization.start)
   );
-  const shareFactor = clamp(Math.abs(sharePercentile - 0.5) * 2);
+  const shareFactor = shareDelta === 0 ? 0 : clamp(Math.abs(sharePercentile - 0.5) * 2);
   const streakFactor = clamp(streak.days / SIGNAL_PARAMETERS.streakCapDays);
-  const resonanceFactor = clamp(resonanceCount / SIGNAL_PARAMETERS.resonanceMinCount);
+  const hasResonance = resonanceCount >= SIGNAL_PARAMETERS.resonanceMinCount;
+  const resonanceFactor = hasResonance ? 1 : 0;
 
   const components = [
     {
@@ -107,7 +114,7 @@ function calculateSignalScore({
       weight: SIGNAL_PARAMETERS.weights.shareChange,
       contribution: round(shareFactor * SIGNAL_PARAMETERS.weights.shareChange),
       direction: shareDelta > 0 ? 'subscription' : shareDelta < 0 ? 'redemption' : 'flat',
-      note: `不含未来份额；分位基于当日及以前最多 ${SIGNAL_PARAMETERS.sharePercentileDays} 个连续官方变化`
+      note: `取当日及以前最多 ${SIGNAL_PARAMETERS.sharePercentileDays} 个有效变化，并列用平均名次，持平不计分`
     },
     {
       key: 'streak',
@@ -124,18 +131,16 @@ function calculateSignalScore({
       key: 'resonance',
       label: '宽基或同分类共振',
       actual: resonanceCount,
-      actualLabel: resonanceSource === '同分类'
-        ? `${resonanceCount} 只同分类 ETF 放量`
-        : resonanceSource === '宽基'
-          ? `${resonanceCount} 只宽基 ETF 同步放量`
-          : categorySize < SIGNAL_PARAMETERS.resonanceMinCount
-            ? '同分类样本不足'
-            : '未形成共振',
+      actualLabel: hasResonance
+        ? `${resonanceCount} 只${resonanceSource || '同分类'} ETF 同步放量`
+        : resonanceCount === 0 && categorySize < SIGNAL_PARAMETERS.resonanceMinCount
+          ? '同分类样本不足'
+          : `${resonanceCount} 只放量，未形成共振`,
       normalized: round(resonanceFactor, 4),
       weight: SIGNAL_PARAMETERS.weights.resonance,
       contribution: round(resonanceFactor * SIGNAL_PARAMETERS.weights.resonance),
-      direction: resonanceCount >= SIGNAL_PARAMETERS.resonanceMinCount ? 'resonance' : 'none',
-      note: `成交额量比达到 ${SIGNAL_PARAMETERS.resonanceVolumeRatio.toFixed(2)}× 计为放量`
+      direction: hasResonance ? 'resonance' : 'none',
+      note: `至少 ${SIGNAL_PARAMETERS.resonanceMinCount} 只 ETF 的成交额量比达到 ${SIGNAL_PARAMETERS.resonanceVolumeRatio.toFixed(2)}×`
     }
   ];
 
@@ -156,7 +161,7 @@ function calculateSignalScore({
   };
 }
 
-function createShareTimeline(bars, shares) {
+function createShareTimeline(bars, shares, previousDateByDate) {
   const sharesByDate = new Map(
     shares
       .filter((row) => finite(row.shares))
@@ -165,7 +170,7 @@ function createShareTimeline(bars, shares) {
   const deltaByDate = new Map();
   for (let index = 1; index < bars.length; index += 1) {
     const current = sharesByDate.get(bars[index].date);
-    const previous = sharesByDate.get(bars[index - 1].date);
+    const previous = sharesByDate.get(previousDateByDate.get(bars[index].date) || bars[index - 1].date);
     if (!current || !previous) continue;
     deltaByDate.set(bars[index].date, current.shares - previous.shares);
   }
@@ -185,6 +190,8 @@ function createShareTimeline(bars, shares) {
     let days = delta === 0 ? 0 : 1;
     if (days) {
       for (let index = barIndex - 1; index > 0; index -= 1) {
+        const expectedDate = previousDateByDate.get(bars[index + 1].date);
+        if (expectedDate && bars[index].date !== expectedDate) break;
         const priorDelta = deltaByDate.get(bars[index].date);
         if (!finite(priorDelta) || priorDelta === 0) break;
         const priorDirection = priorDelta > 0 ? 'subscription' : 'redemption';
@@ -195,7 +202,7 @@ function createShareTimeline(bars, shares) {
 
     states.set(bar.date, {
       shareDelta: delta,
-      sharePercentile: percentile(delta, rollingDeltas),
+      sharePercentile: shareChangePercentile(delta, rollingDeltas),
       shareSamples: rollingDeltas.length,
       streak: {
         direction,
@@ -211,13 +218,17 @@ function createShareTimeline(bars, shares) {
   return states;
 }
 
-function buildSignalScores(dataset) {
+function buildSignalScores(dataset, { tradingDates = [] } = {}) {
+  const previousDateByDate = new Map();
+  for (let index = 1; index < tradingDates.length; index += 1) {
+    previousDateByDate.set(tradingDates[index], tradingDates[index - 1]);
+  }
   const prepared = dataset.map(({ etf, bars, shares }) => {
     const sortedBars = [...bars].sort((left, right) => left.date.localeCompare(right.date));
     return {
       etf,
       bars: sortedBars,
-      shareStates: createShareTimeline(sortedBars, shares)
+      shareStates: createShareTimeline(sortedBars, shares, previousDateByDate)
     };
   });
   const ratiosByDate = new Map();
@@ -230,13 +241,17 @@ function buildSignalScores(dataset) {
         item.byDate.set(bar.date, { bar, volumeRatio: null });
         continue;
       }
-      const priorBars = item.bars.slice(
+      const windowBars = item.bars.slice(
         index - SIGNAL_PARAMETERS.volumeBaselineDays,
-        index
+        index + 1
       );
-      const priorAverage = average(priorBars.map((row) => row.amount));
-      const volumeRatio = finite(bar.amount) && priorAverage > 0
-        ? bar.amount / priorAverage
+      const consecutive = windowBars.slice(1).every((day, offset) => {
+        const expectedDate = previousDateByDate.get(day.date);
+        return !expectedDate || windowBars[offset].date === expectedDate;
+      });
+      const priorAmounts = windowBars.slice(0, -1).map((row) => row.amount);
+      const volumeRatio = consecutive && priorAmounts.every(finite)
+        ? calculateVolumeRatio(bar.amount, priorAmounts)
         : null;
       const row = { bar, volumeRatio };
       item.byDate.set(bar.date, row);
@@ -303,6 +318,8 @@ function buildSignalScores(dataset) {
         name: item.etf.name,
         category: item.etf.category,
         date,
+        volumeRatio: row.volumeRatio,
+        changePercent: row.bar.changePercent,
         score: scored.score,
         level: scored.level,
         components: scored.components,

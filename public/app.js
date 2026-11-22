@@ -1,6 +1,11 @@
 'use strict';
 
 const EXPECTED_API_VERSION = 3;
+const DATA_TASK_LABELS = { quotes: '行情', history: '日线', shares: '官方份额', iopv: 'IOPV' };
+const TASK_STATUS_LABELS = {
+  running: '同步中', success: '已完成', partial: '部分完成', pending: '待数据', error: '同步失败',
+  ready: '已完整', waiting: '待发布', failed: '同步失败', incomplete: '历史不完整', unavailable: '暂无目标日'
+};
 const COLUMN_STORAGE_KEY = 'etf-dashboard-columns-v1';
 const DENSITY_STORAGE_KEY = 'etf-dashboard-density-v1';
 const COLUMN_DEFAULTS = {
@@ -43,7 +48,7 @@ const state = {
   sortKey: null,
   sortDirection: 'desc',
   loading: false,
-  detailCode: null,
+  detailRequest: null,
   detailData: null,
   shareRange: 250,
   shareChart: null,
@@ -72,11 +77,13 @@ const elements = {
   errorBanner: document.querySelector('#errorBanner'),
   totalAmount: document.querySelector('#totalAmount'),
   volumeUpCount: document.querySelector('#volumeUpCount'),
+  volumeUpFoot: document.querySelector('#volumeUpFoot'),
   shareUpCount: document.querySelector('#shareUpCount'),
   shareUpFoot: document.querySelector('#shareUpFoot'),
   compositeCount: document.querySelector('#compositeCount'),
   resonanceHint: document.querySelector('#resonanceHint'),
   signalBoard: document.querySelector('#signalBoard'),
+  closingSummary: document.querySelector('#closingSummary'),
   scoreBoardAsOf: document.querySelector('#scoreBoardAsOf'),
   categoryTabs: document.querySelector('#categoryTabs'),
   resultCount: document.querySelector('#resultCount'),
@@ -348,19 +355,20 @@ async function loadSummary({ silent = false } = {}) {
   }
 }
 
-async function refreshData() {
+async function refreshData(kind = 'all') {
   if (state.loading) return;
   state.loading = true;
   setRefreshLoading(true);
   try {
-    const summary = await fetchJson('/api/refresh', { method: 'POST' });
+    const path = kind === 'all' ? '/api/refresh' : `/api/refresh?kind=${kind}`;
+    const summary = await fetchJson(path, { method: 'POST' });
     state.summary = summary;
     state.rows = summary.etfs || [];
     applyColumnSettings();
     renderSummary();
     renderTable();
     updateBackendVersionNotice();
-    showToast('行情与份额已刷新');
+    showToast(refreshResultText(summary, kind));
   } catch (error) {
     elements.errorBanner.hidden = false;
     elements.errorBanner.textContent = `刷新失败：${error.message}`;
@@ -371,9 +379,20 @@ async function refreshData() {
   }
 }
 
+function refreshResultText(summary, kind) {
+  const taskKeys = kind === 'all' ? ['quotes', 'iopv', 'shares'] : [kind];
+  return taskKeys.map((key) => {
+    const state = key === 'shares' ? summary.shareSyncStatus?.state : summary.dataStatus?.tasks?.[key]?.status;
+    return `${DATA_TASK_LABELS[key]} ${TASK_STATUS_LABELS[state] || '状态待确认'}`;
+  }).join(' · ');
+}
+
 function setRefreshLoading(loading) {
   elements.refreshButton.disabled = loading;
   elements.refreshButton.classList.toggle('is-loading', loading);
+  document.querySelectorAll('[data-refresh-kind]').forEach((button) => {
+    button.disabled = loading;
+  });
 }
 
 function setStatus(type, text) {
@@ -408,6 +427,9 @@ function updateMarketStatus() {
   const status = state.summary.quoteStatus;
   if (status === 'error') setStatus('error', '行情数据异常');
   else if (status === 'partial') setStatus('warning', '部分数据异常');
+  else if (state.summary.marketPhase === 'closed') setStatus('quiet', '休市 · 最近交易日');
+  else if (state.summary.marketPhase === 'break') setStatus('quiet', '午间休市');
+  else if (state.summary.marketPhase === 'unknown') setStatus('warning', '交易日历待确认');
   else setStatus('live', state.summary.dataTime ? '行情已连接' : '等待盘后数据');
 }
 
@@ -415,8 +437,13 @@ function renderSummary() {
   const summary = state.summary;
   if (!summary) return;
   const monitorCount = summary.monitorCount ?? state.rows.length;
+  const quoteDate = summary.quoteAsOfDate || summary.dataStatus?.dates?.quoteDate;
+  const amountCount = summary.amountCoverage?.available ?? 0;
   elements.monitorEyebrow.textContent = `${monitorCount} 只监控 ETF · 公开行情监测`;
-  elements.monitorCountFoot.textContent = `${monitorCount} 只 ETF 合计`;
+  elements.monitorCountFoot.textContent = quoteDate
+    ? `${quoteDate} · ${amountCount}/${monitorCount} 只有效`
+    : '等待行情覆盖数据';
+  elements.volumeUpFoot.textContent = [quoteDate, '成交额达到均值 2 倍'].filter(Boolean).join(' · ');
   if (elements.tableLoadingText) {
     elements.tableLoadingText.textContent =
       `正在读取 ${monitorCount} 只 ETF 的行情、IOPV 与历史数据...`;
@@ -451,28 +478,36 @@ function renderSummary() {
     elements.shareUpCount.textContent = '同步状态缺失';
     elements.shareUpFoot.textContent = summary.shareSyncStatus?.message || '后台未返回官方份额同步状态';
   }
-  const scoreDates = state.rows.map((row) => row.scoreDate).filter(Boolean).sort();
-  const latestScoreDate = scoreDates.at(-1) || null;
+  const latestScoreDate = summary.scoreAsOfDate ?? state.rows.map((row) => row.scoreDate).filter(Boolean).sort().at(-1);
+  const scoredRows = state.rows.filter((row) => latestScoreDate && row.scoreDate === latestScoreDate);
   elements.scoreBoardAsOf.textContent = latestScoreDate
     ? `评分基于 ${latestScoreDate} · 非实时`
     : '评分暂不可用';
-  const highCount = state.rows.filter((row) => row.scoreLevel?.key === 'high').length;
-  const activeCount = state.rows.filter((row) => row.scoreLevel?.key === 'active').length;
+  const highCount = scoredRows.filter((row) => row.scoreLevel?.key === 'high').length;
+  const activeCount = scoredRows.filter((row) => row.scoreLevel?.key === 'active').length;
   elements.resonanceHint.textContent = latestScoreDate
     ? `评分日 ${latestScoreDate} · ${activeCount} 只活跃 · ${highCount} 只高强度`
     : '等待最近完整评分日';
   elements.dataTime.textContent = formatter.time(summary.dataTime);
-  elements.generatedTime.textContent = `抓取于 ${formatter.fullTime(summary.generatedAt)}`;
+  elements.generatedTime.textContent = summary.capturedAt
+    ? `抓取于 ${formatter.fullTime(summary.capturedAt)}`
+    : `页面更新 ${formatter.fullTime(summary.generatedAt)}`;
   updateMarketStatus();
-  renderSignalBoard();
+  renderSignalBoard(scoredRows);
+  renderClosingSummary(quoteDate);
   renderCategoryTabs();
   renderLogs();
   renderDataStatus();
 }
 
-function renderSignalBoard() {
+function renderSignalBoard(scoredRows) {
+  const focusedCode = elements.signalBoard.contains(document.activeElement)
+    ? document.activeElement.dataset.etfCode
+    : null;
   elements.signalBoard.replaceChildren();
-  const candidates = state.rows.filter((row) => row.scoreSignal).slice(0, 4);
+  const candidates = scoredRows.filter((row) => row.scoreSignal)
+    .sort((left, right) => right.score - left.score || left.code.localeCompare(right.code))
+    .slice(0, 4);
   if (!candidates.length) {
     elements.signalBoard.append(createElement('div', 'signal-empty', '最近完整评分日没有达到 40 分的异动信号'));
     return;
@@ -489,10 +524,12 @@ function renderSignalBoard() {
       createElement('span', 'signal-code', row.code),
       createElement('h4', '', row.name)
     );
+    const scoredChange = row.scoreChangePercent ?? (row.tradeDate === row.scoreDate ? row.changePercent : null);
+    const scoredRatio = row.scoreVolumeRatio ?? (row.tradeDate === row.scoreDate ? row.volumeRatio : null);
     const change = createElement(
       'span',
-      directionClass(row.changePercent),
-      formatter.percentDirect(row.changePercent)
+      directionClass(scoredChange),
+      formatter.percentDirect(scoredChange)
     );
     top.append(titles, change);
     const value = createElement('div', 'score-card-line');
@@ -508,7 +545,7 @@ function renderSignalBoard() {
     tags.append(createElement(
       'span',
       'tag',
-      `量比 ${formatter.ratio(row.volumeRatio)} · ${row.scoreDate || '--'}`
+      `量比 ${formatter.ratio(scoredRatio)} · ${row.scoreDate}`
     ));
     card.append(top, value, tags);
     card.addEventListener('click', () => openDetail(row.code));
@@ -520,6 +557,27 @@ function renderSignalBoard() {
     });
     elements.signalBoard.append(card);
   }
+  if (focusedCode) elements.signalBoard.querySelector(`[data-etf-code="${focusedCode}"]`)?.focus({ preventScroll: true });
+}
+
+function renderClosingSummary(quoteDate) {
+  const summary = state.summary;
+  elements.closingSummary.hidden = summary.marketPhase !== 'closed' || !quoteDate;
+  if (elements.closingSummary.hidden) return;
+  const rows = state.rows.filter((row) => row.tradeDate === quoteDate && !row.isStale);
+  const topVolume = rows.filter((row) => Number.isFinite(row.volumeRatio))
+    .sort((left, right) => right.volumeRatio - left.volumeRatio)[0];
+  const topFlow = rows.filter((row) => Number.isFinite(row.estimatedSubscription))
+    .sort((left, right) => Math.abs(right.estimatedSubscription) - Math.abs(left.estimatedSubscription))[0];
+  elements.closingSummary.textContent = [
+    `${quoteDate} 盘后摘要`,
+    `有效行情 ${rows.length}/${state.rows.length}`,
+    topVolume ? `最高量比 ${topVolume.name} ${formatter.ratio(topVolume.volumeRatio)}` : '量比待积累',
+    topFlow
+      ? `申赎变动最大 ${topFlow.name} ${formatter.signedAmount(topFlow.estimatedSubscription)}（官方份额估算）`
+      : '官方申赎估算待齐',
+    summary.scoreAsOfDate === quoteDate ? `评分 ≥ 40 有 ${summary.scoreSignalCount} 只` : '当日评分待齐'
+  ].join(' · ');
 }
 
 function renderDataStatus() {
@@ -530,18 +588,33 @@ function renderDataStatus() {
     return;
   }
   const rows = [
-    ['行情', status.dates?.quoteDate],
-    ['日线', status.dates?.barDate],
-    ['官方份额', status.dates?.officialShareDate],
-    ['IOPV', status.dates?.iopvDate]
+    ['quotes', 'quoteDate', '东方财富', (row) => !row.quoteDate || row.quoteDate < state.summary.quoteAsOfDate],
+    ['history', 'barDate', '东方财富', (row) => row.quoteBarLag],
+    ['shares', 'officialShareDate', '沪深交易所', (row) => row.quoteShareLag],
+    ['iopv', 'iopvDate', '沪深交易所 / 东方财富补充', (row) => row.barIopvLag]
   ];
-  for (const [label, date] of rows) {
+  for (const [key, field, source, isBehind] of rows) {
     const item = createElement('div', 'data-status-item');
+    const task = status.tasks?.[key];
+    const gaps = (status.etfs || []).filter(isBehind)
+      .map((row) => `${row.code} ${row[field] || '无数据'}`);
+    const failedDates = (task?.failedDates || []).slice(-5);
     item.append(
-      createElement('span', '', label),
-      createElement('strong', '', date || '尚未更新')
+      createElement('span', '', `${DATA_TASK_LABELS[key]} · ${source}`),
+      createElement('strong', '', status.dates?.[field] || '尚未更新')
     );
+    if (task) item.append(createElement('small', '', [
+      TASK_STATUS_LABELS[task.status], task.message, failedDates.length ? `待补 ${failedDates.join('、')}` : null
+    ].filter(Boolean).join(' · ')));
+    if (gaps.length) item.append(createElement('small', 'status-note', `缺口 ${gaps.join('、')}`));
     elements.dataStatusPanel.append(item);
+  }
+  for (const [key, label] of [['closeQuotes', '15:30 盘后快照'], ['closeHistory', '18:00 盘后同步']]) {
+    const task = status.tasks?.[key];
+    if (!task) continue;
+    elements.dataStatusPanel.append(createElement('div', 'data-status-note', [
+      label, task.targetDates?.at(-1) || task.lastSuccessDate, TASK_STATUS_LABELS[task.status]
+    ].filter(Boolean).join(' · ')));
   }
   const shareSync = state.summary?.shareSyncStatus;
   if (hasApiVersionMismatch()) {
@@ -567,7 +640,11 @@ function renderDataStatus() {
       'div',
       'data-status-note',
       `目标日 ${shareSync.targetDate || '--'} · 最近尝试 ${formatter.fullTime(shareSync.lastAttemptAt)} · ` +
-      `已重试 ${shareSync.retryCount || 0} 次 · 下次 ${shareSync.nextRetryAt ? formatter.fullTime(shareSync.nextRetryAt) : '无（已完整或需手动补历史）'}`
+      `下次 ${shareSync.nextRetryAt ? formatter.fullTime(shareSync.nextRetryAt) : '暂无计划'}`
+    ));
+    const missingDates = shareSync.history?.missingRecentDates || [];
+    if (missingDates.length) elements.dataStatusPanel.append(createElement(
+      'div', 'data-status-note', `官方份额历史缺口 ${missingDates.join('、')}`
     ));
   }
   const calendar = status.calendar;
@@ -723,6 +800,10 @@ async function persistCatalogOrder(previousRows, previousSummary) {
 
 function renderTable() {
   const rows = visibleRows();
+  const focused = document.activeElement;
+  const focusedPool = [elements.etfRows, elements.etfCards].find((pool) => pool?.contains(focused));
+  const focusedCode = focusedPool ? focused.closest('[data-etf-code]')?.dataset.etfCode : null;
+  const focusedMove = focusedCode ? focused.dataset.move : null;
   document.querySelectorAll('th[data-sort]').forEach((header) => {
     const active = header.dataset.sort === state.sortKey;
     header.setAttribute(
@@ -825,6 +906,11 @@ function renderTable() {
     bindRowInteractions(tr, row);
     elements.etfRows.append(tr);
   }
+  if (focusedCode) {
+    const entry = focusedPool.querySelector(`[data-etf-code="${focusedCode}"]`);
+    const target = focusedMove ? entry?.querySelector(`[data-move="${focusedMove}"]`) : entry;
+    target?.focus({ preventScroll: true });
+  }
 }
 
 function createEtfCard(row) {
@@ -862,14 +948,14 @@ function createEtfCard(row) {
   const subscriptionValue = hasApiVersionMismatch()
     ? '后台版本过旧'
     : subscriptionReady
-      ? formatter.signedAmount(row.estimatedSubscription)
+      ? Number.isFinite(row.estimatedSubscription) ? formatter.signedAmount(row.estimatedSubscription) : '缺少同日收盘'
       : shareMetricStatusLabel(row.shareMetricStatus);
   const metricGrid = createElement('div', 'etf-card-metrics');
   const metrics = [
     ['成交额', formatter.amount(row.amount), ''],
-    ['今日净申赎', subscriptionValue, subscriptionReady ? directionClass(row.estimatedSubscription) : 'status-warning'],
+    ['行情日估算净申赎', subscriptionValue, subscriptionReady ? directionClass(row.estimatedSubscription) : 'status-warning'],
     ['20日量比', formatter.ratio(row.volumeRatio), row.volumeRatio >= 2 ? 'metric-alert' : ''],
-    ['涨跌幅', formatter.percentDirect(row.changePercent), directionClass(row.changePercent)]
+    ['行情日', row.tradeDate || '待行情', 'neutral']
   ];
   for (const [label, value, className] of metrics) {
     const item = createElement('div', 'etf-card-metric');
@@ -936,11 +1022,11 @@ function createShareMetricCell(row, field) {
     : ready
     ? field === 'shareDelta'
       ? formatter.signedShares(value)
-      : formatter.signedAmount(value)
+      : Number.isFinite(value) ? formatter.signedAmount(value) : '缺少同日收盘'
     : shareMetricStatusLabel(row.shareMetricStatus);
-  const note = field === 'shareDelta'
-    ? latestOfficialMetricNote(row)
-    : latestOfficialSubscriptionNote(row);
+  const note = ready && row.latestOfficialShareDeltaDate === row.tradeDate
+    ? `官方日终 ${row.tradeDate}`
+    : field === 'shareDelta' ? latestOfficialMetricNote(row) : latestOfficialSubscriptionNote(row);
   wrapper.append(
     createElement('strong', ready ? directionClass(value) : 'status-note', primary),
     createElement('small', '', note)
@@ -1213,7 +1299,7 @@ async function openManagement() {
   elements.manageClose.focus();
   elements.manageEtfList.replaceChildren(createElement('div', 'table-loading', '正在加载目录...'));
   try {
-    const payload = await fetchJson('/api/etfs/manage');
+    const payload = await fetchJson('/api/etfs/manage?includeSummary=false');
     applyCatalogPayload(payload);
   } catch (error) {
     elements.manageEtfList.replaceChildren(
@@ -1461,7 +1547,9 @@ async function restoreDefaultOrder() {
 
 async function openDetail(code) {
   rememberDrawerTrigger(`[data-etf-code="${code}"]`);
-  state.detailCode = code;
+  state.detailRequest?.abort();
+  const request = new AbortController();
+  state.detailRequest = request;
   state.detailData = null;
   state.shareRange = 250;
   const row = state.rows.find((item) => item.code === code);
@@ -1475,18 +1563,22 @@ async function openDetail(code) {
   pageMain?.toggleAttribute('inert', true);
   pageHeader?.toggleAttribute('inert', true);
   elements.drawerClose.focus();
+  const options = { signal: request.signal };
+  const intradayResult = fetchJson(`/api/etfs/${code}/intraday`, options).then(
+    (data) => ({ data }), (error) => ({ error })
+  );
   try {
-    const [detail, intraday] = await Promise.all([
-      fetchJson(`/api/etfs/${code}`),
-      fetchJson(`/api/etfs/${code}/intraday`).catch(() => ({ points: [], tailVolumeShare: null }))
-    ]);
-    if (state.detailCode === code) renderDetail(detail, intraday);
+    const detail = await fetchJson(`/api/etfs/${code}?compact=1`, options);
+    if (state.detailRequest === request) renderDetail(detail, intradayResult);
   } catch (error) {
-    elements.drawerBody.replaceChildren(createElement('div', 'error-banner', `详情加载失败：${error.message}`));
+    if (state.detailRequest === request) {
+      request.abort();
+      elements.drawerBody.replaceChildren(createElement('div', 'error-banner', `详情加载失败：${error.message}`));
+    }
   }
 }
 
-function renderDetail(detail, intraday) {
+function renderDetail(detail, intradayResult) {
   const row = detail.quote;
   state.detailData = detail;
   elements.drawerBody.replaceChildren();
@@ -1561,8 +1653,7 @@ function renderDetail(detail, intraday) {
       ? `${row.shareStreak.label} ${row.shareStreak.days}日 · 截至 ${row.shareStreakDate}`
       : '无连续序列', directionClass(row.shareStreak?.direction === 'subscription' ? 1 : row.shareStreak?.direction === 'redemption' ? -1 : 0)],
     ['250日份额分位', formatter.plainPercent(row.sharePercentile === null ? null : row.sharePercentile * 100, 1), ''],
-    ['最新官方来源', row.officialShareDate ? `${row.officialShareDate} · ${row.officialShareSource}` : '暂无官方记录', 'neutral'],
-    ['尾盘成交占比', formatter.plainPercent(intraday.tailVolumeShare === null ? null : intraday.tailVolumeShare * 100), '']
+    ['最新官方来源', row.officialShareDate ? `${row.officialShareDate} · ${row.officialShareSource}` : '暂无官方记录', 'neutral']
   ];
   const metricGroups = [
     {
@@ -1594,7 +1685,7 @@ function renderDetail(detail, intraday) {
     {
       title: '风险与历史分位',
       hint: '规模、波动与成交结构',
-      labels: ['估算基金规模', '20日波动率', '成交额分位', '尾盘成交占比']
+      labels: ['估算基金规模', '20日波动率', '成交额分位']
     }
   ].map((group) => ({ ...group, metrics: createElement('div', 'detail-metrics') }));
   for (const [label, value, className] of items) {
@@ -1643,23 +1734,13 @@ function renderDetail(detail, intraday) {
   }
   elements.drawerBody.append(scoreNote);
 
-  const disclaimer = createElement('div', 'detail-note');
-  disclaimer.textContent = '折溢价率统一为“市场价 ÷ IOPV − 1”。IOPV 优先使用交易所官方数据，来源时间无法对齐时不做跨源合并；缺失、为零、过期或来源冲突时只显示异常状态。交易所官方份额通常不是盘中逐秒数据：行情快照份额仅作展示和校验，当前日官方份额未发布时不计算份额变化或估算净申赎。历史曲线只使用上交所、深交所官方份额，缺失日期不补齐。份额只能作为一级市场净申赎代理，不能确认交易账户或国家队身份。';
-  elements.drawerBody.append(disclaimer);
-
   const signalNote = createElement('section', 'signal-note');
   signalNote.append(createElement('h3', '', '旧版规则对照'));
   const signalList = createElement('div', 'signal-explain-list');
-  const detailSignals = [...row.signals];
-  if (
-    Number.isFinite(intraday.tailVolumeShare) &&
-    intraday.tailVolumeShare >= 0.2 &&
-    !detailSignals.some((signal) => signal.key === 'tail-volume')
-  ) {
-    detailSignals.push({ key: 'tail-volume', label: '尾盘异动', level: 'medium' });
-  }
+  const detailSignals = row.signals || [];
+  const emptySignals = createElement('p', '', '旧版规则当前没有触发标签');
   if (!detailSignals.length) {
-    signalList.append(createElement('p', '', '旧版规则当前没有触发标签；历史信号标签仅用于与当前评分对照。'));
+    signalList.append(emptySignals);
   } else {
     for (const signal of detailSignals) {
       signalList.append(createElement(
@@ -1673,6 +1754,14 @@ function renderDetail(detail, intraday) {
   elements.drawerBody.append(signalNote);
 
   const sourceLinks = createElement('div', 'source-links');
+  const methodologyLink = createElement('a', 'source-link', '指标口径');
+  methodologyLink.href = '#methodology';
+  methodologyLink.addEventListener('click', (event) => {
+    event.preventDefault();
+    closeDrawer();
+    document.querySelector('#methodology').focus();
+  });
+  sourceLinks.append(methodologyLink);
   const sourceLink = createElement('a', 'source-link', '东方财富原始行情 ↗');
   sourceLink.href = `https://quote.eastmoney.com/${row.code}.html`;
   sourceLink.target = '_blank';
@@ -1752,9 +1841,11 @@ function renderDetail(detail, intraday) {
 
   const intradayCard = createElement('section', 'chart-card');
   intradayCard.append(createElement('h3', '', '当日分时'));
+  const intradayNote = createElement('div', 'share-coverage-note', '正在加载东方财富分时');
+  intradayNote.setAttribute('role', 'status');
   const intradayChart = createElement('div', 'chart');
   intradayChart.id = 'intradayChart';
-  intradayCard.append(intradayChart);
+  intradayCard.append(intradayNote, intradayChart);
   elements.drawerBody.append(intradayCard);
 
   const dailyCard = createElement('section', 'chart-card');
@@ -1765,7 +1856,7 @@ function renderDetail(detail, intraday) {
   elements.drawerBody.append(dailyCard);
 
   afterRender(() => {
-    if (!window.echarts) return;
+    if (state.detailData !== detail || !window.echarts) return;
     state.charts.forEach((instance) => instance.dispose());
     const shareInstance = echarts.init(shareChart);
     const intradayInstance = echarts.init(intradayChart);
@@ -1774,7 +1865,6 @@ function renderDetail(detail, intraday) {
     state.shareChart = shareInstance;
     renderShareRange();
     renderIopvCharts(iopv, iopvIntradayInstance);
-    intradayInstance.setOption(buildIntradayOption(intraday));
     dailyInstance.setOption(buildDailyOption(detail.bars || []));
     state.charts = [
       shareInstance,
@@ -1782,6 +1872,24 @@ function renderDetail(detail, intraday) {
       dailyInstance,
       iopvIntradayInstance
     ];
+    intradayResult.then(({ data, error }) => {
+      if (state.detailData !== detail) return;
+      if (!data?.points?.length) {
+        const message = error ? `分时加载失败：${error.message}` : '东方财富暂无分时记录';
+        intradayNote.textContent = message;
+        intradayInstance.setOption(emptyChartOption('分时暂不可用'), true);
+        return;
+      }
+      intradayNote.textContent = [
+        `东方财富 · ${data.points.at(-1).time.slice(0, 10)}`,
+        Number.isFinite(data.tailVolumeShare) ? `尾盘成交占比 ${formatter.plainPercent(data.tailVolumeShare * 100)}` : null
+      ].filter(Boolean).join(' · ');
+      intradayInstance.setOption(buildIntradayOption(data), true);
+      if (data.tailVolumeShare >= 0.2 && !detailSignals.some((signal) => signal.key === 'tail-volume')) {
+        emptySignals.remove();
+        signalList.append(createElement('p', '', `尾盘异动：${signalCondition('tail-volume', row)}`));
+      }
+    });
   });
 }
 
@@ -1843,7 +1951,10 @@ function renderShareRange() {
   const missingText = coverage?.missingRecentDates?.length
     ? `；近期缺口 ${coverage.missingRecentDates.join('、')}`
     : '';
-  note.textContent = `${statusText}${missingText}。数据来源：${history.sourceName || '交易所'}官方接口；${history.note}`;
+  const estimateText = Number.isInteger(coverage?.estimatedDays)
+    ? `；连续份额 ${coverage.shareDeltaDays}/${state.shareRange} 日，有效估算 ${coverage.estimatedDays}/${state.shareRange} 日`
+    : '';
+  note.textContent = `${statusText}${missingText}${estimateText}。数据来源：${history.sourceName || '交易所'}官方接口；${history.note}`;
   state.shareChart?.setOption(buildShareOption(range, history), true);
 }
 
@@ -2337,7 +2448,8 @@ function buildDailyOption(bars) {
 }
 
 function closeDrawer() {
-  state.detailCode = null;
+  state.detailRequest?.abort();
+  state.detailRequest = null;
   state.detailData = null;
   state.shareChart = null;
   state.charts.forEach((instance) => instance.dispose());
@@ -2424,7 +2536,10 @@ function showToast(message) {
 }
 
 function bindEvents() {
-  elements.refreshButton.addEventListener('click', refreshData);
+  elements.refreshButton.addEventListener('click', () => refreshData());
+  document.querySelectorAll('[data-refresh-kind]').forEach((button) => {
+    button.addEventListener('click', () => refreshData(button.dataset.refreshKind));
+  });
   elements.densityToggle.addEventListener('click', () => {
     state.density = state.density === 'compact' ? 'comfortable' : 'compact';
     applyDensity();

@@ -1634,6 +1634,30 @@ th[aria-sort="descending"] .sort-button::after {
   display: block;
 }
 
+.data-status-item small {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.data-refresh-tools {
+  margin-top: var(--space-3);
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.data-refresh-tools summary {
+  cursor: pointer;
+}
+
+.data-refresh-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
 .data-status-item span {
   color: var(--faint);
   font-size: 11px;

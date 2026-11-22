@@ -36,12 +36,14 @@ const {
 const {
   fetchSseEtfShares,
   fetchSzseEtfShares,
-  fetchSzseEtfShareRange
+  fetchSzseEtfShareRange,
+  splitDateRange
 } = require('./official-shares');
 const {
   fetchCalendarMonth,
   calendarStatusFor,
-  isTradingSession
+  isTradingSession,
+  shanghaiClock
 } = require('./trading-calendar');
 const {
   isOfficialShareRetryDue,
@@ -50,10 +52,11 @@ const {
 
 const OFFICIAL_HISTORY_DAYS = 250;
 const OFFICIAL_FETCH_DAYS = OFFICIAL_HISTORY_DAYS + 1;
-const OFFICIAL_RECOVERY_DAYS = 2;
-const OFFICIAL_STATUS_HISTORY_DAYS = OFFICIAL_HISTORY_DAYS;
+const OFFICIAL_RECOVERY_DAYS = 10;
+const OFFICIAL_STATUS_HISTORY_DAYS = OFFICIAL_FETCH_DAYS;
 const OFFICIAL_RANGES = [20, 60, 250];
 const SSE_FETCH_CONCURRENCY = 4;
+const TASK_RETRY_MS = 15 * 60 * 1000;
 const OFFICIAL_SHARE_SOURCES = new Set(['上交所', '深交所', 'SSE', 'SZSE']);
 
 const shanghaiDateFormatter = new Intl.DateTimeFormat('en-CA', {
@@ -93,6 +96,14 @@ function snapshotToQuote(row) {
 
 function isOfficialShareSource(source) {
   return OFFICIAL_SHARE_SOURCES.has(source);
+}
+
+function marketPhase(now, calendar) {
+  if (!calendar.known) return 'unknown';
+  if (isTradingSession(now, calendar)) return 'trading';
+  const { minute } = shanghaiClock(now);
+  if (calendar.isTradingDay && minute > '11:30' && minute < '13:00') return 'break';
+  return 'closed';
 }
 
 function calculateOfficialShareMetric({
@@ -182,8 +193,9 @@ class MarketService {
     this.refreshPromise = null;
     this.shareSyncPromise = null;
     this.iopvRefreshPromise = null;
+    this.historySyncPromise = null;
     this.calendarRefreshPromise = null;
-    this.calendarLastAttemptAt = 0;
+    this.calendarLastAttemptAt = null;
     this.calendarLastError = null;
     this.initializing = false;
     this.initializedAt = db.getMeta('initializedAt');
@@ -331,8 +343,8 @@ class MarketService {
       if (quote?.timestamp) {
         const capturedAt = this.now().toISOString();
         const tradeDate = tradeDateFromTimestamp(quote.timestamp);
-        this.db.saveSnapshot(quote, tradeDate, capturedAt);
-        if (quote.shares !== null) {
+        const saved = this.db.saveSnapshot(quote, tradeDate, capturedAt);
+        if (saved && quote.shares !== null) {
           this.db.saveShareHistory([{
             code,
             tradeDate,
@@ -416,6 +428,9 @@ class MarketService {
       return this.getTradingCalendarStatus(date);
     }
     if (this.calendarRefreshPromise) return this.calendarRefreshPromise;
+    if (!force && this.calendarLastError && nowMs - this.calendarLastAttemptAt < TASK_RETRY_MS) {
+      return this.getTradingCalendarStatus(date);
+    }
     this.calendarRefreshPromise = (async () => {
       try {
         const calendar = await this.calendarProvider(date);
@@ -477,58 +492,63 @@ class MarketService {
     return isTradingSession(date, this.getTradingCalendarStatus(date));
   }
 
-  async syncHistoricalBars({ force = false } = {}) {
-    const attemptedAt = this.now().toISOString();
-    const before = this.db.getDataDates();
-    const targets = this.getEnabledEtfs().filter((etf) => {
-      if (force) return true;
-      const dates = this.db.getEtfDataDates(etf.code);
-      return this.db.countBars(etf.code) < OFFICIAL_HISTORY_DAYS ||
-        (dates.quoteDate && (!dates.barDate || dates.barDate < dates.quoteDate));
-    });
-    const targetDates = [...new Set(
-      targets.map((etf) => this.db.getEtfDataDates(etf.code).quoteDate).filter(Boolean)
-    )].sort();
-    this.db.startSyncTask('history', { targetDates, attemptedAt });
-    if (!targets.length) {
-      this.db.finishSyncTask('history', {
-        status: 'success',
-        lastSuccessDate: before.barDate,
-        message: '报价日期与日线日期已对齐',
-        attemptedAt
-      });
-      return {
-        requestedCodes: [],
-        failedCodes: [],
-        barDate: before.barDate
-      };
+  async syncHistoricalBars(options = {}) {
+    if (this.historySyncPromise) {
+      if (!options.tradeDate) return this.historySyncPromise;
+      await this.historySyncPromise;
     }
+    this.historySyncPromise = this.performHistorySync(options);
+    try {
+      return await this.historySyncPromise;
+    } finally {
+      this.historySyncPromise = null;
+    }
+  }
 
-    const results = await Promise.allSettled(targets.map(async (etf) => {
-      const bars = await this.klineProvider(etf, 520);
-      this.db.upsertBars(etf.code, bars);
-      return etf.code;
-    }));
-    const failedCodes = results.flatMap((result, index) => (
-      result.status === 'rejected' ? [targets[index].code] : []
-    ));
-    const after = this.db.getDataDates();
-    const failedDates = targets
-      .filter((etf) => {
-        const dates = this.db.getEtfDataDates(etf.code);
-        return dates.quoteDate && (!dates.barDate || dates.barDate < dates.quoteDate);
-      })
-      .map((etf) => this.db.getEtfDataDates(etf.code).quoteDate);
-    const status = failedCodes.length
-      ? (failedCodes.length === targets.length ? 'error' : 'partial')
-      : 'success';
-    const message = failedCodes.length
-      ? `${failedCodes.length}/${targets.length} 只日线补数失败`
-      : `${targets.length} 只日线已补齐至报价交易日`;
+  async performHistorySync({ force = false, tradeDate = null } = {}) {
+    const attemptedAt = this.now().toISOString();
+    const clock = shanghaiClock(this.now());
+    const latestQuoteDate = this.latestQuoteTradeDate();
+    const targetDate = tradeDate || (latestQuoteDate === clock.date && clock.minute < '15:00'
+      ? this.db.getPreviousTradingDate(clock.date)
+      : latestQuoteDate);
+    const targetDates = targetDate ? [targetDate] : [];
+    const expectedDates = targetDate ? this.db.getRecentTradeDates(OFFICIAL_FETCH_DAYS, targetDate) : [];
+    if (targetDate && !expectedDates.includes(targetDate)) expectedDates.push(targetDate);
+    const missingDatesFor = (code) => {
+      const bars = this.db.getBars(code, 520);
+      const firstDate = bars[0]?.date;
+      const validDates = new Set(bars.filter((bar) => bar.close > 0 && bar.rawClose > 0).map((bar) => bar.date));
+      return expectedDates.filter((date) => (!firstDate || date >= firstDate) && !validDates.has(date));
+    };
+    const etfs = this.getEnabledEtfs();
+    const targets = etfs.filter((etf) => force || !this.db.countBars(etf.code) || missingDatesFor(etf.code).length);
+    this.db.startSyncTask('history', { targetDates, attemptedAt });
+    const results = await mapLimit(targets, 4, async (etf) => {
+      try {
+        const bars = await this.klineProvider(etf, 520);
+        if (bars.length) this.db.upsertBars(etf.code, bars);
+        return { code: etf.code, empty: !bars.length };
+      } catch (error) {
+        return { code: etf.code, error: error.message };
+      }
+    });
+    const missingByCode = etfs.map((etf) => [etf.code, missingDatesFor(etf.code)]);
+    const failedDates = [...new Set(missingByCode.flatMap(([, dates]) => dates))].sort();
+    const failedCodes = [...new Set([
+      ...results.filter((result) => result.error || result.empty).map((result) => result.code),
+      ...missingByCode.filter(([, dates]) => dates.length).map(([code]) => code)
+    ])];
+    const status = !failedCodes.length ? 'success'
+      : failedCodes.length < etfs.length ? 'partial'
+        : results.length && results.every((result) => result.error) ? 'error' : 'pending';
+    const message = failedCodes.length ? `${failedCodes.length}/${etfs.length} 只日线或不复权收盘待补`
+      : (targetDate ? `日线与不复权收盘已对齐 ${targetDate}` : '已更新可取得日线');
+    const barDate = this.getActiveDataDates().barDate;
     this.db.log('history', status, message, this.now().toISOString());
     this.db.finishSyncTask('history', {
       status,
-      lastSuccessDate: after.barDate,
+      lastSuccessDate: status === 'success' ? targetDate || barDate : null,
       failedDates,
       message,
       attemptedAt: this.now().toISOString()
@@ -536,8 +556,66 @@ class MarketService {
     return {
       requestedCodes: targets.map((etf) => etf.code),
       failedCodes,
-      barDate: after.barDate
+      failedDates,
+      status,
+      barDate
     };
+  }
+
+  async runPostCloseTasks(now, calendar) {
+    if (!calendar?.known || this.initializing) return;
+    const { date, minute } = shanghaiClock(now);
+    const previousDate = !calendar.isTradingDay || minute < '18:00'
+      ? this.db.getPreviousTradingDate(date)
+      : null;
+    for (const [taskKey, after] of [['closeQuotes', '15:30'], ['closeHistory', '18:00']]) {
+      const tradeDate = calendar.isTradingDay && minute >= after ? date : previousDate;
+      if (!tradeDate) continue;
+      const task = this.db.getSyncTask(taskKey);
+      if (task?.lastSuccessDate === tradeDate || (
+        task?.targetDates.includes(tradeDate) && now.getTime() - Date.parse(task.lastAttemptAt) < TASK_RETRY_MS
+      )) continue;
+      this.db.startSyncTask(taskKey, { targetDates: [tradeDate], attemptedAt: now.toISOString() });
+      let status;
+      let message;
+      try {
+        if (taskKey === 'closeQuotes') {
+          const count = this.getEnabledEtfs().length;
+          let covered = this.db.getClosingSnapshotCodes(tradeDate).length;
+          if (covered < count) {
+            await this.refreshQuotes();
+            covered = this.db.getClosingSnapshotCodes(tradeDate).length;
+          }
+          status = covered === count ? 'success' : 'partial';
+          message = `收盘报价 ${covered}/${count} 只 · ${tradeDate}`;
+        } else {
+          const history = await this.syncHistoricalBars({ tradeDate });
+          status = history.status;
+          if (this.getOfficialShareTargetDate() === tradeDate) {
+            const shares = this.getOfficialShareSyncStatus();
+            const retry = isOfficialShareRetryDue(now, {
+              isTradingDay: calendar.isTradingDay,
+              lastAttemptAt: shares.lastAttemptAt
+            });
+            if (shares.needsRetry && retry) await this.syncOfficialShareHistory(tradeDate, { maxFetchDates: OFFICIAL_RECOVERY_DAYS });
+            const targetReady = Object.values(this.getOfficialShareSyncStatus().exchanges)
+              .every((exchange) => exchange.status === 'ready');
+            if (status === 'success' && !targetReady) status = 'pending';
+          }
+          message = `日线与官方份额 · ${tradeDate}`;
+        }
+      } catch (error) {
+        status = 'error';
+        message = error.message;
+      }
+      this.db.finishSyncTask(taskKey, {
+        status,
+        lastSuccessDate: status === 'success' ? tradeDate : null,
+        failedDates: status === 'success' ? [] : [tradeDate],
+        message,
+        attemptedAt: this.now().toISOString()
+      });
+    }
   }
 
   async syncHistory() {
@@ -572,11 +650,14 @@ class MarketService {
     const failures = [];
     results.forEach((result, index) => {
       const etf = enabledEtfs[index];
-      if (result.status === 'fulfilled' && result.value.timestamp) {
+      let snapshotSaved = false;
+      let error = result.reason?.message || '无有效时间戳';
+      if (result.status === 'fulfilled' && result.value?.timestamp) {
         const quote = result.value;
         const tradeDate = tradeDateFromTimestamp(quote.timestamp);
-        this.db.saveSnapshot(quote, tradeDate, capturedAt);
-        if (quote.shares !== null) {
+        snapshotSaved = this.db.saveSnapshot(quote, tradeDate, capturedAt);
+        error = '行情来源时间早于已保存报价';
+        if (snapshotSaved && quote.shares !== null) {
           this.db.saveShareHistory([{
             code: quote.code,
             tradeDate,
@@ -584,6 +665,8 @@ class MarketService {
             source: '行情快照'
           }], capturedAt);
         }
+      }
+      if (snapshotSaved) {
         successCount += 1;
         this.db.recordFetchStatus(etf.code, 'quote', {
           status: 'success',
@@ -592,8 +675,7 @@ class MarketService {
           error: null
         });
       } else {
-        const error = result.reason?.message || '无有效时间戳';
-        failures.push(`${etf.code}: ${result.reason?.message || '无有效时间戳'}`);
+        failures.push(`${etf.code}: ${error}`);
         this.db.recordFetchStatus(etf.code, 'quote', {
           status: 'error',
           attemptedAt: capturedAt,
@@ -641,7 +723,10 @@ class MarketService {
   }
 
   async performIopvRefresh() {
-    const attemptedAt = this.now().toISOString();
+    const now = this.now();
+    const attemptedAt = now.toISOString();
+    const calendar = this.getTradingCalendarStatus(now);
+    const tradingSession = isTradingSession(now, calendar);
     this.db.startSyncTask('iopv', { attemptedAt });
     const enabledEtfs = this.getEnabledEtfs();
     let supplementary = new Map();
@@ -662,7 +747,7 @@ class MarketService {
 
     officialResults.forEach((result, index) => {
       const etf = enabledEtfs[index];
-      const latestTradeDate = this.db.getBars(etf.code, 1).at(-1)?.date || null;
+      const latestTradeDate = tradingSession ? calendar.date : this.db.getBars(etf.code, 1).at(-1)?.date || null;
       let state;
       if (result.status === 'fulfilled') {
         const official = result.value;
@@ -699,9 +784,10 @@ class MarketService {
       }
 
       const resolved = resolveIopvState(state, {
-        now: this.now(),
+        now,
         latestTradeDate,
-        tradingSession: this.isTradingSession(this.now())
+        tradingSession,
+        checkAgeOutsideSession: !calendar.known
       });
       const stored = {
         ...state,
@@ -789,12 +875,17 @@ class MarketService {
   }
 
   async syncOfficialShareHistory(tradeDate, {
-    historyDays = OFFICIAL_FETCH_DAYS
+    historyDays = OFFICIAL_FETCH_DAYS,
+    maxFetchDates = historyDays
   } = {}) {
-    if (this.shareSyncPromise) return this.shareSyncPromise;
+    if (this.shareSyncPromise) {
+      const result = await this.shareSyncPromise;
+      if (!tradeDate || result?.targetDate === tradeDate) return result;
+      return this.syncOfficialShareHistory(tradeDate, { historyDays, maxFetchDates });
+    }
     this.shareSyncPromise = (async () => {
       try {
-        return await this.performOfficialShareSync(tradeDate, historyDays);
+        return await this.performOfficialShareSync(tradeDate, historyDays, maxFetchDates);
       } catch (error) {
         this.db.finishSyncTask('shares', {
           status: 'error',
@@ -840,10 +931,10 @@ class MarketService {
   }
 
   async syncRecentOfficialShareGaps() {
-    const targetDate = this.latestQuoteTradeDate();
+    const targetDate = this.getOfficialShareTargetDate();
     if (!targetDate) return null;
     return this.syncOfficialShareHistory(targetDate, {
-      historyDays: OFFICIAL_RECOVERY_DAYS
+      maxFetchDates: OFFICIAL_RECOVERY_DAYS
     });
   }
 
@@ -860,8 +951,29 @@ class MarketService {
     return this.syncRecentOfficialShareGaps();
   }
 
+  getShareCoverage(exchange, etfs, dates) {
+    const starts = etfs.map((etf) => [etf.code, this.db.getFirstEtfDate(etf.code)]);
+    const expectedCodesByDate = new Map();
+    const groups = new Map();
+    for (const date of dates) {
+      const codes = starts.filter(([, firstDate]) => !firstDate || firstDate <= date).map(([code]) => code);
+      expectedCodesByDate.set(date, codes);
+      const key = codes.join(',');
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(date);
+    }
+    const completed = new Set();
+    for (const [key, groupDates] of groups) {
+      const groupCompleted = key
+        ? this.db.getCompletedOfficialShareSyncDates(exchange, groupDates, key.split(','))
+        : groupDates;
+      for (const date of groupCompleted) completed.add(date);
+    }
+    return { expectedCodesByDate, completed };
+  }
+
   getOfficialShareSyncStatus(now = this.now()) {
-    const targetDate = this.latestQuoteTradeDate();
+    const targetDate = this.getOfficialShareTargetDate(now);
     if (!targetDate) {
       return {
         state: 'unavailable',
@@ -884,18 +996,19 @@ class MarketService {
     const task = this.db.getSyncTask('shares');
     const enabledEtfs = this.getEnabledEtfs();
     const exchanges = {};
+    const historyDates = this.db.getRecentTradeDates(OFFICIAL_STATUS_HISTORY_DAYS, targetDate);
+    if (!historyDates.includes(targetDate)) historyDates.push(targetDate);
+    const missingHistoryDates = new Set();
     for (const [exchange, etfs] of [
       ['SSE', enabledEtfs.filter((etf) => getMarket(etf.code) === 1)],
       ['SZSE', enabledEtfs.filter((etf) => getMarket(etf.code) === 0)]
     ]) {
-      const expectedCodes = etfs.map((etf) => etf.code);
+      const { expectedCodesByDate, completed } = this.getShareCoverage(exchange, etfs, historyDates);
+      const expectedCodes = expectedCodesByDate.get(targetDate);
       const record = this.db.getOfficialShareSyncRecord(exchange, targetDate);
       const actualCodes = this.db.getActualOfficialShareCodes(targetDate, expectedCodes);
-      const complete = this.db.getCompletedOfficialShareSyncDates(
-        exchange,
-        [targetDate],
-        expectedCodes
-      ).has(targetDate);
+      const complete = completed.has(targetDate);
+      for (const date of historyDates) if (!completed.has(date)) missingHistoryDates.add(date);
       const status = complete
         ? 'ready'
         : record?.status === 'error'
@@ -908,7 +1021,7 @@ class MarketService {
         expectedCount: expectedCodes.length,
         actualCount: actualCodes.length,
         missingCodes: expectedCodes.filter((code) => !actualCodes.includes(code)),
-        message: record?.message || (
+        message: !expectedCodes.length ? '该市场无适用标的' : record?.message || (
           complete
             ? '官方份额完整'
             : status === 'waiting'
@@ -919,28 +1032,7 @@ class MarketService {
       };
     }
 
-    let historyComplete = null;
-    let historyDates = this.db.getRecentTradeDates(
-      OFFICIAL_STATUS_HISTORY_DAYS,
-      targetDate
-    );
-    if (!historyDates.includes(targetDate)) historyDates.push(targetDate);
-    historyDates = [...new Set(historyDates)].sort();
-    for (const [exchange, etfs] of [
-      ['SSE', enabledEtfs.filter((etf) => getMarket(etf.code) === 1)],
-      ['SZSE', enabledEtfs.filter((etf) => getMarket(etf.code) === 0)]
-    ]) {
-      const dates = this.db.getCompletedOfficialShareSyncDates(
-        exchange,
-        historyDates,
-        etfs.map((etf) => etf.code)
-      );
-      historyComplete = historyComplete === null
-        ? dates
-        : new Set([...historyComplete].filter((date) => dates.has(date)));
-    }
-    historyComplete ||= new Set();
-    const missingRecentDates = historyDates.filter((date) => !historyComplete.has(date));
+    const missingRecentDates = historyDates.filter((date) => missingHistoryDates.has(date));
     const exchangeList = Object.values(exchanges);
     const targetFailed = exchangeList.some((item) => item.status === 'failed');
     const targetWaiting = exchangeList.some((item) => item.status !== 'ready');
@@ -960,13 +1052,13 @@ class MarketService {
       .sort()
       .at(-1) || null;
     const calendar = this.getTradingCalendarStatus(now);
-    const needsRetry = state === 'waiting' || state === 'failed';
+    const needsRetry = state !== 'ready';
     const message = state === 'failed'
       ? `官方份额同步失败（${actualTotal}/${expectedTotal}），等待自动重试`
       : state === 'waiting'
         ? `交易所尚未返回完整份额（${actualTotal}/${expectedTotal}），等待自动重试`
         : state === 'incomplete'
-          ? `最近 ${OFFICIAL_STATUS_HISTORY_DAYS} 个交易日官方份额不完整`
+          ? `最近 ${historyDates.length} 个交易日有 ${missingRecentDates.length} 日份额不完整，等待分批重试`
           : `${targetDate} 官方份额已完整（${actualTotal}/${expectedTotal}）`;
     return {
       state,
@@ -997,9 +1089,14 @@ class MarketService {
     };
   }
 
-  async performOfficialShareSync(tradeDate, historyDays) {
-    const currentTradeDate = tradeDate ||
-      this.db.getLatestSnapshots().map((row) => row.trade_date).sort().at(-1);
+  getOfficialShareTargetDate(now = this.now()) {
+    const calendar = this.getTradingCalendarStatus(now);
+    const calendarDate = calendar.isTradingDay && shanghaiClock(now).minute >= '15:30' ? calendar.date : null;
+    return [this.latestQuoteTradeDate(), calendarDate].filter(Boolean).sort().at(-1) || null;
+  }
+
+  async performOfficialShareSync(tradeDate, historyDays, maxFetchDates) {
+    const currentTradeDate = tradeDate || this.getOfficialShareTargetDate();
     if (!currentTradeDate) return null;
     this.db.startSyncTask('shares', {
       targetDates: [currentTradeDate],
@@ -1014,8 +1111,8 @@ class MarketService {
     const sseEtfs = enabledEtfs.filter((etf) => getMarket(etf.code) === 1);
     const szseEtfs = enabledEtfs.filter((etf) => getMarket(etf.code) === 0);
     const [sseResult, szseResult] = await Promise.all([
-      this.syncSseShareDates(sseEtfs, requestedDates),
-      this.syncSzseShareDates(szseEtfs, requestedDates)
+      this.syncSseShareDates(sseEtfs, requestedDates, maxFetchDates),
+      this.syncSzseShareDates(szseEtfs, requestedDates, maxFetchDates)
     ]);
     const entries = [...sseResult.entries, ...szseResult.entries];
     const failures = [...sseResult.failures, ...szseResult.failures];
@@ -1026,7 +1123,7 @@ class MarketService {
     );
     const missingDates = requestedDates.filter((date) => !completedDates.includes(date));
     const syncStatus = this.getOfficialShareSyncStatus();
-    const status = syncStatus.state === 'ready'
+    const status = !missingDates.length
       ? 'success'
       : syncStatus.state === 'waiting'
         ? 'pending'
@@ -1043,7 +1140,7 @@ class MarketService {
     );
     this.db.finishSyncTask('shares', {
       status,
-      lastSuccessDate: this.getActiveDataDates().officialShareDate,
+      lastSuccessDate: completedDates.at(-1) || null,
       failedDates: [...new Set([
         ...missingDates,
         ...failures.map((failure) => failure.match(/\d{4}-\d{2}-\d{2}/)?.[0]).filter(Boolean)
@@ -1057,6 +1154,7 @@ class MarketService {
     this.persistSummaryMetrics(summary, this.now().toISOString());
     return {
       tradeDate: previousTradeDate,
+      targetDate: currentTradeDate,
       requestedDates,
       completedDates,
       entries,
@@ -1065,21 +1163,17 @@ class MarketService {
     };
   }
 
-  async syncSseShareDates(etfs, requestedDates) {
-    const expectedCodes = etfs.map((etf) => etf.code);
-    const completed = this.db.getCompletedOfficialShareSyncDates(
-      'SSE',
-      requestedDates,
-      expectedCodes
-    );
-    const datesToFetch = requestedDates.filter((date) => !completed.has(date));
+  async syncSseShareDates(etfs, requestedDates, maxFetchDates) {
+    const { expectedCodesByDate, completed } = this.getShareCoverage('SSE', etfs, requestedDates);
+    const datesToFetch = requestedDates.filter((date) => !completed.has(date)).slice(-maxFetchDates);
     const results = await mapLimit(datesToFetch, SSE_FETCH_CONCURRENCY, async (date) => {
+      const expectedCodes = expectedCodesByDate.get(date);
       try {
         const values = await this.sseShareProvider(date);
-        const entries = etfs.flatMap((etf) => {
-          const shares = values.get(etf.code);
+        const entries = expectedCodes.flatMap((code) => {
+          const shares = values.get(code);
           return Number.isFinite(shares) && shares > 0
-            ? [{ code: etf.code, tradeDate: date, shares, source: '上交所' }]
+            ? [{ code, tradeDate: date, shares, source: '上交所' }]
             : [];
         });
         const saved = this.db.saveOfficialShareDay({
@@ -1125,116 +1219,68 @@ class MarketService {
     };
   }
 
-  async syncSzseShareDates(etfs, requestedDates) {
-    const expectedCodes = etfs.map((etf) => etf.code);
-    const completed = this.db.getCompletedOfficialShareSyncDates(
-      'SZSE',
-      requestedDates,
-      expectedCodes
-    );
-    const datesToFetch = requestedDates.filter((date) => !completed.has(date));
+  async syncSzseShareDates(etfs, requestedDates, maxFetchDates) {
+    const { expectedCodesByDate, completed } = this.getShareCoverage('SZSE', etfs, requestedDates);
+    const datesToFetch = requestedDates.filter((date) => !completed.has(date)).slice(-maxFetchDates);
     if (!datesToFetch.length) {
       return { entries: [], failures: [], completedDates: [...completed] };
     }
-    const codes = etfs.map((etf) => etf.code);
-    if (datesToFetch.length >= 4) {
+    const useRanges = datesToFetch.length >= 4;
+    const groups = useRanges
+      ? splitDateRange(datesToFetch[0], datesToFetch.at(-1))
+        .map(({ startDate, endDate }) => datesToFetch.filter((date) => date >= startDate && date <= endDate))
+        .filter((dates) => dates.length)
+      : datesToFetch.map((date) => [date]);
+    const results = await mapLimit(groups, 2, async (dates) => {
       try {
-        const entries = await this.szseRangeProvider(
-          codes,
-          datesToFetch[0],
-          datesToFetch.at(-1)
-        );
-        const dateSet = new Set(datesToFetch);
-        const results = datesToFetch.map((date) => {
-          const dateEntries = entries.filter((entry) => entry.tradeDate === date);
-          const saved = this.db.saveOfficialShareDay({
-            exchange: 'SZSE',
-            tradeDate: date,
-            entries: dateEntries,
-            expectedCodes,
-            message: dateEntries.length === expectedCodes.length
-              ? null
-              : `深交所 ${date} 仅返回 ${dateEntries.length}/${expectedCodes.length} 只目标 ETF`,
-            fetchedAt: this.now().toISOString()
-          });
-          return { date, status: saved.status, entries: dateEntries };
-        });
+        if (useRanges) {
+          const codes = [...new Set(dates.flatMap((date) => expectedCodesByDate.get(date)))];
+          return { dates, entries: await this.szseRangeProvider(codes, dates[0], dates.at(-1)) };
+        }
+        const date = dates[0];
+        const values = await this.szseShareProvider(expectedCodesByDate.get(date), date);
         return {
-          entries: entries.filter((entry) => dateSet.has(entry.tradeDate)),
-          failures: results
-            .filter((result) => result.status !== 'success')
-            .map((result) => `深交所 ${result.date}：${result.status}`),
-          completedDates: [
-            ...completed,
-            ...results.filter((result) => result.status === 'success').map((result) => result.date)
-          ]
+          dates,
+          entries: [...values].map(([code, shares]) => ({ code, shares, tradeDate: date, source: '深交所' }))
         };
       } catch (error) {
-        for (const date of datesToFetch) {
-          try {
-            this.db.recordOfficialShareDayFailure({
-              exchange: 'SZSE',
-              tradeDate: date,
-              expectedCodes,
-              message: error.message,
-              fetchedAt: this.now().toISOString()
-            });
-          } catch {
-            // Preserve the provider failure as the primary retry reason.
-          }
-        }
-        return {
-          entries: [],
-          failures: [`深交所 ${datesToFetch[0]} 至 ${datesToFetch.at(-1)}：${error.message}`],
-          completedDates: [...completed]
-        };
+        return { dates, entries: [], error };
       }
-    }
-    const results = await Promise.allSettled(datesToFetch.map(async (date) => ({
-      date,
-      values: await this.szseShareProvider(codes, date)
-    })));
+    });
     const entries = [];
     const failures = [];
     const successfulDates = [];
-    results.forEach((result, index) => {
-      const date = datesToFetch[index];
-      if (result.status === 'rejected') {
-        try {
+    for (const result of results) {
+      for (const date of result.dates) {
+        const expectedCodes = expectedCodesByDate.get(date);
+        if (result.error) {
           this.db.recordOfficialShareDayFailure({
             exchange: 'SZSE',
             tradeDate: date,
             expectedCodes,
-            message: result.reason.message,
+            message: result.error.message,
             fetchedAt: this.now().toISOString()
           });
-        } catch {
-          // Preserve the provider failure as the primary retry reason.
+          failures.push(`深交所 ${date}：${result.error.message}`);
+          continue;
         }
-        failures.push(`深交所 ${date}：${result.reason.message}`);
-        return;
+        const dateEntries = result.entries.filter((entry) => entry.tradeDate === date &&
+          expectedCodes.includes(entry.code) && entry.shares > 0);
+        const saved = this.db.saveOfficialShareDay({
+          exchange: 'SZSE',
+          tradeDate: date,
+          entries: dateEntries,
+          expectedCodes,
+          message: dateEntries.length === expectedCodes.length
+            ? null
+            : `深交所 ${date} 仅返回 ${dateEntries.length}/${expectedCodes.length} 只目标 ETF`,
+          fetchedAt: this.now().toISOString()
+        });
+        entries.push(...dateEntries);
+        if (saved.status === 'success') successfulDates.push(date);
+        else failures.push(`深交所 ${date}：${saved.status}`);
       }
-      const dateEntries = [];
-      for (const etf of etfs) {
-        const shares = result.value.values.get(etf.code);
-        if (Number.isFinite(shares) && shares > 0) {
-          dateEntries.push({ code: etf.code, tradeDate: date, shares, source: '深交所' });
-        }
-      }
-      entries.push(...dateEntries);
-      const saved = this.db.saveOfficialShareDay({
-        exchange: 'SZSE',
-        tradeDate: date,
-        entries: dateEntries,
-        expectedCodes,
-        message: dateEntries.length === expectedCodes.length
-          ? null
-          : `深交所 ${date} 仅返回 ${dateEntries.length}/${expectedCodes.length} 只目标 ETF`,
-        fetchedAt: this.now().toISOString()
-      });
-      if (saved.status === 'success') successfulDates.push(date);
-      else failures.push(`深交所 ${date}：${saved.status}`);
-    });
+    }
     return {
       entries,
       failures,
@@ -1242,41 +1288,28 @@ class MarketService {
     };
   }
 
-  getShareWindowMetric({ history, bars, days, latestOfficial }) {
-    const endDate = latestOfficial?.tradeDate || null;
-    const expectedDates = endDate
-      ? this.db.getRecentTradeDates(days, endDate)
-      : [];
-    const availableDates = new Set(history.map((row) => row.tradeDate));
-    const completeDates = expectedDates.length === days &&
-      expectedDates.every((tradeDate) => availableDates.has(tradeDate));
-    const analysis = calculateShareWindow(history, bars, days);
-    const coverageDays = analysis.points
-      .filter((point) => Number.isFinite(point.estimatedSubscription))
-      .length;
-    const ready = completeDates && coverageDays === days;
+  getShareWindowMetric({ history, bars, days, tradeDates }) {
+    const analysis = calculateShareWindow(history, bars, days, tradeDates);
+    const ready = analysis.estimatedDays === days;
     return {
       status: ready ? 'ready' : 'accumulating',
-      estimatedSubscription: ready ? analysis.periodEstimatedSubscription : null,
-      shareDelta: ready ? analysis.periodShareDelta : null,
-      coverageDays,
+      estimatedSubscription: analysis.periodEstimatedSubscription,
+      shareDelta: analysis.periodShareDelta,
+      coverageDays: analysis.estimatedDays,
       expectedDays: days,
-      endDate
+      endDate: analysis.endDate
     };
   }
 
-  getSummary() {
+  getQuoteContext() {
+    const now = this.now();
+    const calendar = this.getTradingCalendarStatus(now);
+    const phase = marketPhase(now, calendar);
     const enabledEtfs = this.getEnabledEtfs();
     const snapshotByCode = new Map(
       this.db.getLatestSnapshots().map((row) => [row.code, snapshotToQuote(row)])
     );
-    const quoteRows = enabledEtfs.map((etf) => ({
-      name: etf.name,
-      category: etf.category,
-      tone: etf.tone,
-      isPinned: etf.isPinned,
-      isHighlighted: etf.isHighlighted,
-      sortOrder: etf.sortOrder,
+    const values = enabledEtfs.map((etf) => ({
       price: null,
       previousClose: null,
       change: null,
@@ -1301,7 +1334,48 @@ class MarketService {
       isHighlighted: etf.isHighlighted,
       sortOrder: etf.sortOrder
     }));
-    const marketData = quoteRows.map((quote) => {
+    const latestQuoteDate = values.map((row) => row.tradeDate).filter(Boolean).sort().at(-1) || null;
+    const calendarQuoteDate = calendar.isTradingDay && shanghaiClock(now).minute >= '09:30'
+      ? calendar.date
+      : calendar.known ? this.db.getPreviousTradingDate(calendar.date) : null;
+    const quoteAsOfDate = [calendarQuoteDate, latestQuoteDate].filter(Boolean).sort().at(-1) || null;
+    const fetchStatuses = this.db.getFetchStatuses('quote');
+    const quoteRows = values.map((quote) => ({
+      ...quote,
+      ...this.getQuoteFreshness(quote, { latestQuoteDate: quoteAsOfDate, fetchStatus: fetchStatuses[quote.code], now, calendar })
+    }));
+    const times = quoteRows.map((quote) => quote.dataTime).filter(Boolean).sort();
+    const freshCount = quoteRows.filter((quote) => !quote.isStale && quote.tradeDate === quoteAsOfDate).length;
+    const staleCount = quoteRows.filter((quote) => quote.isStale).length;
+    const quoteStats = {
+      dataTime: times.at(-1) || null,
+      oldestDataTime: times[0] || null,
+      latestDataTime: times.at(-1) || null,
+      quoteStatus: !freshCount ? 'error' : staleCount ? 'partial' : 'ok',
+      staleCount,
+      freshCount
+    };
+    return { now, calendar, phase, enabledEtfs, quoteAsOfDate, quoteRows, quoteStats };
+  }
+
+  getQuoteHealth() {
+    const { quoteRows, quoteStats } = this.getQuoteContext();
+    const status = !quoteRows.length && !this.initializedAt
+      ? 'starting'
+      : !quoteRows.length || quoteStats.quoteStatus === 'ok' ? 'ok' : 'degraded';
+    return {
+      ...quoteStats,
+      status,
+      initializedAt: this.initializedAt,
+      initializing: this.initializing,
+      etfs: quoteRows.length,
+      shareSyncStatus: this.getOfficialShareSyncStatus()
+    };
+  }
+
+  getSummary() {
+    const { now, calendar, phase, enabledEtfs, quoteAsOfDate, quoteRows, quoteStats } = this.getQuoteContext();
+    const marketData = quoteRows.map((quote, index) => {
       const bars = this.db.getBars(quote.code, 520);
       const officialHistory = this.db.getOfficialShareHistory(
         quote.code,
@@ -1309,78 +1383,84 @@ class MarketService {
       );
       return {
         quote,
-        etf: enabledEtfs.find((etf) => etf.code === quote.code),
+        etf: enabledEtfs[index],
         bars,
         shares: officialHistory,
         officialHistory
       };
     });
+    const latestBarDate = marketData.map(({ bars }) => bars.at(-1)?.date).filter(Boolean).sort().at(-1);
     const scoreObservations = buildSignalScores(
-      marketData.map(({ etf, bars, shares }) => ({ etf, bars, shares }))
+      marketData.map(({ etf, bars, shares }) => ({ etf, bars, shares })),
+      { tradingDates: latestBarDate ? this.db.getRecentTradeDates(520, latestBarDate) : [] }
     );
     const latestScoreByCode = new Map();
     for (const observation of scoreObservations) {
       latestScoreByCode.set(observation.code, observation);
     }
+    const tradeDatesByEnd = new Map();
+    const recentTradeDates = (date) => {
+      if (!date) return [];
+      if (!tradeDatesByEnd.has(date)) {
+        tradeDatesByEnd.set(date, this.db.getRecentTradeDates(OFFICIAL_FETCH_DAYS, date));
+      }
+      return tradeDatesByEnd.get(date);
+    };
     const baseRows = marketData.map(({ quote, bars, officialHistory }) => {
       const priorBars = bars.filter((bar) => bar.date < quote.tradeDate);
+      const quoteTradeDates = recentTradeDates(quote.tradeDate).filter((date) => date < quote.tradeDate);
+      const amountByDate = new Map(priorBars.map((bar) => [bar.date, bar.amount]));
       const ratio = volumeRatio(
         quote.amount,
-        priorBars.slice(-20).map((bar) => bar.amount)
+        quoteTradeDates.slice(-20).map((date) => amountByDate.get(date))
       );
-      const priorDayBar = priorBars.at(-1);
-      const previousRatio = priorDayBar
-        ? volumeRatio(priorDayBar.amount, priorBars.slice(-21, -1).map((bar) => bar.amount))
-        : null;
+      const previousRatio = volumeRatio(
+        amountByDate.get(quoteTradeDates.at(-1)),
+        quoteTradeDates.slice(-21, -1).map((date) => amountByDate.get(date))
+      );
       const currentOfficialShare = this.db.getOfficialShareRecord(quote.code, quote.tradeDate);
       const previousOfficialShare = this.db.getPreviousOfficialShareRecord(
         quote.code,
         quote.tradeDate
       );
-      const closeByDate = new Map(bars.map((bar) => [bar.date, bar.close]));
+      const closeByDate = new Map(bars.filter((bar) => bar.rawClose > 0).map((bar) => [bar.date, bar.rawClose]));
       const currentClose = closeByDate.get(quote.tradeDate);
       const currentMetric = calculateOfficialShareMetric({
         current: currentOfficialShare,
         previous: previousOfficialShare,
-        expectedPreviousDate: this.db.getPreviousTradingDate(quote.tradeDate),
-        price: Number.isFinite(currentClose) ? currentClose : quote.price,
-        priceSource: Number.isFinite(currentClose) ? '官方日收盘价' : '行情快照'
+        expectedPreviousDate: recentTradeDates(quote.tradeDate).findLast((date) => date < quote.tradeDate),
+        price: currentClose,
+        priceSource: '东方财富不复权日线'
       });
       const latestOfficial = officialHistory.at(-1) || null;
       const latestPreviousOfficial = latestOfficial
         ? this.db.getPreviousOfficialShareRecord(quote.code, latestOfficial.tradeDate)
         : null;
       const latestClose = latestOfficial ? closeByDate.get(latestOfficial.tradeDate) : null;
-      const latestMetricPrice = Number.isFinite(latestClose)
-        ? latestClose
-        : latestOfficial?.tradeDate === quote.tradeDate
-          ? quote.price
-          : null;
+      const officialTradeDates = recentTradeDates(latestOfficial?.tradeDate);
       const latestMetric = calculateOfficialShareMetric({
         current: latestOfficial,
         previous: latestPreviousOfficial,
         expectedPreviousDate: latestOfficial
-          ? this.db.getPreviousTradingDate(latestOfficial.tradeDate)
+          ? officialTradeDates.findLast((date) => date < latestOfficial.tradeDate)
           : null,
-        price: latestMetricPrice,
-        priceSource: Number.isFinite(latestClose) ? '官方日收盘价' : '行情快照'
+        price: latestClose,
+        priceSource: '东方财富不复权日线'
       });
-      const officialTradeDates = latestOfficial
-        ? this.db.getRecentTradeDates(officialHistory.length, latestOfficial.tradeDate)
-        : [];
       const shareStreak = calculateShareStreak(officialHistory, officialTradeDates);
-      const iopv = this.getCurrentIopv(quote.code, bars.at(-1)?.date || null);
+      const expectedIopvDate = [quoteAsOfDate, bars.at(-1)?.date].filter(Boolean).sort().at(-1) || null;
+      const iopv = this.getCurrentIopv(quote.code, expectedIopvDate);
       const shareWindow5d = this.getShareWindowMetric({
         history: officialHistory,
         bars,
         days: 5,
-        latestOfficial
+        tradeDates: officialTradeDates
       });
       const shareWindow20d = this.getShareWindowMetric({
         history: officialHistory,
         bars,
         days: 20,
-        latestOfficial
+        tradeDates: officialTradeDates
       });
       const historyStatus = bars.length >= 20 && officialHistory.length >= 2
         ? 'ready'
@@ -1488,15 +1568,16 @@ class MarketService {
         sourceUrl: `https://quote.eastmoney.com/${quote.code}.html`
       };
     });
+    const isCurrentQuote = (row) => row.tradeDate === quoteAsOfDate && !row.isStale;
     const broadResonance = baseRows.filter(
-      (row) => row.category === '宽基核心' && row.volumeRatio !== null && row.volumeRatio >= 2
+      (row) => isCurrentQuote(row) && row.category === '宽基核心' && row.volumeRatio >= 2
     ).length >= 2;
     const rows = baseRows.map((row) => {
       const result = calculateSignals({
         isBroad: row.category === '宽基核心',
-        volumeRatio: row.volumeRatio,
-        previousVolumeRatio: row.previousVolumeRatio,
-        shareDelta: row.shareDelta,
+        volumeRatio: isCurrentQuote(row) ? row.volumeRatio : null,
+        previousVolumeRatio: isCurrentQuote(row) ? row.previousVolumeRatio : null,
+        shareDelta: row.tradeDate === quoteAsOfDate ? row.shareDelta : null,
         broadResonance,
         tailVolumeShare: null
       });
@@ -1508,6 +1589,8 @@ class MarketService {
         composite: result.composite,
         score: latestScore?.score ?? null,
         scoreDate: latestScore?.date ?? null,
+        scoreVolumeRatio: latestScore?.volumeRatio ?? null,
+        scoreChangePercent: latestScore?.changePercent ?? null,
         scoreLevel: latestScore?.level ?? null,
         scoreComponents: latestScore?.components ?? null,
         scoreReasons: latestScore?.reasons ?? [],
@@ -1519,60 +1602,35 @@ class MarketService {
       left.sortOrder - right.sortOrder ||
       left.code.localeCompare(right.code)
     ));
-    const dataTime = quoteRows
-      .map((row) => row.dataTime)
-      .filter(Boolean)
-      .sort()
-      .at(-1) || null;
-    const amountRows = rows.filter((row) => Number.isFinite(row.amount));
-    const latestQuoteDate = quoteRows.map((row) => row.tradeDate).filter(Boolean).sort().at(-1) || null;
-    const fetchStatuses = this.db.getFetchStatuses('quote');
-    const freshnessRows = rows.map((row) => {
-      const freshness = this.getQuoteFreshness(row, {
-        latestQuoteDate,
-        fetchStatus: fetchStatuses[row.code] || null
-      });
-      return { ...row, ...freshness };
-    });
+    const currentQuotes = rows.filter(isCurrentQuote);
+    const amountRows = currentQuotes.filter((row) => Number.isFinite(row.amount));
+    const currentShareRows = rows.filter((row) => quoteAsOfDate && row.tradeDate === quoteAsOfDate);
     const shareMetricStatusCounts = {
-      ready: freshnessRows.filter((row) => row.shareMetricStatus === 'ready').length,
-      pending: freshnessRows.filter((row) => row.shareMetricStatus === 'pending').length,
-      insufficient: freshnessRows.filter((row) => row.shareMetricStatus === 'insufficient').length
+      ready: currentShareRows.filter((row) => row.shareMetricStatus === 'ready').length,
+      pending: currentShareRows.filter((row) => row.shareMetricStatus === 'pending').length,
+      insufficient: currentShareRows.filter((row) => row.shareMetricStatus === 'insufficient').length
     };
-    const readyShareRows = freshnessRows.filter((row) => row.shareMetricStatus === 'ready');
-    const latestOfficialReadyRows = freshnessRows.filter(
-      (row) => row.latestOfficialMetricStatus === 'ready'
-    );
-    const staleRows = freshnessRows.filter((row) => row.isStale);
-    const freshRows = freshnessRows.filter((row) => !row.isStale);
-    const oldestDataTime = freshnessRows
-      .map((row) => row.dataTime)
-      .filter(Boolean)
-      .sort()
-      .at(0) || null;
-    const latestDataTime = freshnessRows
-      .map((row) => row.dataTime)
-      .filter(Boolean)
-      .sort()
-      .at(-1) || null;
-    const quoteStatus = !freshRows.length
-      ? 'error'
-      : staleRows.length ? 'partial' : 'ok';
+    const readyShareRows = currentShareRows.filter((row) => row.shareMetricStatus === 'ready');
+    const officialReadyRows = rows.filter((row) => row.latestOfficialMetricStatus === 'ready');
+    const latestOfficialAsOfDate = officialReadyRows.map((row) => row.latestOfficialShareDeltaDate).sort().at(-1) || null;
+    const scoreAsOfDate = scoreObservations.at(-1)?.date ?? null;
+    const scoreRows = rows.filter((row) => scoreAsOfDate && row.scoreDate === scoreAsOfDate);
+    const { quoteStatus } = quoteStats;
     return {
-      generatedAt: this.now().toISOString(),
+      generatedAt: now.toISOString(),
       monitorCount: rows.length,
       capacity: ETF_CAPACITY,
-      dataTime: latestDataTime,
-      oldestDataTime,
-      latestDataTime,
-      quoteStatus,
+      ...quoteStats,
+      capturedAt: rows.filter((row) => row.tradeDate === quoteAsOfDate && row.dataTime)
+        .map((row) => row.capturedAt).filter(Boolean).sort().at(-1) || null,
+      quoteAsOfDate,
+      scoreAsOfDate,
+      marketPhase: phase,
       quoteStatusLabel: quoteStatus === 'ok'
         ? '行情已连接'
         : quoteStatus === 'partial'
           ? '部分数据异常'
           : '行情数据异常',
-      staleCount: staleRows.length,
-      freshCount: freshRows.length,
       totalAmount: amountRows.length
         ? amountRows.reduce((sum, row) => sum + row.amount, 0)
         : null,
@@ -1580,34 +1638,29 @@ class MarketService {
         available: amountRows.length,
         total: rows.length
       },
-      volumeUpCount: rows.filter((row) => row.volumeRatio !== null && row.volumeRatio >= 2).length,
+      volumeUpCount: currentQuotes.filter((row) => row.volumeRatio >= 2).length,
       shareUpCount: readyShareRows.filter((row) => row.shareDelta > 0).length,
       shareUpAsOfDate: readyShareRows.map((row) => row.quoteShareDate).filter(Boolean).sort().at(-1) ||
         null,
       shareMetricStatusCounts,
       shareSyncStatus: this.getOfficialShareSyncStatus(),
-      latestOfficialShareUpCount: latestOfficialReadyRows.filter(
-        (row) => row.latestOfficialShareDelta > 0
+      latestOfficialShareUpCount: officialReadyRows.filter(
+        (row) => row.latestOfficialShareDeltaDate === latestOfficialAsOfDate && row.latestOfficialShareDelta > 0
       ).length,
-      latestOfficialShareUpAsOfDate: latestOfficialReadyRows
-        .map((row) => row.latestOfficialShareDeltaDate)
-        .filter(Boolean)
-        .sort()
-        .at(-1) || null,
+      latestOfficialShareUpAsOfDate: latestOfficialAsOfDate,
       compositeCount: rows.filter((row) => row.composite).length,
-      scoreSignalCount: rows.filter((row) => row.scoreSignal).length,
-      highScoreCount: rows.filter((row) => row.score >= SIGNAL_PARAMETERS.levels.high).length,
+      scoreSignalCount: scoreRows.filter((row) => row.scoreSignal).length,
+      highScoreCount: scoreRows.filter((row) => row.score >= SIGNAL_PARAMETERS.levels.high).length,
       iopvAvailableCount: rows.filter((row) => row.premiumStatus === 'valid').length,
       iopvAbnormalCount: rows.filter((row) => row.premiumAbnormal).length,
       broadResonance,
       dataStatus: this.getDataStatus(),
-      etfs: freshnessRows,
+      etfs: rows,
       logs: this.db.recentLogs()
     };
   }
 
-  getQuoteFreshness(row, { latestQuoteDate, fetchStatus }) {
-    const now = this.now();
+  getQuoteFreshness(row, { latestQuoteDate, fetchStatus, now, calendar }) {
     const dataTime = row.dataTime || row.capturedAt || null;
     const observedMs = dataTime ? new Date(dataTime).getTime() : NaN;
     const ageSeconds = Number.isFinite(observedMs)
@@ -1619,10 +1672,10 @@ class MarketService {
       latestQuoteDate &&
       row.tradeDate < latestQuoteDate
     );
-    const intradayStale = this.isTradingSession(now) &&
+    const intradayStale = isTradingSession(now, calendar) &&
       Number.isFinite(ageSeconds) &&
       ageSeconds > 3 * 60;
-    const generalStale = Number.isFinite(ageSeconds) &&
+    const generalStale = !calendar.known && Number.isFinite(ageSeconds) &&
       ageSeconds > 72 * 60 * 60;
     const isStale = !row.dataTime || failedAttempt || behindLatest ||
       intradayStale || generalStale;
@@ -1652,7 +1705,7 @@ class MarketService {
   getDataStatus() {
     const dates = this.getActiveDataDates();
     const tasks = Object.fromEntries(
-      this.db.getSyncTasks().map((task) => [task.key, task])
+      this.db.getSyncTasks().filter((task) => task.key !== 'backtest').map((task) => [task.key, task])
     );
     const calendar = this.getTradingCalendarStatus();
     const etfs = this.getEnabledEtfs().map((etf) => {
@@ -1687,22 +1740,28 @@ class MarketService {
   }
 
   getCurrentIopv(code, latestTradeDate) {
+    const now = this.now();
+    const calendar = this.getTradingCalendarStatus(now);
     const record = this.db.getIopvLatest(code);
     return resolveIopvState(record, {
-      now: this.now(),
-      latestTradeDate
+      now,
+      latestTradeDate,
+      tradingSession: isTradingSession(now, calendar),
+      checkAgeOutsideSession: !calendar.known
     });
   }
 
-  getDetail(code) {
+  getDetail(code, { compact = false } = {}) {
     const summary = this.getSummary();
     const quote = summary.etfs.find((row) => row.code === code);
     if (!quote) return null;
+    const shareHistory = this.getShareHistory(code, OFFICIAL_HISTORY_DAYS);
+    if (compact) delete shareHistory.range;
     return {
       quote,
       bars: this.db.getBars(code, 520),
-      shareHistory: this.getShareHistory(code, OFFICIAL_HISTORY_DAYS),
-      iopvHistory: this.getIopvHistory(code, OFFICIAL_HISTORY_DAYS),
+      shareHistory,
+      iopvHistory: this.getIopvHistory(code, OFFICIAL_HISTORY_DAYS, { includeCloseHistory: !compact }),
       updatedAt: summary.generatedAt
     };
   }
@@ -1717,28 +1776,25 @@ class MarketService {
     const bars = this.db.getBars(code, 520);
     const latestOfficial = history.at(-1) || null;
     const officialTradeDates = latestOfficial
-      ? this.db.getRecentTradeDates(history.length, latestOfficial.tradeDate)
+      ? this.db.getRecentTradeDates(OFFICIAL_FETCH_DAYS, latestOfficial.tradeDate)
       : [];
     const ranges = Object.fromEntries(OFFICIAL_RANGES.map((days) => {
-      const analysis = calculateShareWindow(history, bars, days);
-      const targetDates = latestOfficial
-        ? this.db.getRecentTradeDates(days, latestOfficial.tradeDate)
-        : [];
-      const availableDates = new Set(history.map((row) => row.tradeDate));
-      const missingDates = targetDates.filter((tradeDate) => !availableDates.has(tradeDate));
-      const unavailableBeforeWindow = Math.max(0, days - targetDates.length);
-      const availableDays = targetDates.length - missingDates.length;
-      const missingDays = unavailableBeforeWindow + missingDates.length;
+      const analysis = calculateShareWindow(history, bars, days, officialTradeDates);
+      const missingDates = analysis.points.filter((point) => point.shares === null).map((point) => point.tradeDate);
+      const availableDays = analysis.points.length - missingDates.length;
+      const missingDays = days - availableDays;
       return [days, {
         ...analysis,
         coverage: {
           requestedDays: days,
           availableDays,
+          shareDeltaDays: analysis.shareDeltaDays,
+          estimatedDays: analysis.estimatedDays,
           missingDays,
-          targetStartDate: targetDates[0] || null,
-          targetEndDate: targetDates.at(-1) || null,
+          targetStartDate: analysis.startDate,
+          targetEndDate: analysis.endDate,
           missingRecentDates: missingDates.slice(-5),
-          status: !targetDates.length
+          status: !analysis.points.length
             ? 'unavailable'
             : missingDays ? 'partial' : 'complete'
         }
@@ -1766,7 +1822,7 @@ class MarketService {
     };
   }
 
-  getIopvHistory(code, selectedDays = OFFICIAL_HISTORY_DAYS) {
+  getIopvHistory(code, selectedDays = OFFICIAL_HISTORY_DAYS, { includeCloseHistory = true } = {}) {
     const etf = this.getEtfConfig(code);
     if (!etf) return null;
     const days = Number.isInteger(selectedDays) && selectedDays > 0
@@ -1774,8 +1830,11 @@ class MarketService {
       : OFFICIAL_HISTORY_DAYS;
     const bars = this.db.getBars(code, 2);
     const latestTradeDate = bars.at(-1)?.date || null;
-    const current = this.getCurrentIopv(code, latestTradeDate);
     const quote = this.db.getLatestSnapshots().find((row) => row.code === code);
+    const calendar = this.getTradingCalendarStatus();
+    const expectedIopvDate = [latestTradeDate, quote?.trade_date, this.isTradingSession() && calendar.date]
+      .filter(Boolean).sort().at(-1) || null;
+    const current = this.getCurrentIopv(code, expectedIopvDate);
     const tradeDate = current.tradeDate || quote?.trade_date || latestTradeDate;
     const rawIntraday = tradeDate
       ? this.db.getIopvSamplesForDate(code, tradeDate)
@@ -1809,6 +1868,26 @@ class MarketService {
         lastTime: null,
         firstRecordLabel: '首个记录时点'
       };
+    const intradayResult = {
+      code,
+      selectedDays: days,
+      generatedAt: this.now().toISOString(),
+      tradeDate,
+      current,
+      source: current.source || null,
+      sourceKind: current.sourceKind || null,
+      sourceUrl: current.sourceUrl || null,
+      sourceName: current.source || (tradeDate ? null : '暂无'),
+      formula: '市场价 ÷ IOPV − 1',
+      alertThreshold: IOPV_ALERT_THRESHOLD,
+      updateFrequency: '交易所实时行情；本地交易时段每 30 秒刷新',
+      intraday,
+      stats,
+      note: intraday.length <= 1
+        ? '当日 IOPV 历史样本尚不足；统计仅基于已实际记录的交易所时点，不推算或补零。'
+        : '当日统计仅使用同一交易日已记录的市场价与 IOPV 配对样本。'
+    };
+    if (!includeCloseHistory) return intradayResult;
     const targetDates = latestTradeDate
       ? this.db.getRecentTradeDates(days, latestTradeDate)
       : [];
@@ -1832,20 +1911,7 @@ class MarketService {
       ? Math.sign(recent.at(-1).premiumRate - recent[0].premiumRate)
       : 0;
     return {
-      code,
-      selectedDays: days,
-      generatedAt: this.now().toISOString(),
-      tradeDate,
-      current,
-      source: current.source || null,
-      sourceKind: current.sourceKind || null,
-      sourceUrl: current.sourceUrl || null,
-      sourceName: current.source || (tradeDate ? null : '暂无'),
-      formula: '市场价 ÷ IOPV − 1',
-      alertThreshold: IOPV_ALERT_THRESHOLD,
-      updateFrequency: '交易所实时行情；本地交易时段每 30 秒刷新',
-      intraday,
-      stats,
+      ...intradayResult,
       closeHistory,
       closePercentile,
       closeSampleCount: closeRates.length,
@@ -1863,9 +1929,6 @@ class MarketService {
           ? 'unavailable'
           : missingDates.length ? 'partial' : 'complete'
       },
-      note: intraday.length <= 1
-        ? '当日 IOPV 历史样本尚不足；统计仅基于已实际记录的交易所时点，不推算或补零。'
-        : '当日统计仅使用同一交易日已记录的市场价与 IOPV 配对样本。',
       historyNote: closeRates.length < 5
         ? `收盘折溢价历史仅积累 ${closeRates.length} 个交易日，暂不计算分位。`
         : '收盘折溢价按每个交易日最后一个有效 IOPV 样本计算。'

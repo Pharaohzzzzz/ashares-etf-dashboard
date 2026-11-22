@@ -82,6 +82,20 @@ test('signal score returns data missing instead of fabricating a score', () => {
   }), null);
 });
 
+test('share ties and a single ETF do not inflate the anomaly score', () => {
+  const [item] = createDataset({ count: 56 });
+  item.bars.at(-1).amount = 150;
+  const last = () => buildSignalScores([item]).at(-1);
+  const tied = last();
+  assert.equal(tied.components.find((component) => component.key === 'shareChange').percentile, 0.5);
+  assert.equal(tied.components.find((component) => component.key === 'resonance').contribution, 0);
+  for (const row of item.shares) row.shares = 100000;
+  assert.equal(last().components.find((component) => component.key === 'shareChange').contribution, 0);
+  assert.equal(last().isSignal, false);
+  item.bars.at(-2).amount = null;
+  assert.notEqual(last().date, item.bars.at(-1).date);
+});
+
 test('future bars and future shares cannot alter an earlier day score', () => {
   const original = createDataset();
   const withChangedFuture = createDataset({ futureMultiplier: 1.8 });

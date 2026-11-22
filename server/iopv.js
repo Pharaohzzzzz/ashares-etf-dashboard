@@ -276,7 +276,8 @@ function resolveIopvState(record, {
   now = new Date(),
   latestTradeDate = null,
   refreshFailed = false,
-  tradingSession = false
+  tradingSession = false,
+  checkAgeOutsideSession = true
 } = {}) {
   if (!record) {
     return { status: 'missing', label: '暂无', message: '尚无有效 IOPV 记录', premiumRate: null };
@@ -349,7 +350,7 @@ function resolveIopvState(record, {
         premiumRate: null
       };
     }
-    if (age > GENERAL_STALE_MS) {
+    if (checkAgeOutsideSession && age > GENERAL_STALE_MS) {
       return {
         ...record,
         status: 'stale',

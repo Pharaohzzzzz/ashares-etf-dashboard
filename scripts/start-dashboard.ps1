@@ -9,11 +9,16 @@ $dashboardUrl = 'http://127.0.0.1:37821'
 New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
 
 $nodePath = (Get-Command node -ErrorAction Stop).Source
-$currentBuildId = (& $nodePath 'server/runtime-version.js' 2>$null).Trim()
-if (-not $currentBuildId) {
+$serverEntry = Join-Path $projectRoot 'server\index.js'
+$versionPath = Join-Path $projectRoot 'server\runtime-version.js'
+$currentBuildId = ([string](& $nodePath $versionPath)).Trim()
+if ($LASTEXITCODE -ne 0 -or -not $currentBuildId) {
   throw 'Unable to calculate the dashboard build fingerprint.'
 }
-$expectedApiVersion = [int](& $nodePath -e "process.stdout.write(String(require('./server/runtime-version').API_VERSION))").Trim()
+$expectedApiVersion = [int](& $nodePath -p 'require(process.argv[1]).API_VERSION' $versionPath)
+if ($LASTEXITCODE -ne 0 -or -not $expectedApiVersion) {
+  throw 'Unable to read the dashboard API version.'
+}
 
 $needsRestart = $false
 try {
@@ -54,7 +59,7 @@ if ($needsRestart) {
 
 Start-Process `
   -FilePath $nodePath `
-  -ArgumentList 'server/index.js' `
+  -ArgumentList ('"' + $serverEntry + '"') `
   -WorkingDirectory $projectRoot `
   -WindowStyle Hidden `
   -RedirectStandardOutput $stdoutLog `

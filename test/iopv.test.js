@@ -167,6 +167,20 @@ test('IOPV sample and latest persistence are idempotent and keep gaps empty', ()
   assert.equal(db.getIopvLatest('510300').premiumRate, 0.03);
   assert.equal(db.getIopvCloseHistory('510300', 250).length, 1);
   assert.equal(db.getIopvCloseHistory('510300', 250)[0].tradeDate, '2026-11-19');
+  const now = new Date('2026-11-19T06:05:00.000Z');
+  db.saveTradingCalendar([{ date: '2026-11-19', isTrading: true }], {
+    source: '深交所', sourceUrl: null, fetchedAt: now.toISOString()
+  });
+  db.saveIopvLatest({
+    ...point,
+    dataTime: '2026-11-19 14:00:00',
+    observedAt: '2026-11-19T06:00:00.000Z',
+    fetchedAt: '2026-11-19T06:00:00.000Z',
+    attemptedAt: '2026-11-19T06:00:00.000Z'
+  });
+  const current = new MarketService({ db, now: () => now }).getCurrentIopv('510300', '2026-11-19');
+  assert.equal(current.status, 'stale');
+  assert.equal(current.premiumRate, null);
   db.close();
 });
 

@@ -14,6 +14,7 @@ function average(values) {
 }
 
 function volumeRatio(currentAmount, priorAmounts) {
+  if (priorAmounts.length !== 20 || !priorAmounts.every(Number.isFinite)) return null;
   const baseline = average(priorAmounts);
   if (!Number.isFinite(currentAmount) || !baseline || baseline <= 0) return null;
   return currentAmount / baseline;
@@ -78,70 +79,56 @@ function calculateShareStreak(history, tradeDates) {
   };
 }
 
-function calculateShareWindow(history, bars, days) {
-  if (!history.length || !Number.isInteger(days) || days < 1) {
-    return {
-      days,
-      points: [],
-      periodShareDelta: null,
-      periodEstimatedSubscription: null,
-      sharePercentile: null,
-      startDate: null,
-      endDate: null
-    };
-  }
-  const closeByDate = new Map(bars.map((bar) => [bar.date, bar.close]));
-  const baseHistory = history.slice(-(days + 1));
-  const points = [];
+function calculateShareWindow(history, bars, days, tradeDates = bars.map((bar) => bar.date)) {
+  const closeByDate = new Map(bars.map((bar) => [bar.date, bar.rawClose]));
+  const sharesByDate = new Map(history.map((row) => [row.tradeDate, row]));
+  const latestDate = history.at(-1)?.tradeDate;
+  const baseDates = Number.isInteger(days) && days > 0
+    ? tradeDates.filter((date) => date <= latestDate).slice(-(days + 1))
+    : [];
+  const firstPoint = Math.max(0, baseDates.length - days);
   let runningEstimatedSubscription = 0;
   let runningShareDelta = 0;
-  for (let index = 1; index < baseHistory.length; index += 1) {
-    const current = baseHistory[index];
-    const previous = baseHistory[index - 1];
-    const shareDelta = current.shares - previous.shares;
-    const close = closeByDate.get(current.tradeDate) ?? null;
-    const estimatedSubscription = Number.isFinite(close)
-      ? shareDelta * close
-      : null;
-    runningShareDelta += shareDelta;
-    if (Number.isFinite(estimatedSubscription)) {
+  let shareDeltaDays = 0;
+  let estimatedDays = 0;
+  const points = baseDates.slice(firstPoint).map((date, index) => {
+    const current = sharesByDate.get(date);
+    const previous = sharesByDate.get(baseDates[firstPoint + index - 1]);
+    const shareDelta = current && previous ? current.shares - previous.shares : null;
+    const rawClose = closeByDate.get(date);
+    const close = Number.isFinite(rawClose) && rawClose > 0 ? rawClose : null;
+    const estimatedSubscription = shareDelta !== null && close !== null ? shareDelta * close : null;
+    if (shareDelta !== null) {
+      shareDeltaDays += 1;
+      runningShareDelta += shareDelta;
+    }
+    if (estimatedSubscription !== null) {
+      estimatedDays += 1;
       runningEstimatedSubscription += estimatedSubscription;
     }
-    points.push({
-      tradeDate: current.tradeDate,
-      shares: current.shares,
-      source: current.source,
-      fetchedAt: current.fetchedAt || null,
-      officialFetchedAt: current.officialFetchedAt || null,
+    return {
+      tradeDate: date,
+      shares: current?.shares ?? null,
+      source: current?.source ?? null,
+      fetchedAt: current?.fetchedAt ?? null,
+      officialFetchedAt: current?.officialFetchedAt ?? null,
       shareDelta,
       close,
       estimatedSubscription,
-      cumulativeShareDelta: runningShareDelta,
-      cumulativeEstimatedSubscription: Number.isFinite(estimatedSubscription)
-        ? runningEstimatedSubscription
-        : null
-    });
-  }
-  const windowPoints = points.slice(-days);
-  const finiteEstimates = windowPoints
-    .map((point) => point.estimatedSubscription)
-    .filter((value) => Number.isFinite(value));
-  const currentShares = baseHistory.at(-1).shares;
+      cumulativeShareDelta: shareDeltaDays === index + 1 ? runningShareDelta : null,
+      cumulativeEstimatedSubscription: estimatedDays === index + 1 ? runningEstimatedSubscription : null
+    };
+  });
   return {
     days,
-    points: windowPoints,
-    periodShareDelta: windowPoints.length
-      ? windowPoints.reduce((sum, point) => sum + point.shareDelta, 0)
-      : null,
-    periodEstimatedSubscription: finiteEstimates.length
-      ? finiteEstimates.reduce((sum, value) => sum + value, 0)
-      : null,
-    sharePercentile: percentile(
-      currentShares,
-      baseHistory.slice(-days).map((row) => row.shares)
-    ),
-    startDate: windowPoints[0]?.tradeDate || null,
-    endDate: windowPoints.at(-1)?.tradeDate || null
+    points,
+    periodShareDelta: days > 0 && shareDeltaDays === days ? runningShareDelta : null,
+    periodEstimatedSubscription: days > 0 && estimatedDays === days ? runningEstimatedSubscription : null,
+    shareDeltaDays,
+    estimatedDays,
+    sharePercentile: percentile(history.at(-1)?.shares, points.map((point) => point.shares)),
+    startDate: points[0]?.tradeDate || null,
+    endDate: points.at(-1)?.tradeDate || null
   };
 }
 

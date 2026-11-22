@@ -31,6 +31,7 @@ function createConsecutiveBars(count) {
     date: new Date(start + index * 86400000).toISOString().slice(0, 10),
     open: 4,
     close: 4 + index * 0.001,
+    rawClose: 5 + index * 0.001,
     high: 4.1,
     low: 3.9,
     volume: 100,
@@ -52,6 +53,7 @@ function createBarsEnding(endDate, count) {
       date,
       open: 4,
       close: 4 + index * 0.001,
+      rawClose: 5 + index * 0.001,
       high: 4.1,
       low: 3.9,
       volume: 100,
@@ -292,6 +294,14 @@ test('a few rows older than the latest quote are marked stale individually', () 
   assert.equal(summary.quoteStatus, 'partial');
   assert.equal(summary.oldestDataTime, '2026-11-18T07:00:00.000Z');
   assert.equal(summary.latestDataTime, '2026-11-19T07:00:00.000Z');
+  assert.equal(summary.totalAmount, 100);
+  assert.equal(summary.quoteAsOfDate, '2026-11-19');
+  assert.equal(db.saveSnapshot({
+    ...quote,
+    code: '510300',
+    timestamp: Date.parse('2026-11-19T06:00:00.000Z') / 1000
+  }, '2026-11-19', '2026-11-20T01:00:00.000Z'), false);
+  assert.equal(service.getSummary().etfs.find((row) => row.code === '510300').dataTime, current.dataTime);
   db.close();
 });
 
@@ -419,8 +429,8 @@ test('startup reconciles a new quote date over 520 bars and an official share ga
 
   await service.initialize();
   assert.equal(historyCalls.length, ETFS.length);
-  assert.deepEqual(sseCalls, [missingShareDate]);
-  assert.deepEqual(szseCalls, [missingShareDate]);
+  assert.deepEqual(sseCalls, [missingShareDate, '2026-11-20']);
+  assert.deepEqual(szseCalls, [missingShareDate, '2026-11-20']);
   assert.ok(db.getOfficialShareHistory('510300', 251)
     .some((row) => row.tradeDate === missingShareDate));
 
@@ -431,7 +441,7 @@ test('startup reconciles a new quote date over 520 bars and an official share ga
   const status = service.getDataStatus();
   assert.equal(status.dates.quoteDate, '2026-11-19');
   assert.equal(status.dates.barDate, '2026-11-19');
-  assert.equal(status.dates.officialShareDate, '2026-11-19');
+  assert.equal(status.dates.officialShareDate, '2026-11-20');
   assert.ok(status.tasks.shares.lastSuccessDate);
   db.close();
 });
@@ -470,7 +480,8 @@ test('official previous-day shares populate ETF share delta immediately', async 
   assert.equal(row.previousShares, 1000);
   assert.equal(row.previousShareSource, '上交所');
   assert.equal(row.shareDelta, 200);
-  assert.equal(row.estimatedSubscription, 840);
+  assert.equal(row.estimatedSubscription, null);
+  assert.equal(row.shareMetricPriceSource, null);
   db.close();
 });
 
@@ -495,7 +506,7 @@ test('pending current official shares never mix quote snapshot with prior offici
 
   const summary = service.getSummary();
   const row = summary.etfs.find((etf) => etf.code === '510300');
-  const previousClose = bars.find((bar) => bar.date === '2026-11-19').close;
+  const previousClose = bars.find((bar) => bar.date === '2026-11-19').rawClose;
 
   assert.equal(row.tradeDate, '2026-11-20');
   assert.equal(row.quoteShares, 1000001);
@@ -542,7 +553,7 @@ test('current official shares become ready only from two continuous official rec
 
   const summary = service.getSummary();
   const row = summary.etfs.find((etf) => etf.code === '510300');
-  const close = bars.find((bar) => bar.date === '2026-11-20').close;
+  const close = bars.find((bar) => bar.date === '2026-11-20').rawClose;
 
   assert.equal(row.quoteShares, 1200001);
   assert.equal(row.shares, 1200000);
@@ -698,7 +709,7 @@ test('a later official share sync turns the same pending date ready without rest
   assert.equal(after.shareMetricStatus, 'ready');
   assert.equal(after.shares, 1200000);
   assert.equal(after.shareDelta, 200000);
-  assert.equal(after.estimatedSubscription, 200000 * bars.at(-1).close);
+  assert.equal(after.estimatedSubscription, 200000 * bars.at(-1).rawClose);
   db.close();
 });
 
@@ -811,6 +822,8 @@ test('official share sync status distinguishes waiting, failure and history gaps
   });
   status = service.getOfficialShareSyncStatus();
   assert.equal(status.state, 'incomplete');
+  assert.equal(status.needsRetry, true);
+  assert.ok(status.nextRetryAt);
   assert.equal(status.history.status, 'partial');
   assert.ok(status.history.missingRecentDates.includes('2026-11-19'));
   db.close();
@@ -907,14 +920,14 @@ test('official history backfill covers the 250-day analytics window and stays id
   const first = await service.syncOfficialShareHistory(lastDate);
   assert.equal(first.requestedDates.length, 251);
   assert.equal(sseAttempts.length, 251);
-  assert.equal(rangeCalls, 1);
+  assert.equal(rangeCalls, 3);
   assert.equal(db.countOfficialShareHistory('510300'), 251);
   assert.equal(db.recentLogs(1)[0].status, 'success');
 
   const second = await service.syncOfficialShareHistory(lastDate);
   assert.equal(second.requestedDates.length, 251);
   assert.equal(sseAttempts.length, 251);
-  assert.equal(rangeCalls, 1);
+  assert.equal(rangeCalls, 3);
   assert.equal(db.countOfficialShareHistory('510300'), 251);
   db.close();
 });
